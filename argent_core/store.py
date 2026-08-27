@@ -27,17 +27,24 @@ from . import events as events_mod
 from .models import (
     ActionExecution,
     ActionExecutionStatus,
+    AgentContextSnapshot,
+    AgentDispatch,
+    AgentResultQuarantine,
     ApprovalStatus,
     Decision,
+    DispatchStatus,
     Event,
+    ExternalActionsPolicy,
     Finding,
     FindingStatus,
     Handoff,
     OwnerApproval,
     Project,
+    RiskClass,
     Role,
     RoleRun,
     RoleRunStatus,
+    SequenceKind,
     SourceClass,
     Task,
     TaskRun,
@@ -47,7 +54,7 @@ from .models import (
     TestRun,
 )
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 _TASK_STATES = "', '".join(s.value for s in TaskState)
 _TASK_RUN_STATUSES = "', '".join(s.value for s in TaskRunStatus)
@@ -56,6 +63,10 @@ _ROLE_RUN_STATUSES = "', '".join(s.value for s in RoleRunStatus)
 _APPROVAL_STATUSES = "', '".join(s.value for s in ApprovalStatus)
 _SOURCE_CLASSES = "', '".join(s.value for s in SourceClass)
 _EXECUTION_STATUSES = "', '".join(s.value for s in ActionExecutionStatus)
+_RISK_CLASSES = "', '".join(r.value for r in RiskClass)
+_EXT_ACTION_POLICIES = "', '".join(p.value for p in ExternalActionsPolicy)
+_DISPATCH_STATUSES = "', '".join(s.value for s in DispatchStatus)
+_SEQUENCE_KINDS = "', '".join(k.value for k in SequenceKind)
 
 _SCHEMA: tuple[str, ...] = (
     """
@@ -77,10 +88,13 @@ _SCHEMA: tuple[str, ...] = (
         id             TEXT PRIMARY KEY,
         project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
         title          TEXT NOT NULL,
+        description    TEXT,
         state          TEXT NOT NULL CHECK (state IN ('{_TASK_STATES}')),
         resume_state   TEXT CHECK (resume_state IS NULL OR resume_state IN ('{_TASK_STATES}')),
         source         TEXT NOT NULL,
         source_class   TEXT NOT NULL CHECK (source_class IN ('{_SOURCE_CLASSES}')),
+        risk_class     TEXT NOT NULL DEFAULT 'NORMAL' CHECK (risk_class IN ('{_RISK_CLASSES}')),
+        external_actions_policy TEXT NOT NULL DEFAULT 'ALLOWED_WITH_GATE' CHECK (external_actions_policy IN ('{_EXT_ACTION_POLICIES}')),
         created_at     TEXT NOT NULL,
         updated_at     TEXT NOT NULL,
         idempotency_key TEXT UNIQUE
@@ -219,6 +233,72 @@ _SCHEMA: tuple[str, ...] = (
         PRIMARY KEY (key, command)
     )
     """,
+    f"""
+    CREATE TABLE IF NOT EXISTS agent_dispatches (
+        id                  TEXT PRIMARY KEY,
+        task_id             TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        task_run_id         TEXT NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
+        role                TEXT NOT NULL CHECK (role IN ('{_ROLE_VALUES}')),
+        parent_dispatch_id  TEXT REFERENCES agent_dispatches(id),
+        expected_agent_class TEXT NOT NULL,
+        expected_model_class TEXT NOT NULL,
+        expected_thinking_tier TEXT NOT NULL DEFAULT 'medium',
+        child_session_id    TEXT,
+        openclaw_run_id     TEXT,
+        actual_provider     TEXT,
+        actual_model        TEXT,
+        thinking_tier       TEXT,
+        status              TEXT NOT NULL CHECK (status IN ('{_DISPATCH_STATUSES}')),
+        cycle_no            INTEGER NOT NULL DEFAULT 1,
+        position            INTEGER NOT NULL,
+        sequence_kind       TEXT NOT NULL CHECK (sequence_kind IN ('{_SEQUENCE_KINDS}')),
+        attempt_no          INTEGER NOT NULL DEFAULT 1,
+        handoff_id          TEXT,
+        result_json         TEXT,
+        created_at          TEXT NOT NULL,
+        started_at          TEXT,
+        consumed_at         TEXT
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_dispatches_unique
+        ON agent_dispatches (task_id, cycle_no, position, attempt_no)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_dispatches_active
+        ON agent_dispatches (task_id)
+        WHERE status IN ('PENDING', 'RUNNING', 'RECOVERY_PENDING')
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_dispatches_session
+        ON agent_dispatches (child_session_id)
+        WHERE child_session_id IS NOT NULL
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_dispatches_run
+        ON agent_dispatches (openclaw_run_id)
+        WHERE openclaw_run_id IS NOT NULL
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS agent_result_quarantine (
+        id              TEXT PRIMARY KEY,
+        task_id         TEXT,
+        dispatch_id     TEXT,
+        reason          TEXT NOT NULL,
+        event_meta_json TEXT NOT NULL,
+        created_at      TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS agent_context_snapshots (
+        dispatch_id        TEXT PRIMARY KEY REFERENCES agent_dispatches(id) ON DELETE CASCADE,
+        role               TEXT NOT NULL,
+        position           INTEGER NOT NULL,
+        context_hash       TEXT NOT NULL,
+        context_summary_json TEXT NOT NULL,
+        created_at         TEXT NOT NULL
+    )
+    """,
 )
 
 
@@ -260,11 +340,57 @@ class Store:
         return _format_dt(self._clock() + timedelta(seconds=ttl_seconds))
 
     def _create_schema(self) -> None:
-        for stmt in _SCHEMA:
-            self._conn.execute(stmt)
+        # V2.3 (G3): schema DDL AND migration share ONE ``BEGIN IMMEDIATE``
+        # block, so a migration failure leaves no partial schema behind.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for stmt in _SCHEMA:
+                self._conn.execute(stmt)
+            self._migrate()
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
+
+    def _migrate(self) -> None:
+        """Bring a pre-V3 database forward in place (SPEC V2 3.1 / V2.2 16.8).
+
+        The ``CREATE TABLE IF NOT EXISTS`` statements above only create missing
+        tables; an existing ``tasks`` table from a V1/V2 database will not gain
+        the new columns automatically.  We detect and add them idempotently.
+
+        V2.3 (G3): this method runs INSIDE ``_create_schema``'s single
+        ``BEGIN IMMEDIATE`` transaction (no own BEGIN/COMMIT); after the DDL
+        succeeds the ``schema_version`` is UPSERTed to 3.  Any failure rolls the
+        whole schema + migration back (no partial schema / stale version).
+        """
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(tasks)")}
+        if "description" not in cols:
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN description TEXT")
+        if "risk_class" not in cols:
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN risk_class TEXT NOT NULL "
+                "DEFAULT 'NORMAL' CHECK (risk_class IN ('LOW','NORMAL','HIGH'))"
+            )
+        if "external_actions_policy" not in cols:
+            self._conn.execute(
+                "ALTER TABLE tasks ADD COLUMN external_actions_policy TEXT NOT NULL "
+                "DEFAULT 'ALLOWED_WITH_GATE' "
+                "CHECK (external_actions_policy IN ('ALLOWED_WITH_GATE','FORBIDDEN'))"
+            )
+        dcols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(agent_dispatches)")
+        }
+        if "expected_thinking_tier" not in dcols:
+            self._conn.execute(
+                "ALTER TABLE agent_dispatches ADD COLUMN "
+                "expected_thinking_tier TEXT NOT NULL DEFAULT 'medium'"
+            )
+        # UPSERT the schema version to 3 after successful DDL.
         self._conn.execute(
-            "INSERT OR IGNORE INTO schema_meta (key, value) VALUES (?, ?)",
-            ("schema_version", SCHEMA_VERSION),
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (SCHEMA_VERSION,),
         )
 
     @contextmanager
@@ -305,17 +431,21 @@ class Store:
 
     def _insert_task(self, t: Task) -> None:
         self._conn.execute(
-            "INSERT INTO tasks (id, project_id, title, state, resume_state, "
-            "source, source_class, created_at, updated_at, idempotency_key) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, project_id, title, description, state, "
+            "resume_state, source, source_class, risk_class, "
+            "external_actions_policy, created_at, updated_at, idempotency_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 t.id,
                 t.project_id,
                 t.title,
+                t.description,
                 t.state.value,
                 t.resume_state.value if t.resume_state else None,
                 t.source,
                 t.source_class.value,
+                t.risk_class.value,
+                t.external_actions_policy.value,
                 t.created_at,
                 t.updated_at,
                 t.idempotency_key,
@@ -385,12 +515,23 @@ class Store:
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 idempotency_key=row["idempotency_key"],
+                description=row["description"] if "description" in row.keys() else None,
+                risk_class=RiskClass(row["risk_class"])
+                if "risk_class" in row.keys() and row["risk_class"]
+                else RiskClass.NORMAL,
+                external_actions_policy=ExternalActionsPolicy(
+                    row["external_actions_policy"]
+                )
+                if "external_actions_policy" in row.keys()
+                and row["external_actions_policy"]
+                else ExternalActionsPolicy.ALLOWED_WITH_GATE,
             )
             out.append((task, valid))
         return out
 
     @staticmethod
     def _row_to_task(row: sqlite3.Row) -> Task:
+        keys = row.keys()
         return Task(
             id=row["id"],
             project_id=row["project_id"],
@@ -402,6 +543,15 @@ class Store:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             idempotency_key=row["idempotency_key"],
+            description=row["description"] if "description" in keys else None,
+            risk_class=RiskClass(row["risk_class"])
+            if "risk_class" in keys and row["risk_class"]
+            else RiskClass.NORMAL,
+            external_actions_policy=ExternalActionsPolicy(
+                row["external_actions_policy"]
+            )
+            if "external_actions_policy" in keys and row["external_actions_policy"]
+            else ExternalActionsPolicy.ALLOWED_WITH_GATE,
         )
 
     # -- task_runs -----------------------------------------------------------
@@ -751,6 +901,46 @@ class Store:
             created_at=row["created_at"],
         )
 
+    def list_decisions(self, task_id: Optional[str] = None) -> list[Decision]:
+        q = "SELECT * FROM decisions"
+        params: list = []
+        if task_id is not None:
+            q += " WHERE task_id = ?"
+            params.append(task_id)
+        q += " ORDER BY rowid"
+        rows = self._conn.execute(q, params).fetchall()
+        return [
+            Decision(
+                id=r["id"],
+                task_id=r["task_id"],
+                decision=r["decision"],
+                detail=r["detail"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    def list_reviews(self, task_id: Optional[str] = None):
+        q = "SELECT * FROM reviews"
+        params: list = []
+        if task_id is not None:
+            q += " WHERE task_id = ?"
+            params.append(task_id)
+        q += " ORDER BY rowid"
+        rows = self._conn.execute(q, params).fetchall()
+        from .models import Review
+
+        return [
+            Review(
+                id=r["id"],
+                task_id=r["task_id"],
+                verdict=r["verdict"],
+                detail=r["detail"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
     # -- owner_approvals -----------------------------------------------------
 
     def _insert_approval(self, a: OwnerApproval) -> None:
@@ -969,6 +1159,289 @@ class Store:
             (key, command, result_id, args_hash, now),
         )
 
+    # -- agent dispatches ----------------------------------------------------
+
+    def _insert_dispatch(self, d: AgentDispatch) -> None:
+        self._conn.execute(
+            "INSERT INTO agent_dispatches (id, task_id, task_run_id, role, "
+            "parent_dispatch_id, expected_agent_class, expected_model_class, "
+            "expected_thinking_tier, child_session_id, openclaw_run_id, "
+            "actual_provider, actual_model, thinking_tier, status, cycle_no, "
+            "position, sequence_kind, attempt_no, handoff_id, result_json, "
+            "created_at, started_at, consumed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?, ?)",
+            (
+                d.id,
+                d.task_id,
+                d.task_run_id,
+                d.role.value,
+                d.parent_dispatch_id,
+                d.expected_agent_class,
+                d.expected_model_class,
+                d.expected_thinking_tier,
+                d.child_session_id,
+                d.openclaw_run_id,
+                d.actual_provider,
+                d.actual_model,
+                d.thinking_tier,
+                d.status.value,
+                d.cycle_no,
+                d.position,
+                d.sequence_kind.value,
+                d.attempt_no,
+                d.handoff_id,
+                d.result_json,
+                d.created_at,
+                d.started_at,
+                d.consumed_at,
+            ),
+        )
+
+    def get_dispatch(self, dispatch_id: str) -> Optional[AgentDispatch]:
+        row = self._conn.execute(
+            "SELECT * FROM agent_dispatches WHERE id = ?", (dispatch_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_dispatch(row)
+
+    @staticmethod
+    def _row_to_dispatch(row: sqlite3.Row) -> AgentDispatch:
+        return AgentDispatch(
+            id=row["id"],
+            task_id=row["task_id"],
+            task_run_id=row["task_run_id"],
+            role=Role(row["role"]),
+            parent_dispatch_id=row["parent_dispatch_id"],
+            expected_agent_class=row["expected_agent_class"],
+            expected_model_class=row["expected_model_class"],
+            expected_thinking_tier=row["expected_thinking_tier"],
+            child_session_id=row["child_session_id"],
+            openclaw_run_id=row["openclaw_run_id"],
+            actual_provider=row["actual_provider"],
+            actual_model=row["actual_model"],
+            thinking_tier=row["thinking_tier"],
+            status=DispatchStatus(row["status"]),
+            cycle_no=row["cycle_no"],
+            position=row["position"],
+            sequence_kind=SequenceKind(row["sequence_kind"]),
+            attempt_no=row["attempt_no"],
+            handoff_id=row["handoff_id"],
+            result_json=row["result_json"],
+            created_at=row["created_at"],
+            started_at=row["started_at"],
+            consumed_at=row["consumed_at"],
+        )
+
+    def list_dispatches(
+        self,
+        task_id: Optional[str] = None,
+        status: Optional[DispatchStatus] = None,
+    ) -> list[AgentDispatch]:
+        q = "SELECT * FROM agent_dispatches"
+        clauses: list[str] = []
+        params: list = []
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status.value)
+        if clauses:
+            q += " WHERE " + " AND ".join(clauses)
+        q += " ORDER BY cycle_no, position, attempt_no"
+        rows = self._conn.execute(q, params).fetchall()
+        return [self._row_to_dispatch(r) for r in rows]
+
+    def _update_dispatch_bind(
+        self,
+        dispatch_id: str,
+        child_session_id: str,
+        openclaw_run_id: str,
+        actual_provider: str,
+        actual_model: str,
+        thinking_tier: str,
+        started_at: str,
+    ) -> int:
+        cur = self._conn.execute(
+            "UPDATE agent_dispatches SET status = 'RUNNING', child_session_id = ?, "
+            "openclaw_run_id = ?, actual_provider = ?, actual_model = ?, "
+            "thinking_tier = ?, started_at = ? "
+            "WHERE id = ? AND status IN ('PENDING', 'RECOVERY_PENDING')",
+            (
+                child_session_id,
+                openclaw_run_id,
+                actual_provider,
+                actual_model,
+                thinking_tier,
+                started_at,
+                dispatch_id,
+            ),
+        )
+        return cur.rowcount
+
+    def _reject_dispatch_cas(self, dispatch_id: str) -> int:
+        """Atomically reject a dispatch that is still PENDING/RECOVERY_PENDING.
+
+        V2.3 (G1): the mismatch path must never overwrite a dispatch that a
+        parallel valid bind already moved to RUNNING.  The ``WHERE status IN
+        ('PENDING','RECOVERY_PENDING')`` guard makes this a compare-and-set;
+        ``rowcount == 1`` means this call performed the rejection.
+        """
+        cur = self._conn.execute(
+            "UPDATE agent_dispatches SET status = 'REJECTED' "
+            "WHERE id = ? AND status IN ('PENDING', 'RECOVERY_PENDING')",
+            (dispatch_id,),
+        )
+        return cur.rowcount
+
+    def _update_dispatch_status(
+        self, dispatch_id: str, status: DispatchStatus, now: str
+    ) -> int:
+        cur = self._conn.execute(
+            "UPDATE agent_dispatches SET status = ? WHERE id = ?",
+            (status.value, dispatch_id),
+        )
+        return cur.rowcount
+
+    def _consume_dispatch(
+        self,
+        dispatch_id: str,
+        result_json: str,
+        consumed_at: str,
+        allowed: tuple[DispatchStatus, ...] = (
+            DispatchStatus.RUNNING,
+            DispatchStatus.RECOVERY_PENDING,
+        ),
+    ) -> int:
+        allowed_vals = ", ".join(f"'{s.value}'" for s in allowed)
+        cur = self._conn.execute(
+            f"UPDATE agent_dispatches SET status = 'CONSUMED', result_json = ?, "
+            f"consumed_at = ? WHERE id = ? AND status IN ({allowed_vals})",
+            (result_json, consumed_at, dispatch_id),
+        )
+        return cur.rowcount
+
+    def get_latest_decision(self, task_id: str) -> Optional[Decision]:
+        row = self._conn.execute(
+            "SELECT * FROM decisions WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Decision(
+            id=row["id"],
+            task_id=row["task_id"],
+            decision=row["decision"],
+            detail=row["detail"],
+            created_at=row["created_at"],
+        )
+
+    def get_latest_task_run(self, task_id: str) -> Optional[TaskRun]:
+        row = self._conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return TaskRun(
+            id=row["id"],
+            task_id=row["task_id"],
+            status=TaskRunStatus(row["status"]),
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+        )
+
+    # -- quarantine log ------------------------------------------------------
+
+    def _insert_quarantine(self, q: AgentResultQuarantine) -> None:
+        self._conn.execute(
+            "INSERT INTO agent_result_quarantine (id, task_id, dispatch_id, "
+            "reason, event_meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (q.id, q.task_id, q.dispatch_id, q.reason, q.event_meta_json, q.created_at),
+        )
+
+    def list_quarantine(
+        self, task_id: Optional[str] = None
+    ) -> list[AgentResultQuarantine]:
+        q = "SELECT * FROM agent_result_quarantine"
+        params: list = []
+        if task_id is not None:
+            q += " WHERE task_id = ?"
+            params.append(task_id)
+        q += " ORDER BY rowid"
+        rows = self._conn.execute(q, params).fetchall()
+        return [
+            AgentResultQuarantine(
+                id=r["id"],
+                task_id=r["task_id"],
+                dispatch_id=r["dispatch_id"],
+                reason=r["reason"],
+                event_meta_json=r["event_meta_json"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
+    # -- context snapshots ----------------------------------------------------
+
+    def _insert_context_snapshot(self, s: AgentContextSnapshot) -> None:
+        # V2.2 (F5): plain INSERT (no REPLACE) — context snapshots are immutable.
+        self._conn.execute(
+            "INSERT INTO agent_context_snapshots (dispatch_id, role, "
+            "position, context_hash, context_summary_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                s.dispatch_id,
+                s.role.value,
+                s.position,
+                s.context_hash,
+                s.context_summary_json,
+                s.created_at,
+            ),
+        )
+
+    def get_context_snapshot(
+        self, dispatch_id: str
+    ) -> Optional[AgentContextSnapshot]:
+        row = self._conn.execute(
+            "SELECT * FROM agent_context_snapshots WHERE dispatch_id = ?",
+            (dispatch_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return AgentContextSnapshot(
+            dispatch_id=row["dispatch_id"],
+            role=Role(row["role"]),
+            position=row["position"],
+            context_hash=row["context_hash"],
+            context_summary_json=row["context_summary_json"],
+            created_at=row["created_at"],
+        )
+
+    def list_context_snapshots(
+        self, task_id: Optional[str] = None
+    ) -> list[AgentContextSnapshot]:
+        q = "SELECT s.* FROM agent_context_snapshots s"
+        params: list = []
+        if task_id is not None:
+            q += " JOIN agent_dispatches d ON d.id = s.dispatch_id WHERE d.task_id = ?"
+            params.append(task_id)
+        q += " ORDER BY s.dispatch_id"
+        rows = self._conn.execute(q, params).fetchall()
+        return [
+            AgentContextSnapshot(
+                dispatch_id=r["dispatch_id"],
+                role=Role(r["role"]),
+                position=r["position"],
+                context_hash=r["context_hash"],
+                context_summary_json=r["context_summary_json"],
+                created_at=r["created_at"],
+            )
+            for r in rows
+        ]
+
 
 class Queries:
     """Strictly read-only ``get_*``/``list_*`` facade (SPEC V1.1 11.5, R8)."""
@@ -1021,6 +1494,12 @@ class Queries:
     def get_decision(self, decision_id: str):
         return self._store.get_decision(decision_id)
 
+    def list_decisions(self, task_id=None):
+        return self._store.list_decisions(task_id)
+
+    def list_reviews(self, task_id=None):
+        return self._store.list_reviews(task_id)
+
     def get_approval(self, approval_id: str):
         return self._store.get_approval(approval_id)
 
@@ -1035,3 +1514,24 @@ class Queries:
 
     def list_events(self, task_id=None):
         return self._store.list_events(task_id)
+
+    def get_dispatch(self, dispatch_id: str):
+        return self._store.get_dispatch(dispatch_id)
+
+    def list_dispatches(self, task_id=None, status=None):
+        return self._store.list_dispatches(task_id, status)
+
+    def list_quarantine(self, task_id=None):
+        return self._store.list_quarantine(task_id)
+
+    def get_context_snapshot(self, dispatch_id: str):
+        return self._store.get_context_snapshot(dispatch_id)
+
+    def list_context_snapshots(self, task_id=None):
+        return self._store.list_context_snapshots(task_id)
+
+    def get_latest_decision(self, task_id: str):
+        return self._store.get_latest_decision(task_id)
+
+    def get_latest_task_run(self, task_id: str):
+        return self._store.get_latest_task_run(task_id)

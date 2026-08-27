@@ -16,6 +16,40 @@ from typing import Optional
 # Enums
 # ---------------------------------------------------------------------------
 
+class RiskClass(str, Enum):
+    """Risk classification of a task (SPEC V2 3.1)."""
+
+    LOW = "LOW"
+    NORMAL = "NORMAL"
+    HIGH = "HIGH"
+
+
+class ExternalActionsPolicy(str, Enum):
+    """Whether external actions are allowed (gated) or forbidden (SPEC V2 8.4)."""
+
+    ALLOWED_WITH_GATE = "ALLOWED_WITH_GATE"
+    FORBIDDEN = "FORBIDDEN"
+
+
+class DispatchStatus(str, Enum):
+    """Lifecycle status of an agent dispatch (SPEC V2 3.1)."""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    CONSUMED = "CONSUMED"
+    FAILED = "FAILED"
+    REJECTED = "REJECTED"
+    QUARANTINED = "QUARANTINED"
+    RECOVERY_PENDING = "RECOVERY_PENDING"
+
+
+class SequenceKind(str, Enum):
+    """Workflow sequence kind of a dispatch (SPEC V2 15.4)."""
+
+    STANDARD = "STANDARD"
+    REWORK = "REWORK"
+
+
 class TaskState(str, Enum):
     """All 16 task states defined in SPEC V1 chapter 1.
 
@@ -167,6 +201,18 @@ class NotFound(ArgentError):
     """A referenced entity does not exist."""
 
 
+class RolePolicyViolation(ArgentError):
+    """A role/model policy violation (SPEC V2 6/7; policy.role_violation)."""
+
+
+class OutputValidationError(ArgentError):
+    """A structured agent output failed validation (SPEC V2 5, fail-closed)."""
+
+
+class DispatchError(ArgentError):
+    """An agent dispatch operation failed provenance/state validation."""
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -191,6 +237,9 @@ class Task:
     created_at: str
     updated_at: str
     idempotency_key: Optional[str] = None
+    description: Optional[str] = None
+    risk_class: RiskClass = RiskClass.NORMAL
+    external_actions_policy: ExternalActionsPolicy = ExternalActionsPolicy.ALLOWED_WITH_GATE
 
 
 @dataclass(frozen=True)
@@ -298,4 +347,57 @@ class Event:
     role: Optional[str]
     state: Optional[str]
     payload: dict
+    created_at: str
+
+
+@dataclass(frozen=True)
+class AgentDispatch:
+    """Provenance record for one expected agent run (SPEC V2 3.1 / V2.1 15.4)."""
+
+    id: str
+    task_id: str
+    task_run_id: str
+    role: Role
+    parent_dispatch_id: Optional[str]
+    expected_agent_class: str
+    expected_model_class: str
+    expected_thinking_tier: str
+    child_session_id: Optional[str]
+    openclaw_run_id: Optional[str]
+    actual_provider: Optional[str]
+    actual_model: Optional[str]
+    thinking_tier: Optional[str]
+    status: DispatchStatus
+    cycle_no: int
+    position: int
+    sequence_kind: SequenceKind
+    attempt_no: int
+    handoff_id: Optional[str]
+    result_json: Optional[str]
+    created_at: str
+    started_at: Optional[str]
+    consumed_at: Optional[str]
+
+
+@dataclass(frozen=True)
+class AgentResultQuarantine:
+    """Immutable quarantine log entry (SPEC V2 3.1 / V2.1 15.11)."""
+
+    id: str
+    task_id: str
+    dispatch_id: Optional[str]
+    reason: str
+    event_meta_json: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class AgentContextSnapshot:
+    """Immutable context snapshot for a dispatch (SPEC V2 15.8)."""
+
+    dispatch_id: str
+    role: Role
+    position: int
+    context_hash: str
+    context_summary_json: str
     created_at: str

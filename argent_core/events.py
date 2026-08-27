@@ -11,8 +11,8 @@ from typing import Any, Optional
 
 from .models import PrivacyViolation
 
-# The 19 mandatory event types (SPEC V1 chapter 6).
-EVENT_TYPES: frozenset[str] = frozenset(
+# The 19 mandatory event types from SPEC V1 chapter 6.
+V1_EVENT_TYPES: frozenset[str] = frozenset(
     {
         "task.created",
         "task.state_changed",
@@ -35,6 +35,27 @@ EVENT_TYPES: frozenset[str] = frozenset(
         "task.completed",
     }
 )
+
+# The 12 new event types from SPEC V2 chapter 10.
+AGENT_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "agent.dispatch_created",
+        "agent.started",
+        "agent.result_received",
+        "agent.result_accepted",
+        "agent.result_rejected",
+        "agent.result_duplicate",
+        "agent.completed",
+        "agent.failed",
+        "agent.recovery_pending",
+        "handoff.expected",
+        "handoff.accepted",
+        "policy.role_violation",
+    }
+)
+
+# Union of V1 + V2 (31 total).
+EVENT_TYPES: frozenset[str] = V1_EVENT_TYPES | AGENT_EVENT_TYPES
 
 # Fail-closed privacy deny list.  Matching is case-insensitive substring
 # matching against both payload keys and string payload values.
@@ -106,6 +127,15 @@ def check_privacy(payload: dict) -> None:
         raise PrivacyViolation(
             f"event payload contains deny-listed term {hit!r}"
         )
+
+
+def scan_value_for_denylist(value: Any) -> Optional[str]:
+    """Return the first deny-listed word in ``value`` or ``None``.
+
+    Public wrapper around the internal scanner, used by ``outputs`` to apply
+    the same fail-closed deny-list to structured agent outputs (SPEC V2 5).
+    """
+    return _scan_value(value)
 
 
 def check_event(ev) -> None:

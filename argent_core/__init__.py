@@ -5,18 +5,24 @@ state machine, roles, gated autonomy, trust boundary, SQLite persistence,
 privacy-safe events, idempotency and crash recovery.
 """
 
-from .core import ActionRequestResult, Core, RecoveryReport
-from .gates import classify_action
+from .core import ActionRequestResult, Core, ReceiveResult, RecoveryReport
+from .gates import EXTERNAL_ACTIONS, classify_action
 from .models import (
     ActionClass,
     ActionExecution,
     ActionExecutionStatus,
+    AgentContextSnapshot,
+    AgentDispatch,
+    AgentResultQuarantine,
     ApprovalError,
     ApprovalStatus,
     ArgentError,
     ArtifactCategory,
     Decision,
+    DispatchError,
+    DispatchStatus,
     Event,
+    ExternalActionsPolicy,
     Finding,
     FindingStatus,
     ForbiddenAction,
@@ -24,6 +30,7 @@ from .models import (
     IdempotencyError,
     InvalidTransition,
     NotFound,
+    OutputValidationError,
     OwnerApproval,
     OwnerAuthorityRequired,
     Permission,
@@ -31,10 +38,13 @@ from .models import (
     PrivacyViolation,
     Project,
     Review,
+    RiskClass,
     Role,
     RoleConflict,
+    RolePolicyViolation,
     RoleRun,
     RoleRunStatus,
+    SequenceKind,
     SourceClass,
     Task,
     TaskRun,
@@ -45,6 +55,7 @@ from .models import (
     UntrustedSource,
 )
 from .roles import DEFAULT_NEXT_ROLE, can_read, can_write, check_permission
+from .routing import resolve_model, validate_model_choice
 from .state_machine import is_allowed, is_valid_resume_target, validate_transition
 from .store import Queries
 from .trust import OWNER_SOURCE, classify_source, role_source
@@ -54,6 +65,9 @@ __all__ = [
     "ActionExecution",
     "ActionExecutionStatus",
     "ActionRequestResult",
+    "AgentContextSnapshot",
+    "AgentDispatch",
+    "AgentResultQuarantine",
     "ApprovalError",
     "ApprovalStatus",
     "ArgentError",
@@ -61,7 +75,11 @@ __all__ = [
     "Core",
     "DEFAULT_NEXT_ROLE",
     "Decision",
+    "DispatchError",
+    "DispatchStatus",
     "Event",
+    "EXTERNAL_ACTIONS",
+    "ExternalActionsPolicy",
     "Finding",
     "FindingStatus",
     "ForbiddenAction",
@@ -70,6 +88,7 @@ __all__ = [
     "InvalidTransition",
     "NotFound",
     "OWNER_SOURCE",
+    "OutputValidationError",
     "OwnerApproval",
     "OwnerAuthorityRequired",
     "Permission",
@@ -77,12 +96,16 @@ __all__ = [
     "PrivacyViolation",
     "Project",
     "Queries",
+    "ReceiveResult",
     "RecoveryReport",
     "Review",
+    "RiskClass",
     "Role",
     "RoleConflict",
+    "RolePolicyViolation",
     "RoleRun",
     "RoleRunStatus",
+    "SequenceKind",
     "SourceClass",
     "Task",
     "TaskRun",
@@ -98,6 +121,8 @@ __all__ = [
     "classify_source",
     "is_allowed",
     "is_valid_resume_target",
+    "resolve_model",
     "role_source",
+    "validate_model_choice",
     "validate_transition",
 ]

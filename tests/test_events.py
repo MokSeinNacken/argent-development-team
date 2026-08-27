@@ -10,7 +10,7 @@ from argent_core import (
     role_source,
     OWNER_SOURCE,
 )
-from argent_core.events import EVENT_TYPES, PRIVACY_DENYLIST
+from argent_core.events import V1_EVENT_TYPES, PRIVACY_DENYLIST
 
 from conftest import LEAD, events_of, pipeline_to, start_lead
 
@@ -75,7 +75,7 @@ def test_all_19_event_types_emitted(core, project, task):
         core.transition(t2.id, s, LEAD)
 
     seen = {e.type for e in core.list_events(OWNER)}
-    assert EVENT_TYPES <= seen, f"missing event types: {EVENT_TYPES - seen}"
+    assert V1_EVENT_TYPES <= seen, f"missing event types: {V1_EVENT_TYPES - seen}"
 
 
 def test_event_format_fields(core, task):

@@ -121,3 +121,146 @@ Restbefunde aus dem Sol-Recheck:
   `Core`-Fassade vorbei gibt und die DB-Constraints (CHECKs, partielle
   Unique-Indizes, Foreign Keys) als zweite Verteidigungslinie greifen
   (R8/R14).
+
+## Phase 2A — Orchestrierung & Provenance (SPEC V2/V2.1)
+
+Phase 2A verbindet den deterministischen Core mit echten, isolierten
+OpenClaw-Agent-Runs und erzwingt harte Run-/Session-/Handoff-Provenance.
+**Der Core bleibt die einzige Autoritätsinstanz**; Agenten liefern Empfehlungen
+(DATA), der Provenance-Layer validiert und konsumiert atomar. Der **Controller
+(Lead) ist die einzige Core-Schnittstelle**.
+
+### Architektur (neu)
+
+```
+argent_core/
+  routing.py   Kanonisches Modellrouting (resolve_model / validate_model_choice)
+  workflow.py  STANDARD-/REWORK-Sequenzen + expected_next_role-Replay
+  outputs.py   Fail-closed Validierung strukturierter Rollen-Outputs
+  context.py   Rollen-spezifische Kontext-Isolation + Snapshots
+  core.py      create_dispatch / bind_spawn_result / receive_agent_result /
+               mark_agent_failed / build_agent_context / expected_next_role /
+               list_dispatches / quarantine_log; recover()-Erweiterung
+  store.py     Schema V3: agent_dispatches, agent_result_quarantine,
+               agent_context_snapshots + tasks.description/risk_class/
+               external_actions_policy + Migration
+  gates.py     EXTERNAL_ACTIONS (geschlossene Menge) + policy-aware classify
+  events.py    +12 Eventtypen (agent.*, handoff.expected/accepted,
+               policy.role_violation)
+tests/
+  mock_runtime.py          Offline Mock-Runtime (Spawn + Completion-Events)
+  test_phase2a_*.py        8 Testdateien (Workflow, Provenance, Routing,
+                           Outputs, Context, Gates, Recovery, Events)
+```
+
+### Workflow-Sequenzen
+
+- **Standard**: `lead → analyst → lead → implementer → qa → reviewer → lead → DONE`
+- **Rework**:  `lead → implementer → qa → [reviewer] → lead → DONE`
+  (Reviewer konditional via `lead_decision.rework_include_reviewer`, Default
+  `true` wenn Findings offen). Rework setzt `cycle_no+1` + `sequence_kind=REWORK`.
+- `expected_next_role(task)` wird deterministisch aus `(cycle_no, position,
+  sequence_kind)` + offenen Findings + letzter Lead-Decision replayt.
+
+### Modellrouting (kanonisch)
+
+| Rolle       | Provider | Modell             | Thinking |
+|-------------|----------|--------------------|----------|
+| lead        | openai   | gpt-5.6-sol        | high     |
+| analyst     | deepseek | deepseek-v4-pro    | medium   |
+| implementer | deepseek | deepseek-v4-pro    | medium   |
+| qa          | deepseek | deepseek-v4-pro    | medium   |
+| reviewer    | openai   | gpt-5.6-sol        | high     |
+
+- `deepseek-v4-flash` **nur** für implementer/qa mit `risk_class='LOW'`.
+- **Sol Max existiert nicht** in Doku/Konfiguration (`openclaw models list`,
+  read-only geprüft); höchste Stufe ist `openai/gpt-5.6-sol` = **„Sol High“**.
+  Lead und Reviewer verwenden deshalb Sol High (Owner-Vorgabe, dokumentiert).
+- Lead/Reviewer müssen unterschiedliche `child_session_id`s haben (partielle
+  Unique-Indizes erzwingen dies fail-closed).
+
+### Provenance-Mechanismus
+
+- `create_dispatch` ist der persistente Spawn-Intent (vor `sessions_spawn`);
+  Korrelationslabel `argent-dispatch-<dispatch_id>` (Controller-Verfahren).
+- `bind_spawn_result` = EINE atomare `PENDING→RUNNING`-Operation (bindet alle
+  Spawn-Rückgaben); IDs werden NIE geraten.
+- `receive_agent_result` validiert alle IDs verpflichtend (task_id/session/
+  run_id/parent/envelope/provider/model), Handoff, Task-Zustand und den
+  strukturierten Output fail-closed; nur vollständig gebundene
+  `RUNNING|RECOVERY_PENDING`-Dispatches sind konsumierbar (CAS, rowcount==1).
+- Ghost-Writer-Ausschluss: Schreibrollen-`PENDING|RUNNING` werden bei Recovery
+  NIE auto-failed → `RECOVERY_PENDING` + Task konservativ `RECOVERING`.
+
+### Rollenrechte & Context-Isolation
+
+- Lead/Analyst/Reviewer read-only Produktcode; Implementer einziger Writer;
+  QA nur Test-Scope. Verstöße → `policy.role_violation`.
+- Reviewer-Kontext ohne Implementer-`own_assessment`/`proposal`; Analyst-Kontext
+  ohne Implementer-Lösung. Snapshots persistiert in `agent_context_snapshots`
+  (`context_hash` = SHA-256 der strukturierten Sektionen).
+
+### Smoke-Run-Verfahren (Controller, separat von der Testsuite)
+
+Ein echter Smoke-Run wird außerhalb von pytest ausgeführt: Controller startet
+`openclaw sessions_spawn` mit Modell aus `routing.resolve_model` und stabilem
+Label `argent-dispatch-<dispatch_id>`, bindet die Rückgaben mit
+`bind_spawn_result`, liefert den Completion-Event mit `receive_agent_result`
+und dokumentiert `openclaw tasks show`/`openclaw models list` (read-only) im
+Abschlussbericht. Kein echter Spawn in den Tests (offline-deterministisch).
+
+### V2.2-Härtung (F1–F8)
+
+Nach dem unabhängigen Sol-Implementierungs-Review (SPEC V2.2 §16):
+
+- **F1** — Orchestrierung treibt die autoritative State Machine: der Konsum
+  synchronisiert den Task-Zustand in derselben Transaktion über eine
+  deterministische Mapping-Tabelle (`sequence_kind, position, decision`); die
+  State Machine erhielt genau zwei Übergänge (`LEAD_DECISION→REWORK`,
+  `REWORK→IMPLEMENTING`).
+- **F2** — vorhandene UND neue `RECOVERY_PENDING`-Dispatches bleiben bei
+  `recover()` ungelöst (Role-/Task-Run bleiben STARTED).
+- **F3** — `bind_spawn_result` akzeptiert `PENDING|RECOVERY_PENDING→RUNNING`
+  (Spawn-vor-Bind-Crash rekonzilierbar).
+- **F4** — `expected_thinking_tier` wird persistiert; Bindung erzwingt exakte
+  Gleichheit (provider/model/thinking) zusätzlich zur Rollen-Policy
+  (Mismatch → atomar `REJECTED`); `parent_dispatch_id` verpflichtend;
+  `event_meta` muss `task_id/child_session_id/run_id/parent_dispatch_id/
+  event_type/status` enthalten, `status ∈ {completed, succeeded}`.
+- **F5** — Context-Snapshots unveränderlich (Plain INSERT), dispatchgebunden
+  (Rolle/Position müssen passen), `repo_summary` allow-list-/limit-/deny-list-
+  gefiltert.
+- **F6** — verschachtelte Rollenoutput-Validierung VOR dem CAS (Element-Schemas/
+  Enums je Feld → `REJECTED(malformed_output)`).
+- **F7** — Quarantäne-Metadaten: Werte erzwungen `str`, ≤512 Zeichen,
+  Deny-List-Scan → `<redacted:<sha256-prefix>>` (immer JSON-serialisierbar).
+- **F8** — Migration in EINEM `BEGIN IMMEDIATE`-Block + UPSERT der
+  `schema_version` auf 3.
+
+### V2.3-Härtung (G1–G4)
+
+Nach dem Sol-Recheck (SPEC V2.3 §17):
+
+- **G1** — `bind_spawn_result` liest Status, prüft Exact-Equality/Policy UND
+  ändert den Status in EINEM `BEGIN IMMEDIATE`-Block; der Mismatch-Pfad setzt
+  `REJECTED` per CAS (`WHERE status IN ('PENDING','RECOVERY_PENDING')`,
+  `rowcount==1`), überschreibt also nie einen parallel gültig gebundenen
+  `RUNNING`-Dispatch (kein Ghost-Writer-Retry).
+- **G2** — verschachtelte Element-Schemas vollständig erzwungen: `findings[]`
+  braucht `severity` (Enum) + `description`/`title`; Sec/Arch-Dicts brauchen
+  `severity` + `description` (leere Dicts abgelehnt); `_apply_role_effects`
+  nutzt `title` als `description`-Fallback.
+- **G3** — Schema-Erstellung (`_SCHEMA`) und Migration laufen in EINEM
+  gemeinsamen `BEGIN IMMEDIATE`-Block; ein Migrationsfehler rollt alles zurück
+  (keine persistierte Teilmigration).
+- **G4** — `_sanitize_event_meta`: `None` → `<none>`, fehlschlagendes `__str__`
+  → `<unprintable>`; immer String, ≤512 Zeichen, Deny-List-Scan.
+
+### Testausführung
+
+```bash
+cd /home/pc/projects/argent-development-team
+python3 -m pytest tests/ -q
+```
+
+Voraussetzungen unverändert: Python 3.14, nur Standardbibliothek + pytest.

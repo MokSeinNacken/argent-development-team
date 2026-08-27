@@ -23,6 +23,7 @@ _STATIC: set = {
     (TaskState.PLANNING, TaskState.ANALYZING),
     (TaskState.ANALYZING, TaskState.LEAD_DECISION),
     (TaskState.LEAD_DECISION, TaskState.IMPLEMENTING),
+    (TaskState.LEAD_DECISION, TaskState.REWORK),  # SPEC V2.2 16.1 (F1)
     (TaskState.IMPLEMENTING, TaskState.TESTING),
     (TaskState.TESTING, TaskState.REVIEWING),
     (TaskState.TESTING, TaskState.REWORK),
@@ -31,6 +32,7 @@ _STATIC: set = {
     (TaskState.FINAL_DECISION, TaskState.DONE),
     (TaskState.FINAL_DECISION, TaskState.REWORK),
     (TaskState.REWORK, TaskState.PLANNING),
+    (TaskState.REWORK, TaskState.IMPLEMENTING),  # SPEC V2.2 16.1 (F1)
     # additional states
     (TaskState.BLOCKED, TaskState.RECOVERING),
     (TaskState.FAILED, TaskState.RECOVERING),

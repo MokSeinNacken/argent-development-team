@@ -10,7 +10,8 @@ from argent_core.store import Store
 REQUIRED_TABLES = {
     "projects", "tasks", "task_runs", "role_runs", "handoffs", "findings",
     "test_runs", "reviews", "decisions", "owner_approvals", "events",
-    "action_executions", "schema_meta",
+    "action_executions", "schema_meta", "agent_dispatches",
+    "agent_result_quarantine", "agent_context_snapshots",
 }
 
 
@@ -54,7 +55,7 @@ def test_schema_meta_version(db_path, core):
         ).fetchone()
     finally:
         conn.close()
-    assert row is not None and row["value"] == "2"
+    assert row is not None and row["value"] == "3"
 
 
 def test_foreign_keys_enabled(core):
@@ -201,3 +202,54 @@ def test_command_idempotency_has_args_hash(db_path, core):
 def test_task_idempotency_key_unique_column(core, project):
     t1 = core.create_task(project.id, "a", OWNER_SOURCE, idempotency_key="k-abc")
     assert core.queries.get_task(t1.id).idempotency_key == "k-abc"
+
+
+def test_tasks_v3_columns_present(db_path, core):
+    cols = _raw(db_path)
+    try:
+        names = {r[1] for r in cols.execute("PRAGMA table_info(tasks)")}
+    finally:
+        cols.close()
+    assert {"description", "risk_class", "external_actions_policy"} <= names
+
+
+def test_agent_dispatch_unique_indexes_exist(db_path, core):
+    idx = _schema_sql(db_path, "index")
+    assert "idx_agent_dispatches_unique" in idx
+    assert "idx_agent_dispatches_active" in idx
+    assert "idx_agent_dispatches_session" in idx
+    assert "idx_agent_dispatches_run" in idx
+    assert "status IN ('PENDING', 'RUNNING', 'RECOVERY_PENDING')" in idx["idx_agent_dispatches_active"]
+
+
+def test_migration_from_v2_adds_columns(tmp_path):
+    # Build a pre-V3 tasks table (V2 shape) without the new columns, then open
+    # the Core and verify the migration adds them and sets schema version 3.
+    db = str(tmp_path / "v2.db")
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE tasks (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
+        "title TEXT NOT NULL, state TEXT NOT NULL, resume_state TEXT, "
+        "source TEXT NOT NULL, source_class TEXT NOT NULL, created_at TEXT "
+        "NOT NULL, updated_at TEXT NOT NULL, idempotency_key TEXT UNIQUE)"
+    )
+    conn.execute(
+        "INSERT INTO tasks (id, project_id, title, state, source, source_class, "
+        "created_at, updated_at) VALUES ('t1', 'p1', 'x', 'NEW', "
+        "'owner:authenticated', 'TRUSTED', '2026', '2026')"
+    )
+    conn.commit()
+    conn.close()
+
+    c = Core(db)
+    cols = {r[1] for r in c._store._conn.execute("PRAGMA table_info(tasks)")}
+    assert {"description", "risk_class", "external_actions_policy"} <= cols
+    row = c._store._conn.execute(
+        "SELECT value FROM schema_meta WHERE key='schema_version'"
+    ).fetchone()
+    assert row is not None and row["value"] == "3"
+    # The migrated task still exists and gained the defaults.
+    t = c.queries.get_task("t1")
+    assert t.risk_class.value == "NORMAL"
+    assert t.external_actions_policy.value == "ALLOWED_WITH_GATE"
+    c.close()

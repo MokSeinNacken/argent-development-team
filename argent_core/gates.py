@@ -1,13 +1,23 @@
-"""Gated autonomy (SPEC V1 chapter 3).
+"""Gated autonomy (SPEC V1 chapter 3 + V2 8.4 / V2.1 15.10).
 
 Every action is classified into exactly one of three classes.  Anything not
 explicitly listed as AUTONOMOUS or OWNER_APPROVAL_REQUIRED is classified as
 FORBIDDEN (fail-closed).
+
+Phase 2A adds a closed set of external actions (``EXTERNAL_ACTIONS``): when a
+task's ``external_actions_policy`` is ``FORBIDDEN`` every external action is
+classified ``FORBIDDEN`` (not approvable).  Unknown action names remain
+``FORBIDDEN`` (V1 rule).
 """
 
 from __future__ import annotations
 
-from .models import ActionClass, ArtifactCategory, Permission
+from .models import (
+    ActionClass,
+    ArtifactCategory,
+    ExternalActionsPolicy,
+    Permission,
+)
 
 AUTONOMOUS_ACTIONS: frozenset[str] = frozenset(
     {
@@ -49,6 +59,27 @@ FORBIDDEN_ACTIONS: frozenset[str] = frozenset(
     }
 )
 
+# Closed set of external action names (SPEC V2 15.10).  Under a FORBIDDEN
+# external-actions policy every one of these is classified FORBIDDEN.
+EXTERNAL_ACTIONS: frozenset[str] = frozenset(
+    {
+        "install_software",
+        "download_dependency",
+        "system_install",
+        "network_fetch",
+        "external_send",
+        "deploy_production",
+        "change_secrets",
+        "expose_gateway",
+        "modify_allowlist",
+        "promote_stable",
+        "modify_policy",
+        "raise_privileges",
+        "enable_self_improvement",
+        "production_write",
+    }
+)
+
 # Permission requirement for each AUTONOMOUS action.  ``review`` maps to reading
 # the product code (every role may read); the write-gated actions map to the
 # artifact category they modify.
@@ -64,11 +95,26 @@ ACTION_PERMISSIONS: dict[str, tuple[ArtifactCategory, Permission]] = {
 }
 
 
-def classify_action(action: str) -> ActionClass:
-    """Classify an action name deterministically (fail-closed on unknown)."""
+def classify_action(
+    action: str,
+    external_actions_policy: ExternalActionsPolicy = ExternalActionsPolicy.ALLOWED_WITH_GATE,
+) -> ActionClass:
+    """Classify an action name deterministically (fail-closed on unknown).
+
+    When ``external_actions_policy`` is ``FORBIDDEN``, every action in
+    ``EXTERNAL_ACTIONS`` is classified ``FORBIDDEN`` (SPEC V2 8.4 / 15.10).
+    With ``ALLOWED_WITH_GATE`` they remain ``OWNER_APPROVAL_REQUIRED``.
+    """
+    if (
+        external_actions_policy is ExternalActionsPolicy.FORBIDDEN
+        and action in EXTERNAL_ACTIONS
+    ):
+        return ActionClass.FORBIDDEN
     if action in AUTONOMOUS_ACTIONS:
         return ActionClass.AUTONOMOUS
     if action in OWNER_APPROVAL_ACTIONS:
+        return ActionClass.OWNER_APPROVAL_REQUIRED
+    if action in EXTERNAL_ACTIONS:
         return ActionClass.OWNER_APPROVAL_REQUIRED
     # FORBIDDEN_ACTIONS and anything unlisted are forbidden.
     return ActionClass.FORBIDDEN
