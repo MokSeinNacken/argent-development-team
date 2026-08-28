@@ -1,7 +1,8 @@
 """Write-Broker (SPEC V2B chapter 2).
 
 The single path by which file changes enter the task workspace.  Role agents
-have zero native tools (SPEC V2B §1); every write flows through this broker,
+have zero dangerous or mutating tools (one harmless status capability on
+direct turns; SPEC V2B §1); every write flows through this broker,
 which applies a chain of hardening checks (§2.1–§2.10) and applies the whole
 patch set atomically (all-or-nothing, §2.9).
 
@@ -27,7 +28,6 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 from uuid import uuid4
 
-from . import events
 from .models import PermissionDenied, Role
 
 CONTROLLER_SOURCE = "role:lead"
@@ -50,11 +50,21 @@ _ABSOLUTE_DENY_PREFIXES: tuple[str, ...] = (
     "/run",
 )
 
-# Content deny-list (§2.7): the privacy deny-list plus the explicit secret
-# markers (already a subset of the privacy deny-list).
-CONTENT_DENYLIST: frozenset[str] = frozenset(
-    w.lower() for w in events.PRIVACY_DENYLIST
-) | {"secret", "api_key", "token", "password"}
+# Content deny-list (§2.7): privacy-high-signal markers only.  This is a
+# NARROWED list, deliberately distinct from events.PRIVACY_DENYLIST (which is
+# still used for envelope validation in outputs.py / events).  Ordinary code
+# words like token/code/diff/content/subject/body are NOT denied here, so
+# legitimate source (``token = lexer.next()``, ``data.decode()``, etc.) passes.
+CONTENT_DENYLIST: frozenset[str] = frozenset({
+    "secret",
+    "password",
+    "api_key",
+    "credential",
+    "mail_content",
+    "mail_address",
+    "email_address",
+    "recipient",
+})
 
 
 class BrokerError(Exception):

@@ -1458,15 +1458,19 @@ class Core:
             )
             self._emit("lead.decision", task_id=d.task_id,
                        payload={"decision_id": did, "decision": decision})
-            # Accepted findings are resolved; rejected findings stay open.
-            for fid in validated.get("accepted_findings", []) or []:
-                f = self._store.get_finding(fid)
-                if f is not None and f.status is FindingStatus.OPEN:
-                    self._store._update_finding_status(
-                        fid, FindingStatus.RESOLVED, now
-                    )
-                    self._emit("finding.resolved", task_id=d.task_id,
-                               payload={"finding_id": fid})
+            # Accepted findings are resolved ONLY on an explicit accept
+            # decision.  rework/cancel/request_owner_gate leave them open:
+            # the remediation has not actually been verified yet, so marking
+            # them RESOLVED would drop a live finding from the lifecycle.
+            if decision == "accept":
+                for fid in validated.get("accepted_findings", []) or []:
+                    f = self._store.get_finding(fid)
+                    if f is not None and f.status is FindingStatus.OPEN:
+                        self._store._update_finding_status(
+                            fid, FindingStatus.RESOLVED, now
+                        )
+                        self._emit("finding.resolved", task_id=d.task_id,
+                                   payload={"finding_id": fid})
         elif d.role is Role.QA:
             for t in validated.get("tests", []) or []:
                 name = ""

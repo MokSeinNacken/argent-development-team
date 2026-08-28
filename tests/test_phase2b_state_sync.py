@@ -13,6 +13,7 @@ receive failed.  This test pins the fixed behaviour with the mock runtime.
 import pytest
 
 from argent_core import (
+    FindingStatus,
     Role,
     SequenceKind,
     TaskState,
@@ -99,3 +100,56 @@ def test_rework_start_rework_keeps_cycle(core):
     assert t.state is TaskState.REWORK, t.state
     frontier = core._workflow_frontier(task.id)
     assert frontier.cycle_no == 3 and frontier.expected_role is Role.LEAD
+
+
+def test_rework_keeps_accepted_findings_open_then_accept_resolves(core):
+    """FIX 2(b): a lead decision only resolves accepted findings on 'accept'.
+
+    A rework decision that lists an accepted finding must NOT mark it RESOLVED
+    (the remediation was never verified).  A subsequent accept resolves it.
+    """
+    runtime = MockRuntime()
+    task, task_run = orchestrated_task(core)
+
+    # pos0 lead (accept) creates a HIGH finding via its findings payload.
+    d, session, run = start_and_dispatch(
+        core, runtime, task, task_run, Role.LEAD, 1, 0, SequenceKind.STANDARD
+    )
+    res = receive_valid(
+        core, runtime, d, session, run, task.id, Role.LEAD,
+        decision="accept",
+        findings=[{"severity": "high", "description": "persistent defect remains"}],
+    )
+    assert res.status == "consumed", res
+    findings = core.queries.list_findings(task.id)
+    assert len(findings) == 1
+    fid = findings[0].id
+    assert findings[0].status is FindingStatus.OPEN
+
+    # pos1 analyst, then pos2 lead decides REWORK while "accepting" the finding.
+    d, session, run = start_and_dispatch(
+        core, runtime, task, task_run, Role.ANALYST, 1, 1, SequenceKind.STANDARD
+    )
+    assert receive_valid(core, runtime, d, session, run, task.id, Role.ANALYST).status == "consumed"
+    d, session, run = start_and_dispatch(
+        core, runtime, task, task_run, Role.LEAD, 1, 2, SequenceKind.STANDARD
+    )
+    res = receive_valid(
+        core, runtime, d, session, run, task.id, Role.LEAD,
+        decision="rework",
+        accepted_findings=[fid],
+    )
+    assert res.status == "consumed", res
+    assert core.queries.get_finding(fid).status is FindingStatus.OPEN  # rework keeps it open
+
+    # rework-cycle lead accept resolves the same finding.
+    d, session, run = start_and_dispatch(
+        core, runtime, task, task_run, Role.LEAD, 2, 0, SequenceKind.REWORK
+    )
+    res = receive_valid(
+        core, runtime, d, session, run, task.id, Role.LEAD,
+        decision="accept",
+        accepted_findings=[fid],
+    )
+    assert res.status == "consumed", res
+    assert core.queries.get_finding(fid).status is FindingStatus.RESOLVED

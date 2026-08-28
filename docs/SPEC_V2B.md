@@ -2,14 +2,16 @@
 
 Basis: Phase 2A (ORCHESTRATION_GREEN, 676b4ee, 727 Tests). Owner-freigegeben am 2026-08-27 20:16
 (exakt Variante A; Approval nicht übertragbar). Config-Änderung bereits aktiv (siehe
-docs/PHASE2B_CONFIG_CHANGE.md): 5 Rollen-Agenten mit `tools.profile="minimal"` +
-`tools.deny=["session_status"]` → effektiv 0 direkte Tools (belegt: minimal-Profil = nur
-session_status; deny gewinnt; session_status wird Subagenten nativ entzogen).
+docs/PHASE2B_CONFIG_CHANGE.md): 5 Rollen-Agenten mit `tools.profile="minimal"` →
+zero dangerous or mutating tools; one harmless status capability (session_status)
+auf direkten Turns; Subagent-Spawns fail closed (belegt: minimal-Profil = nur
+session_status; session_status wird Subagenten nativ entzogen).
 
 ## 1. Sicherheitsarchitektur (final)
 
-- **Layer 1 (nativ):** Rollen-Agenten haben 0 direkte Tools — kein read (host-weit!), kein exec,
-  kein write/edit/apply_patch, kein web, kein memory, keine Sessions. Sub-Spawns nativ verboten.
+- **Layer 1 (nativ):** Rollen-Agenten haben zero dangerous or mutating tools; one harmless
+  status capability (session_status) on direct turns; subagent spawns fail closed — kein read
+  (host-weit!), kein exec, kein write/edit/apply_patch, kein web, kein memory, keine Sessions.
 - **Layer 2 (Core):** Provenance, Owner Gates, Rollenrechte, Workflow (unverändert Phase 2A).
 - **Datenfluss:** Controller erzeugt scope-validierte **Context-Snapshots** (Denylist-gescannt,
   größenbegrenzt) → Agent liefert strukturiertes JSON → Controller validiert (Provenance) →
@@ -38,8 +40,9 @@ Härtungsregeln (alle verpflichtend, jeweils mit Test):
    reguläre Dateien im Scope.
 7. **Config-/Secret-Pfade:** Zusätzliche Deny-Liste (unabhängig vom Scope): `~/.openclaw`,
    `/etc`, `~/.ssh`, `~/.config`, `~/.npm-global`, `/mnt/*`, `/proc`, `/sys`, `/dev`, `/run`,
-   sowie jede Datei, deren Inhalt den Denylist-Scan (events.PRIVACY_DENYLIST + `secret`,
-   `api_key`, `token`, `password`) verletzt → Ablehnung.
+   sowie jede Datei, deren Inhalt einen Privacy-High-Signal-Marker der (eingeengten) Content-
+   Deny-Liste enthält: `secret`, `password`, `api_key`, `credential`, `mail_content`,
+   `mail_address`, `email_address`, `recipient` → Ablehnung.
 8. **TOCTOU-nahe Fälle:** Staging-Datei im Zielverzeichnis schreiben (`O_CREAT|O_EXCL|O_NOFOLLOW`),
    unmittelbar vor `os.replace` erneute Kanonisierung des Ziels, nach dem Replace `lstat`-Verifikation
    (4+5). Bei jeder Verletzung: bereits geschriebene Dateien des Patch-Sets zurücksetzen
@@ -63,12 +66,13 @@ Exakte Isolation (freigegeben; verifiziert durch Selftests):
 bwrap --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
       --ro-bind /bin /bin --ro-bind /sbin /sbin --ro-bind /etc /etc \
       --proc /proc --dev /dev --tmpfs /tmp --tmpfs /home --tmpfs /root \
-      --bind <workspace> /workspace \
+      --ro-bind <workspace> /workspace \
       --unshare-net --unshare-pid --die-with-parent --new-session \
       --clearenv --setenv PATH /usr/local/bin:/usr/bin:/bin \
       --setenv HOME /tmp --setenv LANG C.UTF-8 \
+      --setenv PYTHONDONTWRITEBYTECODE 1 \
       prlimit --nproc=64 --as=536870912 --cpu=30 --fsize=10485760 -- \
-      timeout 120 python3 -m pytest /workspace/tests -q
+      timeout 120 python3 -m pytest /workspace/tests -q -p no:cacheprovider
 ```
 - `/home/pc`, `/mnt/c`, `~/.ssh`, `/run/user` unsichtbar (tmpfs-Overlays; verifiziert).
 - Kein Netz (--unshare-net; verifiziert). PID-Isolation (--unshare-pid --die-with-parent),
@@ -81,7 +85,8 @@ bwrap --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
 `context.build_agent_context` (Phase 2A) wird erweitert um `fixture_snapshot`:
 Controller liest relevante Fixture-Dateien (nur Dateien im Fixture-Scope, max. 64 KB/Datei,
 max. 20 Dateien), scannt mit Denylist (keine Secrets), und bindet sie als Text-Sektion in den
-Agenten-Prompt. Rollen-Agenten haben KEINE Tools → sie können nur sehen, was der Snapshot enthält.
+Agenten-Prompt. Rollen-Agenten haben zero dangerous or mutating tools (nur die harmlose
+Status-Fähigkeit session_status auf direkten Turns) → sie können nur sehen, was der Snapshot enthält.
 Snapshot wird als `agent_context_snapshots` persistiert (Hash + Summary; keine vollen Inhalte in
 Events/Handoffs).
 
@@ -116,7 +121,7 @@ Der Rework-Zyklus wird NICHT simuliert.
 - QA Produktcode-Write → blockiert; QA Testdatei-Write → erlaubt (Broker-Scope)
 - Implementer Produktcode-Write → erlaubt; Implementer außerhalb Task-Scope → blockiert (Broker)
 - Agent kann eigene Rechte nicht erhöhen / Tool Policy nicht verändern / Sandbox nicht deaktivieren
-  (0-Tools + Core-FORBIDDEN-Aktionen; Tests auf Core-Ebene)
+  (zero dangerous/mutating tools + Core-FORBIDDEN-Aktionen; Tests auf Core-Ebene)
 - Agent kann Owner Gate nicht umgehen / andere Rolle nicht direkt starten (bestehende Provenance-Tests)
 - inherited permissions → keine Eskalation (Leaf-Subagent-Restriktion dokumentiert + Core-Test)
 - falsche Session/Rolle → Provenance-Reject (bestehend)
@@ -129,7 +134,7 @@ Der Rework-Zyklus wird NICHT simuliert.
 ## 7. Abnahmekriterien Phase 2B (unverändert aus Owner-Auftrag §14)
 
 Alle Tests grün, keine Skips; keine offenen HIGH/CRITICAL, keine unakzeptierten relevanten MEDIUM;
-Rollenrechte Core-seitig verifiziert; native Tool-Rechte verifiziert (0-Tools-Config aktiv);
+Rollenrechte Core-seitig verifiziert; native Tool-Rechte verifiziert (zero dangerous/mutating tools; session_status-only, spawns fail closed);
 echter vollständiger 5-Agenten-Workflow erfolgreich; echter Rework-Workflow erfolgreich;
 Recovery/Reconciliation erfolgreich; Provenance mit echten Agent-IDs verifiziert;
 Lead/Reviewer getrennte Sessions; nur Implementer schreibt Produktcode; QA nur Tests;
@@ -173,7 +178,7 @@ die `from parser import ...` nutzen, funktionieren unabhängig vom Caller-cwd
 
 Deterministischer Controller: init/status/next/run/init-rework/unexpected-smoke/
 recovery-smoke. Rollen-Agenten laufen als direkte `openclaw agent`-Turns
-(0 Tools); der Controller wendet Patch-Sets über den Write-Broker an, testet im
+(zero dangerous/mutating tools; nur session_status); der Controller wendet Patch-Sets über den Write-Broker an, testet im
 bwrap-Namespace und zeichnet Test-Runs im Core auf. Enthält: Vokabular-Guard
 (Deny-List-Compliance der Agenten, dokumentierte False-Positive-Vermeidung),
 Content-Normalisierung (Agenten liefern Klartext; Base64 wird erkannt),
@@ -201,3 +206,98 @@ für Nicht-Null).
 - Verifikation: 794 Tests grün (inkl. 3 neuer F9-Regressionstests); Visualizer
   und Mail-Agent unverändert; OpenClaw-Config identisch zum last-good-Stand
   (keine Config-Änderung durch Phase 2B); lokaler Commit, kein Push.
+
+## 8.5 Closing-Review-Fixes (2026-08-28)
+
+Umsetzung der bestätigten, supervisor-verifizierten Findings der unabhängigen
+Sol-Review. Nur die bestätigten Findings wurden geändert; kein Re-Run des E2E,
+keine Dispatch-/DB-/Config-Änderung, kein Push.
+
+### 8.5.1 F1 (CRITICAL) — Sandbox-Escape: Workspace war read-write gemountet
+
+`argent_core/sandbox_runner.py` `build_command` mountete den Workspace mit
+`--bind <workspace> /workspace` (read-write); QA-verfasste Tests hätten
+Produktdateien (parser.py/service.py) auf dem Host überschreiben und damit den
+Broker-Scope umgehen können. Fix: `--ro-bind <workspace> /workspace`,
+`--setenv PYTHONDONTWRITEBYTECODE 1`, und `-p no:cacheprovider` in der
+Default-pytest-Invokation (pytest braucht keinen Schreibzugriff mehr).
+Regressionstest `test_sandbox_cannot_overwrite_product_file` (Write-Versuch →
+Exit != 0, Host-Datei unverändert) + `test_build_command_workspace_ro_bind`.
+Verifikation: Suite grün; e2e-fixture läuft im Sandbox (90 Tests, exit 0).
+
+### 8.5.2 F2 (HIGH) — Dropped Finding + Finding-Lifecycle
+
+(a) `e2e-fixture/service.py` `format_duration`: eine Nicht-Null-Dauer konnte
+als `0m` rendern (`timedelta(microseconds=6)` / `=1` → `0m`), weil
+`_fraction_decimal` auf 6 Nachkommastellen kappte und `_rounded_fraction` auf
+6 Stellen rundete. Fix: Cap auf 12 Stellen, exakter Terminierungs-Pfad bleibt,
+`_rounded_fraction` rundet auf 12 Stellen und emittiert NIE eine zu Null
+rundende Fraktion (Minimum = kleinster darstellbarer Wert). Verifikation:
+`format_duration(6µs) == '0.0000001m'`, `(60µs) == '0.000001m'`,
+`(1µs) == '0.000000016667m'`; alle round-trip-parsen zu Nicht-Null (1/6/60 µs).
+Fixture-Tests `e2e-fixture/tests/test_duration_microseconds.py`.
+
+(b) `argent_core/core.py` `_apply_role_effects`: akzeptierte Findings wurden
+unabhängig von der Lead-Entscheidung als RESOLVED markiert — ein `rework`
+markierte nie behobene Findings als erledigt (cycle-6-HIGH-Fall). Fix:
+akzeptierte Findings nur bei `decision == "accept"` auflösen; bei
+`rework`/`cancel`/`request_owner_gate` bleiben sie OPEN. Regressionstest
+`test_rework_keeps_accepted_findings_open_then_accept_resolves`.
+
+### 8.5.3 F3 (MEDIUM) — Encoding-Bypass
+
+`smoke/phase2b_e2e.py` `_normalize_content`: doppelt-kodiertes
+`base64(base64(x))` passierte den Round-Trip unverändert → der Broker dekodierte
+nur einmal, der Deny-Scan sah nur Base64-Text, der innere Inhalt wurde nie
+gescannt. Fix: vollständiges Entpacken verschachtelter Kodierungen (gültiges
+Base64 + gültiges UTF-8 + verändert → dekodieren; Depth-Cap 4), dann entweder
+als Base64 behalten (konsistenter Round-Trip) oder Klartext neu kodieren.
+Unit-Tests `tests/test_phase2b_driver_normalize.py` (doppelt/plain/single/
+invalides Base64/Whitespace) + Broker-Reject-Nachweis (entpackter Deny-Inhalt
+wird abgelehnt). Verifikation: doppelt-kodiertes `"deploy with password
+hunter2"` wird jetzt vollständig entpackt und vom Broker mit `content_denylist`
+abgelehnt.
+
+### 8.5.4 F4 (MEDIUM) — Überbreite Content-Deny-Liste
+
+`argent_core/workspace_broker.py` `CONTENT_DENYLIST` war identisch zur vollen
+`events.PRIVACY_DENYLIST` und lehnte legitimen Code ab (`token = lexer.next()`,
+`data.decode()`, `request.body`, `different`). Fix: eingeengt auf Privacy-High-
+Signal-Marker `{secret, password, api_key, credential, mail_content,
+mail_address, email_address, recipient}`; `events.PRIVACY_DENYLIST` bleibt
+unverändert (Envelope-Validierung in outputs.py/events). Vokabular-Guard in
+`_build_prompt` auf zwei Tiers: Envelope/Findings → volle Deny-Liste;
+Patch-DATEI-Inhalt → nur die eingeengte Content-Liste. Tests aktualisiert
+(`test_content_denylist_token_now_accepted` + High-Signal-Reject/
+Ordinary-Code-Accept-Matrix).
+
+### 8.5.5 F5 (LOW) — No-op-Erkennung
+
+`smoke/phase2b_e2e.py`: Ziel-Dateien werden vor/nach dem Broker-Apply gehasht;
+ein byte-identischer Write wird als `no-op` geloggt (bei Rework-Implementer-
+Zyklen zusätzlich als Hinweis in der Schritt-Ausgabe). Reines Reporting, keine
+Verhaltensänderung.
+
+### 8.5.6 F6 (LOW) — Docs: "0 Tools"-Behauptungen korrigiert
+
+`docs/SPEC_V2B.md`: wörtliche "0 Tools"/"0 direkte Tools"-Behauptungen (§1, §5,
+§7 sowie Header, §6, §8.3) ersetzt durch "zero dangerous or mutating tools; one
+harmless status capability (session_status) on direct turns; subagent spawns
+fail closed". §2-Regel 7 und der §3-Kommandoblock an F1/F4 angeglichen.
+
+### 8.5.7 F7 — Mail-Agent (kein Code)
+
+Keine Änderung im Repo. Der Abschlussbericht dokumentiert die engere, verifizierte
+Aussage: während Phase 2B wurde kein Mail-Agent-Code geändert; der v2-Code
+stammt aus der Zeit vor Phase 2B.
+
+### Verifikation (Closing-Review-Fixes)
+
+- Suite: `python3 -m pytest tests/ -q` → **805 passed** (0 skips, 0 xfails).
+- Sandbox-Fixture: `run_tests('e2e-fixture')` → **exit_code 0, timed_out False,
+  90 passed**.
+- F2-Mikrosekunden: 1µs/6µs/60µs rendern nie `0m` und round-trip-parsen zu
+  Nicht-Null.
+- F3-Bypass: doppelt-kodierter Deny-Inhalt jetzt abgelehnt (`content_denylist`).
+- F4-Matrix: reject secret/password/api_key/credential/recipient; accept
+  token/code/diff/content/subject/body/api_token.

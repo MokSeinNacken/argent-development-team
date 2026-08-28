@@ -228,11 +228,34 @@ def test_content_denylist_rejected(b, scope):
     assert not (scope / "a.txt").exists()
 
 
-def test_content_denylist_token_rejected(b, scope):
+def test_content_denylist_token_now_accepted(b, scope):
+    # FIX 4: 'token' is ordinary code, no longer a content deny-list term.
     res = b.apply_patch_set(
         scope, [_w("a.txt", "api_token = abc123")], Role.IMPLEMENTER, LEAD
     )
-    assert res.errors[0]["error"] == "content_denylist"
+    assert res.errors == []
+    assert (scope / "a.txt").read_text() == "api_token = abc123"
+
+
+def test_content_denylist_high_signal_rejected(b, scope):
+    # FIX 4: privacy-high-signal markers are still rejected in file content.
+    for text in ("secret", "password", "api_key =", "credential", "recipient"):
+        res = b.apply_patch_set(
+            scope, [_w("a.txt", text)], Role.IMPLEMENTER, LEAD
+        )
+        assert res.applied == [], text
+        assert res.errors[0]["error"] == "content_denylist", text
+        assert not (scope / "a.txt").exists()
+
+
+def test_content_denylist_ordinary_code_accepted(b, scope):
+    # FIX 4: ordinary code words are no longer rejected in file content.
+    for text in ("token", "code", "diff", "content", "subject", "body"):
+        res = b.apply_patch_set(
+            scope, [_w("a.txt", text)], Role.IMPLEMENTER, LEAD
+        )
+        assert res.errors == [], text
+        assert (scope / "a.txt").read_text() == text
 
 
 # --------------------------------------------------------- §2.8 TOCTOU-near

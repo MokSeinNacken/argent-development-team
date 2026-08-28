@@ -47,12 +47,33 @@ def test_bwrap_runs_on_empty_fixture_skeleton(tmp_path):
         assert res.exit_code == 5
         assert "no tests ran" in (res.stdout_bounded + res.stderr_bounded).lower()
     finally:
-        # The sandbox runs pytest in a read-write bind, so it leaves a cache
-        # dir behind; remove it so the workspace stays pristine.
+        # The sandbox mounts the workspace read-only and runs pytest with
+        # -p no:cacheprovider, so no .pytest_cache dir is written; the guard
+        # below is belt-and-suspenders cleanup (a no-op in practice).
         import shutil
 
         if cache.exists():
             shutil.rmtree(cache)
+
+
+def test_sandbox_cannot_overwrite_product_file(tmp_path):
+    """FIX 1 (sandbox escape): the workspace is ro-bound, so a QA test that
+    tries to write /workspace/product.py must fail and leave the host file
+    unchanged."""
+    ws = _workspace(
+        tmp_path,
+        {
+            "test_write.py": (
+                "def test_write_product():\n"
+                "    with open('/workspace/product.py', 'w') as fh:\n"
+                "        fh.write('MUTATED')\n"
+            )
+        },
+    )
+    (ws / "product.py").write_text("ORIGINAL")
+    res = run_tests(str(ws))
+    assert res.exit_code != 0, res.stdout_bounded + res.stderr_bounded
+    assert (ws / "product.py").read_text() == "ORIGINAL"
 
 
 # ---------------------------------------------------------- §3 host invisible
@@ -218,3 +239,14 @@ def test_build_command_limits_configurable(tmp_path):
     joined = " ".join(cmd)
     assert "timeout 7" in joined
     assert "--nproc=11" in joined
+
+
+def test_build_command_workspace_ro_bind(tmp_path):
+    """FIX 1: the workspace is mounted read-only, pytest runs without cache,
+    and bytecode writing is disabled (no write access needed)."""
+    cmd = build_command(str(tmp_path))
+    assert "--bind" not in cmd  # no read-write workspace bind remains
+    i = cmd.index("/workspace")
+    assert cmd[i - 2] == "--ro-bind"
+    assert "PYTHONDONTWRITEBYTECODE" in cmd
+    assert "-p" in cmd and "no:cacheprovider" in cmd

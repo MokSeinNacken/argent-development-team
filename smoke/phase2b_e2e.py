@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
+import hashlib
 import json
 import os
 import re
@@ -48,7 +50,9 @@ from argent_core import (  # noqa: E402
     run_tests,
 )
 from argent_core import context  # noqa: E402
+from argent_core.events import PRIVACY_DENYLIST  # noqa: E402
 from argent_core.outputs import validate_role_output  # noqa: E402
+from argent_core.workspace_broker import CONTENT_DENYLIST  # noqa: E402
 
 OWNER = OWNER_SOURCE
 CONTROLLER = role_source(Role.LEAD)
@@ -153,12 +157,12 @@ ROLE_INSTRUCTIONS = {
         "You are the IMPLEMENTER. You write code by delivering a patch_set. "
         "Read the fixture snapshot carefully: parser.py and service.py are "
         "stubs raising NotImplementedError; tests/ is empty. Deliver complete "
-        "new file contents (base64). Do not touch anything outside the fixture."
+        "new file contents as plain text. Do not touch anything outside the fixture."
     ),
     Role.QA: (
         "You are the QA engineer. Review the implemented code (see fixture "
         "snapshot and changed files). Add/extend pytest tests under tests/ "
-        "via test_patch_set (base64). Run nothing yourself; report the tests "
+        "via test_patch_set (plain text content). Run nothing yourself; report the tests "
         "you expect to pass. Your tests must cover the required edge cases."
     ),
     Role.REVIEWER: (
@@ -307,7 +311,7 @@ def _build_prompt(core: Core, task, role: Role, d, repo_summary: dict, fixture: 
             "conversion only.\n"
             "2) format_duration must never render a nonzero duration as '0m' - "
             "always emit the exact decimal minute fraction (e.g. 6 microseconds "
-            "-> '0.0001m')."
+            "-> '0.0000001m', 1 microsecond -> '0.000000016667m')."
         )
     pos_guidance = _position_guidance(role, d.position, d.cycle_no, d.sequence_kind.value)
     if pos_guidance:
@@ -316,21 +320,26 @@ def _build_prompt(core: Core, task, role: Role, d, repo_summary: dict, fixture: 
         lines.append(pos_guidance)
     lines.append("")
     lines.append("=== STRICT VOCABULARY RULE (privacy boundary, fail-closed) ===")
-    lines.append(
-        "Your ENTIRE reply - every field, every finding description, every string, "
-        "and every patch file - must NOT contain any of these substrings "
-        "(case-insensitive, also when they appear inside longer words):\n"
-        "  prompt, chain_of_thought, cot, reasoning, secret, password, api_key, "
-        "token, credential, mail_content, mail_address, email_address, "
-        "source_code, code, diff, body, subject, content, recipient\n"
-        "Common forbidden words to watch out for: code, encode, decode, different, "
-        "contents, reasoning, tokens, subjects, body, recipient, prompt.\n"
-        "Use safe synonyms instead, e.g.: implementation->logic, encode/decode->"
-        "pack/unpack, different->various, content->data, token->component, "
-        "subject->topic, body->text, recipient->addressee, reasoning->analysis.\n"
-        "Never quote this rule back in your reply. The validator rejects the whole "
-        "result (and the patch set) on the first hit."
-    )
+    lines.append("This rule has TWO tiers with different scope. Match the tier to where the text goes.")
+    lines.append("")
+    lines.append("TIER 1 - ENVELOPE: every field of your reply EXCEPT the patch file "
+                 "content must NOT contain any of these substrings "
+                 "(case-insensitive, also inside longer words):")
+    lines.append("  " + ", ".join(sorted(PRIVACY_DENYLIST)))
+    lines.append("This covers every envelope field, finding description, and every "
+                 "string you return outside the patch files. The envelope "
+                 "validator rejects the WHOLE result on the first hit.")
+    lines.append("")
+    lines.append("TIER 2 - PATCH FILE CONTENT: only the text INSIDE the "
+                 "patch_set/test_patch_set 'content' fields must avoid these "
+                 "high-signal terms:")
+    lines.append("  " + ", ".join(sorted(CONTENT_DENYLIST)))
+    lines.append("Ordinary words like code, encode, decode, token, content, subject, "
+                 "body, diff are ALLOWED inside patch file content (they are only "
+                 "forbidden in the envelope tier).")
+    lines.append("")
+    lines.append("Use safe synonyms where a term is forbidden in its tier. "
+                 "Never quote this rule back in your reply.")
     lines.append("")
     lines.append("=== REQUIRED OUTPUT ===")
     lines.append("Reply with EXACTLY ONE JSON object and nothing else: no markdown, no code fences, no prose.")
@@ -455,30 +464,99 @@ def _read_run_id(agent_id: str, dispatch_id: str) -> str:
     raise RuntimeError(f"no session.started runId in {traj}")
 
 
-def _normalize_content(raw: str) -> str:
-    """Return base64 for the broker.
+def _is_consistent_b64(s: str) -> bool:
+    """True when ``s`` is valid base64 that re-encodes to exactly itself."""
+    try:
+        decoded = base64.b64decode(s, validate=True).decode("utf-8")
+        return base64.b64encode(decoded.encode("utf-8")).decode("ascii") == s
+    except (binascii.Error, ValueError, UnicodeDecodeError):
+        return False
 
-    Agents may send either plain text (preferred) or already-base64 content.
-    Plain text is encoded here; already-valid base64 that decodes to UTF-8 is
-    kept as-is.  Corrupt base64 (e.g. stray spaces) is treated as plain text
-    and re-encoded, so the broker always receives a clean payload.
+
+def _normalize_content(raw: str) -> str:
+    """Return a clean base64 payload for the broker.
+
+    The agent contract is PLAIN UTF-8 text; legacy base64 (single or nested)
+    is still recognised and canonicalised so the broker always scans/writes
+    the true canonical content.  Behaviour:
+
+    - Plain text (not valid base64) and whitespace-only/empty input: encoded
+      from the ORIGINAL bytes - leading/trailing whitespace, blank lines and
+      final newlines are preserved byte-for-byte.
+    - Single-encoded base64: kept as-is (the broker decodes it exactly once).
+    - Multi-encoded base64: fully unwrapped (depth cap 4); the next layer is
+      recognised on the STRIPPED decoded form, so formatted inner layers
+      (whitespace around nested base64) are unwrapped too instead of being
+      written still-encoded.  If the cap is exhausted and a consistent
+      encoded layer still remains, the input is REJECTED (fail-closed).
+
+    Known limitation (documented, LOW): plain text that is itself a consistent
+    base64 string (e.g. ``YWJj``) is interpreted as encoded input and decoded.
+    The prompt contract (plain text, no manual encoding) makes this rare; it
+    is an ambiguity, never a security boundary (the broker still scans the
+    canonical bytes it writes).
     """
     if not isinstance(raw, str):
         raise ValueError("content must be a string")
+    original = raw
     stripped = raw.strip()
+    # Whitespace-only (or empty) input is plaintext: preserve the bytes
+    # exactly instead of letting the empty stripped form count as base64.
+    if not stripped:
+        return base64.b64encode(original.encode("utf-8")).decode("ascii")
+    if not _is_consistent_b64(stripped):
+        # Plain-text path: encode the ORIGINAL bytes (whitespace-preserving).
+        return base64.b64encode(original.encode("utf-8")).decode("ascii")
+    candidate = stripped
+    exhausted = False
+    # Fully unwrap: while the current string is valid base64 AND decodes to
+    # valid UTF-8 AND the decoded text differs, decode (depth cap 4).  The
+    # next encoded layer is recognised on the STRIPPED decoded form so a
+    # formatted inner layer (whitespace around nested base64) is unwrapped
+    # instead of being written still-encoded.
+    for _ in range(4):
+        try:
+            decoded = base64.b64decode(candidate, validate=True).decode("utf-8")
+        except (binascii.Error, ValueError, UnicodeDecodeError):
+            break
+        if decoded == candidate:
+            break
+        if _is_consistent_b64(decoded.strip()) and decoded.strip() != decoded:
+            candidate = decoded.strip()
+        else:
+            candidate = decoded
+    else:
+        exhausted = True
+    cand = candidate.strip()
+    if _is_consistent_b64(cand):
+        if exhausted:
+            # The cap was fully consumed and the remaining text is STILL a
+            # consistent base64 layer (possibly whitespace-padded).  The
+            # broker would decode one more layer and write still-encoded
+            # bytes (canonical content never scanned).
+            inner = base64.b64decode(cand, validate=True).decode("utf-8")
+            if _is_consistent_b64(inner.strip()):
+                raise ValueError("nested encoding exceeds depth cap")
+        return cand
+    # Multi-encoded input fully unwrapped to plain text: encode the canonical
+    # text (the broker writes exactly this).
+    return base64.b64encode(candidate.encode("utf-8")).decode("ascii")
+
+
+def _file_digest(path: Path) -> str:
+    """SHA-256 of a file's bytes (empty string if missing/unreadable)."""
     try:
-        decoded = base64.b64decode(stripped, validate=True).decode("utf-8")
-        # Round-trip check: re-encoding the decoded text yields the input,
-        # i.e. this really is single-encoded base64 text.
-        if base64.b64encode(decoded.encode("utf-8")).decode("ascii") == stripped:
-            return stripped
-    except Exception:
-        pass
-    return base64.b64encode(raw.encode("utf-8")).decode("ascii")
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
 
 
 def _apply_patches(role: Role, agent_json: dict) -> dict:
-    """Apply implementer/qa patches via the write broker. Returns broker result."""
+    """Apply implementer/qa patches via the write broker. Returns broker result.
+
+    Also detects no-op writes: a write whose target file ends up byte-identical
+    to its pre-apply content.
+    """
     broker = WorkspaceBroker()
     if role is Role.IMPLEMENTER:
         patch_set = agent_json.get("patch_set") or []
@@ -487,14 +565,29 @@ def _apply_patches(role: Role, agent_json: dict) -> dict:
         patch_set = agent_json.get("test_patch_set") or []
         field = "test_patch_set"
     else:
-        return {"field": None, "result": None}
+        return {"field": None, "result": None, "noops": []}
     if not patch_set:
-        return {"field": field, "result": None}
+        return {"field": field, "result": None, "noops": []}
+    write_paths = []
+    for p in patch_set:
+        if p.get("op") == "write" and isinstance(p.get("path"), str):
+            raw = p["path"]
+            if os.path.isabs(raw):
+                continue  # the broker rejects absolute paths anyway
+            candidate = (FIXTURE_ROOT / raw).resolve()
+            if candidate.is_relative_to(FIXTURE_ROOT):
+                write_paths.append(candidate)
+    before = {p: _file_digest(p) for p in write_paths}
     for p in patch_set:
         if isinstance(p.get("content"), str):
             p["content"] = _normalize_content(p["content"])
     res = broker.apply_patch_set(FIXTURE_ROOT, patch_set, role, CONTROLLER)
-    return {"field": field, "result": res}
+    noops = [
+        str(p.relative_to(FIXTURE_ROOT))
+        for p in write_paths
+        if _file_digest(p) == before[p]
+    ]
+    return {"field": field, "result": res, "noops": noops}
 
 
 def _snapshot_fixture() -> Path:
@@ -645,6 +738,13 @@ def cmd_run(args) -> int:
                     core.close()
                     return 3
                 print(f"broker applied {len(res.applied)} file(s), skipped {len(res.skipped)}")
+                noops = patch_info.get("noops") or []
+                if noops:
+                    print(f"no-op: byte-identical writes -> {', '.join(noops)}")
+                    if role is Role.IMPLEMENTER and kind is SequenceKind.REWORK:
+                        print(f"NOTE (rework implementer): no byte change in "
+                              f"{', '.join(noops)}; verify the remediation actually "
+                              "alters the files")
             # bwrap sandbox run
             sandbox = run_tests(FIXTURE_ROOT, pytest_args=["/workspace/tests", "-q"])
             print(f"bwrap tests: exit={sandbox.exit_code} wall={sandbox.wall_seconds:.1f}s "

@@ -3,10 +3,11 @@
 Runs agent-authored test code inside a hardened bubblewrap namespace.  The
 isolation is exactly the released command line of SPEC V2B §3 (ro-binds for
 ``/usr``, ``/lib``, ``/lib64``, ``/bin``, ``/sbin``, ``/etc``; ``--proc``;
-``--dev``; tmpfs for ``/tmp``, ``/home``, ``/root``; ``--bind`` of the
-workspace to ``/workspace``; ``--unshare-net``; ``--unshare-pid``;
+``--dev``; tmpfs for ``/tmp``, ``/home``, ``/root``; ``--ro-bind`` (read-only)
+of the workspace to ``/workspace``; ``--unshare-net``; ``--unshare-pid``;
 ``--die-with-parent``; ``--new-session``; ``--clearenv`` with a minimal env;
-``prlimit`` resource caps; ``timeout``; ``python3 -m pytest``).
+``prlimit`` resource caps; ``timeout``; ``python3 -m pytest`` with
+``-p no:cacheprovider`` and ``PYTHONDONTWRITEBYTECODE=1``).
 
 All parameters are configurable via ``limits`` / ``pytest_args``.  Output is
 bounded to 64 KB per stream.
@@ -81,7 +82,11 @@ def build_command(
         "--tmpfs", "/tmp",
         "--tmpfs", "/home",
         "--tmpfs", "/root",
-        "--bind", os.fspath(workspace_path), "/workspace",
+        # The workspace is mounted READ-ONLY: sandboxed (QA-authored) tests
+        # must never be able to overwrite product files on the host.  pytest
+        # therefore runs with -p no:cacheprovider and PYTHONDONTWRITEBYTECODE
+        # so it needs no write access into the workspace at all.
+        "--ro-bind", os.fspath(workspace_path), "/workspace",
         "--unshare-net",
         "--unshare-pid",
         "--die-with-parent",
@@ -90,6 +95,7 @@ def build_command(
         "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
         "--setenv", "HOME", "/tmp",
         "--setenv", "LANG", "C.UTF-8",
+        "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
     ]
     if site is not None:
         cmd += [
@@ -105,7 +111,7 @@ def build_command(
         f"--fsize={merged['fsize']}",
         "--",
         "timeout", str(merged["timeout"]),
-        "python3", "-m", "pytest", "/workspace/tests", "-q",
+        "python3", "-m", "pytest", "/workspace/tests", "-q", "-p", "no:cacheprovider",
     ]
     if pytest_args:
         cmd.extend(pytest_args)
