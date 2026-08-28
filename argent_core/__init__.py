@@ -6,7 +6,10 @@ privacy-safe events, idempotency and crash recovery.
 """
 
 from .core import ActionRequestResult, Core, ReceiveResult, RecoveryReport
+from .context import fixture_snapshot
 from .gates import EXTERNAL_ACTIONS, classify_action
+from .sandbox_runner import SandboxResult, run_tests
+from .workspace_broker import BrokerResult, WorkspaceBroker, broker
 from .models import (
     ActionClass,
     ActionExecution,
@@ -72,6 +75,7 @@ __all__ = [
     "ApprovalStatus",
     "ArgentError",
     "ArtifactCategory",
+    "BrokerResult",
     "Core",
     "DEFAULT_NEXT_ROLE",
     "Decision",
@@ -107,6 +111,7 @@ __all__ = [
     "RoleRunStatus",
     "SequenceKind",
     "SourceClass",
+    "SandboxResult",
     "Task",
     "TaskRun",
     "TaskRunStatus",
@@ -114,15 +119,19 @@ __all__ = [
     "TestResult",
     "TestRun",
     "UntrustedSource",
+    "WorkspaceBroker",
+    "broker",
     "can_read",
     "can_write",
     "check_permission",
     "classify_action",
     "classify_source",
+    "fixture_snapshot",
     "is_allowed",
     "is_valid_resume_target",
     "resolve_model",
     "role_source",
+    "run_tests",
     "validate_model_choice",
     "validate_transition",
 ]

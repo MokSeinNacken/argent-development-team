@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from typing import Any, Optional
 
 from . import events
@@ -134,8 +135,17 @@ def build_agent_context(
     test_runs: tuple = (),
     reviews: tuple = (),
     changed_files: tuple = (),
+    fixture_files: Optional[dict] = None,
+    fixture_skipped: tuple = (),
 ) -> dict[str, Any]:
-    """Build the role-scoped context dict (deterministic)."""
+    """Build the role-scoped context dict (deterministic).
+
+    ``fixture_files`` / ``fixture_skipped`` bind a :func:`fixture_snapshot`
+    result into the context (the controller supplies it for write roles whose
+    snapshot the agent must see).  When omitted (the default) the context
+    stays metadata-only, so persisted ``agent_context_snapshots`` never carry
+    file contents.
+    """
     owner_request = {
         "title": task.title,
         "description": task.description or "",
@@ -210,7 +220,85 @@ def build_agent_context(
     else:
         raise ValueError(f"unknown role {role!r}")
 
+    if fixture_files:
+        sections["fixture"] = {
+            "files": dict(fixture_files),
+            "skipped": list(fixture_skipped),
+        }
+
     return sections
+
+
+def _is_within(scope_root: str, path: str) -> bool:
+    """True if ``path`` is ``scope_root`` or strictly below it (boundary)."""
+    if path == scope_root:
+        return True
+    return path.startswith(scope_root + os.sep)
+
+
+def fixture_snapshot(
+    scope_root, max_files: int = 20, max_bytes: int = 65536
+) -> dict[str, Any]:
+    """Read files from the scope only (SPEC V2B §4).
+
+    Returns ``{files: {relpath: content}, skipped: [...]}``.  Only regular
+    files strictly inside ``realpath(scope_root)`` are read; symlinks escaping
+    the scope are ignored (and recorded as skipped).  Each file's content is
+    bounded to ``max_bytes`` and scanned against the privacy deny-list — files
+    with deny-listed content are skipped (never returned).  The total number of
+    returned files is capped at ``max_files``.
+
+    This mirrors the broker's hardening: realpath containment, no symlink
+    escape, and the deny-list scan.
+    """
+    scope_root = os.path.realpath(os.path.abspath(os.fspath(scope_root)))
+    files: dict[str, str] = {}
+    skipped: list = []
+
+    def walk(directory: str) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda e: e.name)
+        except OSError:
+            return
+        for entry in entries:
+            full = entry.path
+            rel = os.path.relpath(full, scope_root)
+            try:
+                if entry.is_symlink():
+                    # Never follow: a symlink could escape the scope.
+                    skipped.append({"path": rel, "reason": "symlink"})
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    walk(full)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    skipped.append({"path": rel, "reason": "special_file"})
+                    continue
+            except OSError:
+                skipped.append({"path": rel, "reason": "unreadable"})
+                continue
+
+            if len(files) >= max_files:
+                skipped.append({"path": rel, "reason": "file_limit"})
+                continue
+            try:
+                with open(full, "rb") as fh:
+                    data = fh.read(max_bytes + 1)
+            except OSError:
+                skipped.append({"path": rel, "reason": "unreadable"})
+                continue
+            if len(data) > max_bytes:
+                skipped.append({"path": rel, "reason": "size_limit"})
+                continue
+            text = data.decode("utf-8", errors="replace")
+            hit = events.scan_value_for_denylist(text)
+            if hit is not None:
+                skipped.append({"path": rel, "reason": "denylist"})
+                continue
+            files[rel] = text
+
+    walk(scope_root)
+    return {"files": files, "skipped": skipped}
 
 
 def context_hash(sections: dict[str, Any]) -> str:

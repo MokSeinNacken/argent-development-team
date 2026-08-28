@@ -54,7 +54,7 @@ PAUSE_STATES = frozenset(
 # Explicitly listed static transitions (main path + additional states).
 _STATIC: dict[TaskState, frozenset[TaskState]] = {
     TaskState.NEW: frozenset({TaskState.PLANNING}),
-    TaskState.PLANNING: frozenset({TaskState.ANALYZING}),
+    TaskState.PLANNING: frozenset({TaskState.ANALYZING, TaskState.REWORK}),  # V2B 16.3 (F9): pos0 rework gate
     TaskState.ANALYZING: frozenset({TaskState.LEAD_DECISION}),
     TaskState.LEAD_DECISION: frozenset({TaskState.IMPLEMENTING, TaskState.REWORK}),
     TaskState.IMPLEMENTING: frozenset({TaskState.TESTING}),

@@ -21,6 +21,7 @@ _STATIC: set = {
     # main path
     (TaskState.NEW, TaskState.PLANNING),
     (TaskState.PLANNING, TaskState.ANALYZING),
+    (TaskState.PLANNING, TaskState.REWORK),  # V2B 16.3 (F9): pos0 rework gate
     (TaskState.ANALYZING, TaskState.LEAD_DECISION),
     (TaskState.LEAD_DECISION, TaskState.IMPLEMENTING),
     (TaskState.LEAD_DECISION, TaskState.REWORK),  # SPEC V2.2 16.1 (F1)

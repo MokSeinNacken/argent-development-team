@@ -834,6 +834,22 @@ class Core:
             "source": source,
         }
 
+        # SPEC V2B §6/§7: a role that lacks the write permission for an
+        # AUTONOMOUS action is denied with a ``policy.role_violation`` event
+        # (emitted outside the idempotent transaction so it persists).
+        if cls is ActionClass.AUTONOMOUS:
+            category, mode = gates.permission_for(action)
+            try:
+                roles.check_permission(actor_role, category, mode)
+            except PermissionDenied:
+                self._emit(
+                    "policy.role_violation",
+                    task_id=task_id,
+                    role=actor_role.value,
+                    payload={"reason": "permission_denied", "action": action},
+                )
+                raise
+
         if cls is ActionClass.FORBIDDEN:
             def work():
                 task = self._store.get_task(task_id)
@@ -1570,7 +1586,12 @@ class Core:
             final_lead = role is Role.LEAD and pos > 0
 
         if role is Role.LEAD:
-            if kind is SequenceKind.STANDARD and pos == 2:
+            if kind is SequenceKind.STANDARD and pos == 0 and decision == "rework":
+                # V2B 16.3 (F9): a rework decision at the first (spec) gate
+                # enters the rework cycle via PLANNING -> REWORK (the frontier
+                # already starts cycle 2; the state sync must follow).
+                plan.append((TaskState.PLANNING, TaskState.REWORK))
+            elif kind is SequenceKind.STANDARD and pos == 2:
                 if decision == "rework":
                     plan.append((TaskState.LEAD_DECISION, TaskState.REWORK))
                 elif decision == "cancel":
@@ -1582,6 +1603,9 @@ class Core:
                     plan.append((TaskState.FINAL_DECISION, TaskState.REWORK))
                 elif decision == "cancel":
                     plan.append((TaskState.FINAL_DECISION, TaskState.CANCELLED))
+            elif kind is SequenceKind.REWORK and pos == 0 and decision == "cancel":
+                # Rework-start gate: a cancel must actually cancel (escape).
+                plan.append((TaskState.REWORK, TaskState.CANCELLED))
         return plan
 
     def _apply_state_sync(
