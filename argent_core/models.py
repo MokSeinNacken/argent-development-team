@@ -321,6 +321,12 @@ class OwnerApproval:
     decided_at: Optional[str]
     consumed_at: Optional[str]
     expires_at: str
+    # V4 gate-memory closure fields (SPEC V2C §4.3 / §10).
+    binding_hash: Optional[str] = None
+    approved_at: Optional[str] = None
+    execution_id: Optional[str] = None
+    executed_at: Optional[str] = None
+    closed_at: Optional[str] = None
 
 
 @dataclass(frozen=True)

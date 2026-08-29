@@ -516,11 +516,11 @@ def test_f8_realistic_v2_to_v3_migration(tmp_path):
     assert {"description", "risk_class", "external_actions_policy"} <= tcols
     dcols = {r[1] for r in c._store._conn.execute("PRAGMA table_info(agent_dispatches)")}
     assert "expected_thinking_tier" in dcols
-    # Version UPSERTed 2 -> 3.
+    # Version UPSERTed 2 -> 4.
     row = c._store._conn.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
-    assert row is not None and row["value"] == "3"
+    assert row is not None and row["value"] == "4"
     # Existing data intact.
     t = c.queries.get_task("t1")
     assert t.title == "x" and t.state is TaskState.NEW

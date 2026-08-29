@@ -332,6 +332,21 @@ class Core:
             raise NotFound(f"task {task_id!r} not found")
         return self._workflow_frontier(task_id).expected_role
 
+    def workflow_frontier(
+        self, task_id: str, source: str
+    ) -> workflow.WorkflowFrontier:
+        """Public read-only controller wrapper over the workflow frontier.
+
+        SPEC V2C §5.3 (F4): the supervisor needs ``(cycle_no, position,
+        sequence_kind, expected_role)`` and must not reach into the private
+        ``_workflow_frontier`` or re-implement the sequence math.  This is the
+        single public entry point.
+        """
+        self._require_controller(source)
+        if self._store.get_task(task_id) is None:
+            raise NotFound(f"task {task_id!r} not found")
+        return self._workflow_frontier(task_id)
+
     # ---------------------------------------------------------------- events
 
     def _emit(
@@ -390,6 +405,15 @@ class Core:
                 f"(approval={approval.task_id!r}/{approval.action!r}/{approval.scope!r}, "
                 f"requested={task_id!r}/{action!r}/{scope!r})"
             )
+        # F7 (SPEC V2C §10.1): the persisted binding hash must equal the
+        # recomputed canonical hash.  A tampered/stale stored hash must fail
+        # closed on approve/reject/execute, never be trusted.
+        recomputed = gates.binding_hash(task_id, action, scope)
+        if approval.binding_hash != recomputed:
+            raise ApprovalError(
+                f"approval {approval.id!r} binding_hash mismatch: stored "
+                f"{approval.binding_hash!r} != recomputed {recomputed!r}"
+            )
 
     # ------------------------------------------------------------- idempotency
 
@@ -447,6 +471,24 @@ class Core:
         ap = self._store.get_approval(result_id)
         if ap is None:
             raise IdempotencyError(f"idempotent replay: approval {result_id!r} missing")
+        return ap
+
+    def _approval_binding_refetch(
+        self, result_id: str, task_id: str, action: str, scope: str
+    ) -> OwnerApproval:
+        """Idempotent-replay refetch for approve/reject/execute_approved (F2).
+
+        The first execution runs ``_check_full_binding`` inside ``work()``; the
+        replay path must re-verify the same binding (task_id/action/scope +
+        binding_hash) against the persisted approval before returning it, so a
+        tampered/stale stored binding fails closed on replay too.
+        """
+        ap = self._store.get_approval(result_id)
+        if ap is None:
+            raise IdempotencyError(
+                f"idempotent replay: approval {result_id!r} missing"
+            )
+        self._check_full_binding(ap, task_id, action, scope)
         return ap
 
     def _request_action_refetch(self, result_id: str):
@@ -895,6 +937,7 @@ class Core:
                     source_class=SourceClass.TRUSTED, created_at=now,
                     decided_at=None, consumed_at=None,
                     expires_at=self._store.expiry_iso(APPROVAL_TTL_SECONDS),
+                    binding_hash=gates.binding_hash(task_id, action, scope),
                 )
                 self._store._insert_approval(ap)
                 task = self._store.get_task(task_id)
@@ -972,8 +1015,10 @@ class Core:
             return self._store.get_approval(approval_id), approval_id
 
         try:
-            return self._idempotent(idempotency_key, "approve", args, work,
-                                    lambda rid: self._refetch("approve", rid))
+            return self._idempotent(
+                idempotency_key, "approve", args, work,
+                lambda rid: self._approval_binding_refetch(rid, task_id, action, scope),
+            )
         except _ApprovalExpired as exc:
             with self._store._transaction():
                 self._expire_and_release(exc.approval_id)
@@ -1017,8 +1062,10 @@ class Core:
                        payload={"approval_id": approval_id})
             return self._store.get_approval(approval_id), approval_id
 
-        return self._idempotent(idempotency_key, "reject", args, work,
-                                lambda rid: self._refetch("reject", rid))
+        return self._idempotent(
+            idempotency_key, "reject", args, work,
+            lambda rid: self._approval_binding_refetch(rid, task_id, action, scope),
+        )
 
     def _expire_and_release(self, approval_id: str) -> None:
         """Expire an approval and release its task from the gate (SPEC V1.3 13.2).
@@ -1085,19 +1132,20 @@ class Core:
                 raise ApprovalError(
                     f"approval {approval_id!r} has an untrusted source class"
                 )
-            rc = self._store._consume_approval(approval_id, now)
+            eid = str(uuid4())
+            self._store._insert_action_execution(
+                ActionExecution(
+                    id=eid, task_id=ap.task_id, approval_id=approval_id,
+                    action=ap.action, scope=ap.scope, actor_role=ap.requested_by,
+                    status=ActionExecutionStatus.EXECUTED, created_at=self._store.now_iso(),
+                )
+            )
+            rc = self._store._consume_approval_with_execution(approval_id, now, eid)
             if rc == 0:
                 ap2 = self._store.get_approval(approval_id)
                 raise ApprovalError(
                     f"approval {approval_id!r} not consumable ({ap2.status.value})"
                 )
-            self._store._insert_action_execution(
-                ActionExecution(
-                    id=str(uuid4()), task_id=ap.task_id, approval_id=approval_id,
-                    action=ap.action, scope=ap.scope, actor_role=ap.requested_by,
-                    status=ActionExecutionStatus.EXECUTED, created_at=self._store.now_iso(),
-                )
-            )
             task = self._store.get_task(ap.task_id)
             if task is not None and task.state is TaskState.OWNER_APPROVAL_REQUIRED:
                 resume = task.resume_state
@@ -1107,8 +1155,10 @@ class Core:
             return self._store.get_approval(approval_id), approval_id
 
         try:
-            return self._idempotent(idempotency_key, "execute_approved", args, work,
-                                    lambda rid: self._refetch("execute_approved", rid))
+            return self._idempotent(
+                idempotency_key, "execute_approved", args, work,
+                lambda rid: self._approval_binding_refetch(rid, task_id, action, scope),
+            )
         except _ApprovalExpired as exc:
             with self._store._transaction():
                 self._expire_and_release(exc.approval_id)

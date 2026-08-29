@@ -1,5 +1,10 @@
 """Gated autonomy (SPEC V1 chapter 3 + V2 8.4 / V2.1 15.10).
 
+Phase 2C adds the deterministic owner-gate binding hash (SPEC V2C §4.3 / §10):
+the single source of truth for the ``binding_hash`` persisted on ``owner_approvals``.
+It is reused by both the store (insert + migration backfill) and the supervisor
+(gate-memory binding verification).
+
 Every action is classified into exactly one of three classes.  Anything not
 explicitly listed as AUTONOMOUS or OWNER_APPROVAL_REQUIRED is classified as
 FORBIDDEN (fail-closed).
@@ -11,6 +16,9 @@ classified ``FORBIDDEN`` (not approvable).  Unknown action names remain
 """
 
 from __future__ import annotations
+
+import hashlib
+import json
 
 from .models import (
     ActionClass,
@@ -93,6 +101,19 @@ ACTION_PERMISSIONS: dict[str, tuple[ArtifactCategory, Permission]] = {
     "git_local_commit": (ArtifactCategory.PRODUCT_CODE, Permission.WRITE),
     "create_handoff": (ArtifactCategory.OTHER, Permission.WRITE),
 }
+
+
+def binding_hash(task_id: str, action: str, scope: str) -> str:
+    """Deterministic owner-gate binding hash (SPEC V2C §4.3 / §10).
+
+    ``sha256(canonical_json(["argent-gate-v1", task_id, action, scope]))``.
+    A different action or scope (or task) yields a different hash, so a new
+    gate cannot be silently substituted for an existing one.
+    """
+    canonical = json.dumps(
+        ["argent-gate-v1", task_id, action, scope], sort_keys=True, default=str
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def classify_action(

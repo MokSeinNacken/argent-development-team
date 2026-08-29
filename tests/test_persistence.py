@@ -55,7 +55,7 @@ def test_schema_meta_version(db_path, core):
         ).fetchone()
     finally:
         conn.close()
-    assert row is not None and row["value"] == "3"
+    assert row is not None and row["value"] == "4"
 
 
 def test_foreign_keys_enabled(core):
@@ -173,9 +173,9 @@ def test_partial_unique_index_approvals_allows_different_scope(db_path, core, ta
     try:
         conn.execute(
             "INSERT INTO owner_approvals (id, task_id, action, scope, status, "
-            "requested_by, source_class, created_at, expires_at) "
+            "requested_by, source_class, created_at, expires_at, binding_hash) "
             "VALUES ('d2', ?, 'deploy_production', 'staging', 'pending', "
-            "'lead', 'TRUSTED', '2026', '2099')",
+            "'lead', 'TRUSTED', '2026', '2099', 'h2')",
             (task.id,),
         )
         conn.commit()
@@ -247,7 +247,7 @@ def test_migration_from_v2_adds_columns(tmp_path):
     row = c._store._conn.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
-    assert row is not None and row["value"] == "3"
+    assert row is not None and row["value"] == "4"
     # The migrated task still exists and gained the defaults.
     t = c.queries.get_task("t1")
     assert t.risk_class.value == "NORMAL"

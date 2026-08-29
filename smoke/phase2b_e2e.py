@@ -52,6 +52,7 @@ from argent_core import (  # noqa: E402
 from argent_core import context  # noqa: E402
 from argent_core.events import PRIVACY_DENYLIST  # noqa: E402
 from argent_core.outputs import validate_role_output  # noqa: E402
+from argent_core.supervisor import AGENT_IDS, extract_balanced_json  # noqa: E402
 from argent_core.workspace_broker import CONTENT_DENYLIST  # noqa: E402
 
 OWNER = OWNER_SOURCE
@@ -60,13 +61,7 @@ CONTROLLER = role_source(Role.LEAD)
 FIXTURE_ROOT = PROJECT_ROOT / "e2e-fixture"
 
 # role -> (openclaw agent id, thinking tier)
-AGENT_IDS = {
-    Role.LEAD: "argent-lead",
-    Role.ANALYST: "argent-analyst",
-    Role.IMPLEMENTER: "argent-implementer",
-    Role.QA: "argent-qa",
-    Role.REVIEWER: "argent-reviewer",
-}
+# The agent-id map is the single source of truth in argent_core.supervisor (A10).
 THINKING = {
     Role.LEAD: "high",
     Role.ANALYST: "medium",
@@ -352,32 +347,12 @@ def _build_prompt(core: Core, task, role: Role, d, repo_summary: dict, fixture: 
 
 
 def _extract_json(text: str) -> dict:
-    """Extract the first balanced JSON object from a text blob (lenient)."""
-    start = text.find("{")
-    if start < 0:
-        raise ValueError("no '{' found in agent reply")
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(text[start : i + 1])
-    raise ValueError("unbalanced JSON object in agent reply")
+    """Extract the first balanced JSON object from a text blob (lenient).
+
+    Shared implementation (SPEC V2C §6.2.5): delegates to the single source of
+    truth in ``argent_core.supervisor``.
+    """
+    return extract_balanced_json(text)
 
 
 def _parse_inner_result(raw: str):

@@ -1,0 +1,3513 @@
+"""Persistent supervisor loop & reconciliation (SPEC V2C).
+
+This module adds a restart-proof supervisor on top of the deterministic Core /
+SQLite ledger.  It owns:
+
+- Schema V4 supervisor tables (``supervisor_jobs``, ``supervisor_actions``),
+  persisted through the *same* ``Store`` connection as the Core (no second
+  connection, no cross-connection transactions).
+- A pluggable runtime adapter (``RunStatusProvider``) + detached launcher
+  (``RunLauncher``) + workspace state provider.
+- The central ``reconcile()`` decision table (§7.2 + amendments A7/A10).
+- A crash-safe action journal (§8) and a local, interruptible loop (§9).
+
+Trust boundary: the supervisor never trusts agent prose or events as authority;
+it only reads the Core ledger, its own ledger, and allow-list-bound runtime
+facts.  Agent output is UNTRUSTED DATA and is validated exclusively through
+``Core.receive_agent_result()`` / ``outputs.validate_role_output``.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import fcntl
+import hashlib
+import json
+import os
+import subprocess
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Callable, Optional, Protocol
+
+from . import outputs, workflow
+from .core import ReceiveResult
+from .models import (
+    AgentDispatch,
+    ApprovalStatus,
+    ArgentError,
+    DispatchStatus,
+    IdempotencyError,
+    NotFound,
+    Role,
+    TaskState,
+)
+from .store import Store, utcnow
+from .workspace_broker import WorkspaceBroker
+
+# ---------------------------------------------------------------------------
+# Constants (SPEC V2C §9)
+# ---------------------------------------------------------------------------
+
+RUNNING_POLL_SECONDS = 2.0
+BACKOFF_INITIAL_SECONDS = 1.0
+BACKOFF_MULTIPLIER = 2.0
+BACKOFF_MAX_SECONDS = 30.0
+MAX_SNAPSHOT_RETRIES = 3
+MAX_ACTION_RETRIES = 5
+MAX_RUNTIME_UNKNOWN = 5
+MISSING_BOUND_RUN_CONFIRMATIONS = 8
+# Real OpenClaw runs (esp. Sol/Codex) can take 40-90s just to create the
+# trajectory/session files after spawn.  The unbound-spawn budget must cover
+# agent startup latency + a typical run, not seconds: 15 confirmations with
+# backoff 1,2,4,8,16,30... ≈ 5 minutes before declaring the spawn unresolvable
+# (E2E finding from the real recovery smoke).
+MISSING_UNBOUND_SPAWN_CONFIRMATIONS = 15
+MAX_DISPATCH_ATTEMPTS_PER_STEP = 3
+AGENT_TIMEOUT_SECONDS = 900
+
+# Cross-controller apply fence (R14-F1, SPEC V2C §17 exactly-once write
+# pre-effects): a bounded interprocess lock around the broker critical section.
+APPLY_LOCK_TIMEOUT_SECONDS = 30.0
+APPLY_LOCK_POLL_SECONDS = 0.05
+APPLY_LOCK_DIRNAME = ".argent-supervisor-locks"
+
+# Single source of truth for the role -> OpenClaw agent id map (A10).  The
+# smoke E2E driver imports this exact map (no drift).
+AGENT_IDS: dict[Role, str] = {
+    Role.LEAD: "argent-lead",
+    Role.ANALYST: "argent-analyst",
+    Role.IMPLEMENTER: "argent-implementer",
+    Role.QA: "argent-qa",
+    Role.REVIEWER: "argent-reviewer",
+}
+
+# NOT_OBSERVED is a pure persistence sentinel (A10): it has no RunStatus
+# counterpart and only ever lives in the supervisor_jobs.result_status column.
+NOT_OBSERVED = "NOT_OBSERVED"
+
+
+# ---------------------------------------------------------------------------
+# Enums (SPEC V2C §5.1 / §3.2)
+# ---------------------------------------------------------------------------
+
+class RunStatus(str, Enum):
+    NOT_FOUND = "NOT_FOUND"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    UNKNOWN = "UNKNOWN"
+    CONFLICT = "CONFLICT"
+
+
+class SupervisorJobStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    WAITING_RUN = "WAITING_RUN"
+    WAITING_GATE = "WAITING_GATE"
+    BACKOFF = "BACKOFF"
+    RECOVERING = "RECOVERING"
+    ERROR = "ERROR"
+    TERMINAL = "TERMINAL"
+
+
+class RecoveryState(str, Enum):
+    NONE = "NONE"
+    DISCOVERING_RUN = "DISCOVERING_RUN"
+    RESTORING_BINDING = "RESTORING_BINDING"
+    CONSUMING_RESULT = "CONSUMING_RESULT"
+    RETRYING_STEP = "RETRYING_STEP"
+    AMBIGUOUS_WRITER = "AMBIGUOUS_WRITER"
+    RUNTIME_UNKNOWN = "RUNTIME_UNKNOWN"
+    CORE_RECOVERY_REQUIRED = "CORE_RECOVERY_REQUIRED"
+    PERSISTENT_ERROR = "PERSISTENT_ERROR"
+
+
+class ReconcileAction(str, Enum):
+    NONE = "NONE"
+    WAIT = "WAIT"
+    START_ROLE = "START_ROLE"
+    CREATE_DISPATCH = "CREATE_DISPATCH"
+    SPAWN_RUN = "SPAWN_RUN"
+    BIND_RUN = "BIND_RUN"
+    APPLY_PATCH_SET = "APPLY_PATCH_SET"
+    RUN_SANDBOX_TESTS = "RUN_SANDBOX_TESTS"
+    RECORD_TEST_RESULT = "RECORD_TEST_RESULT"
+    CONSUME_RESULT = "CONSUME_RESULT"
+    MARK_RUN_FAILED = "MARK_RUN_FAILED"
+    CORE_RECOVER = "CORE_RECOVER"
+    PRESENT_OWNER_GATE = "PRESENT_OWNER_GATE"
+    CLOSE_DONE = "CLOSE_DONE"
+    CLOSE_FAILED = "CLOSE_FAILED"
+    CLOSE_BLOCKED = "CLOSE_BLOCKED"
+    PERSISTENT_ERROR = "PERSISTENT_ERROR"
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses (SPEC V2C §5.1)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class RunLookup:
+    dispatch_id: str
+    agent_id: str
+    expected_session_label: str  # "dispatch-<dispatch_id>"
+    bound_session_id: Optional[str]
+    bound_run_id: Optional[str]
+    # Expected/bound runtime identity (persisted binding from the dispatch).
+    # When set, EVERY start/terminal trajectory row must match exactly
+    # (fail-closed).  ``None`` disables that specific comparison (only used by
+    # unit tests that build a bare RunLookup); the supervisor always sets them.
+    expected_provider: Optional[str] = None
+    expected_model: Optional[str] = None
+    expected_thinking_tier: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RunObservation:
+    status: RunStatus
+    agent_id: Optional[str]
+    session_id: Optional[str]  # == sessionKey (A4)
+    run_id: Optional[str]
+    provider: Optional[str]
+    model: Optional[str]
+    thinking_tier: Optional[str]
+    started_at: Optional[str]
+    finished_at: Optional[str]
+    result: Optional[dict]  # UNTRUSTED; never validated outside Core
+    result_hash: Optional[str]
+    authoritative_not_found: bool
+    evidence_id: str
+    error_code: Optional[str] = None
+    #: Set (non-None) when ``_guarded_observe`` caught a structural adapter
+    #: exception while interpreting untrusted runtime data and converted it
+    #: into a fail-closed CONFLICT.  ``None`` for genuine provider CONFLICTs
+    #: (e.g. a provenance mismatch), which keep their existing semantics.
+    adapter_exception_type: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ReconcileDecision:
+    job_id: str
+    facts_version: int
+    action: ReconcileAction
+    reason: str
+    dispatch_id: Optional[str] = None
+    wake_at: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ActionOutcome:
+    action: str
+    status: str  # 'executed' | 'skipped' | 'already_succeeded' | 'failed' | 'noop'
+    detail: Optional[str] = None
+    dispatch_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SupervisorState:
+    supervisor_job_id: str
+    task_id: str
+    status: str
+    workflow_state: str
+    expected_role: Optional[str]
+    expected_dispatch_id: Optional[str]
+    agent_id: Optional[str]
+    session_id: Optional[str]
+    run_id: Optional[str]
+    attempt_no: int
+    dispatch_status: Optional[str]
+    result_status: str
+    result_consumed: bool
+    current_handoff_id: Optional[str]
+    open_findings_count: int
+    rework_cycle: int
+    recovery_state: str
+    owner_gate_id: Optional[str]
+    gate_status: Optional[str]
+    gate_scope: Optional[str]
+    gate_closed: bool
+    owner_prompted_at: Optional[str]
+    next_action: str
+    next_wake_at: Optional[str]
+    retry_count: int
+    missing_confirmations: int
+    last_error_code: Optional[str]
+    last_progress_at: str
+    terminal: Optional[str]
+    facts_version: int
+    created_at: str
+    updated_at: str
+
+
+# ---------------------------------------------------------------------------
+# Adapter interfaces (SPEC V2C §5.2)
+# ---------------------------------------------------------------------------
+
+class RunStatusProvider(Protocol):
+    def observe(self, lookup: RunLookup) -> RunObservation: ...
+
+
+class RunLauncher(Protocol):
+    def spawn(
+        self, *, agent_id: str, dispatch_id: str,
+        message_file: Path, timeout_seconds: int,
+    ) -> None: ...
+
+
+class WorkspaceStateProvider(Protocol):
+    def scoped_hash(self, scope_root: Path) -> str: ...
+    def predicted_hash(self, scope_root: Path, patch_set: list) -> str: ...
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _canonical_json(obj) -> str:
+    """Canonical JSON used for hashes (identical to Core ``_hash_args``)."""
+    return json.dumps(obj, sort_keys=True, default=str)
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def session_key_for(agent_id: str, dispatch_id: str) -> str:
+    """Build the exact sessionKey used by the OpenClaw runtime (A4)."""
+    return f"agent:{agent_id}:explicit:dispatch-{dispatch_id}"
+
+
+def extract_balanced_json(text: str) -> dict:
+    """Extract the first balanced JSON object from a text blob (lenient).
+
+    Shared helper (SPEC V2C §6.2.5): the smoke E2E driver imports this exact
+    implementation so parsing stays identical across the controller and the
+    trajectory provider.
+    """
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("no '{' found in agent reply")
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start : i + 1])
+    raise ValueError("unbalanced JSON object in agent reply")
+
+
+def _iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _parse_iso(iso: str) -> float:
+    """Parse an ISO-8601 timestamp into epoch seconds (UTC)."""
+    s = iso.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s).timestamp()
+
+
+def _safe_parse_iso(ts) -> Optional[float]:
+    """Parse an ISO timestamp fail-closed: any non-string or unparsable value
+    returns ``None`` (no timestamp -> skip time filtering), never raises.
+
+    Used at the untrusted runtime-data boundary (trajectory ``ts`` fields) where
+    a JSON list/dict/number/bool/null can never be a valid ISO string.
+    """
+    if not isinstance(ts, str):
+        return None
+    try:
+        return _parse_iso(ts)
+    except (ValueError, TypeError):
+        return None
+
+
+def _ms_to_seconds(ms) -> float:
+    return float(ms) / 1000.0
+
+
+def _safe_ms_to_seconds(ts) -> Optional[float]:
+    """Convert a message timestamp to seconds fail-closed: any non-numeric (or
+    non-numeric-string) value returns ``None`` (ignore the timestamp filter),
+    never raises.  Bools are excluded (``True`` is not a meaningful epoch ms).
+    """
+    if isinstance(ts, bool):
+        return None
+    if isinstance(ts, (int, float)):
+        return float(ts) / 1000.0
+    if isinstance(ts, str):
+        try:
+            return float(ts) / 1000.0
+        except ValueError:
+            return None
+    return None
+
+
+def backoff_seconds(retry_count: int) -> float:
+    """Deterministic, jitter-free backoff: ``min(1 * 2**retry, 30)`` (A10/§9)."""
+    return min(BACKOFF_INITIAL_SECONDS * (BACKOFF_MULTIPLIER ** max(retry_count, 0)),
+               BACKOFF_MAX_SECONDS)
+
+
+def _is_implementer(role: Optional[Role]) -> bool:
+    return role is Role.IMPLEMENTER
+
+
+def _is_write_role(role: Optional[Role]) -> bool:
+    return role in (Role.IMPLEMENTER, Role.QA)
+
+
+# Legitimate write-role result extensions (SPEC V2C §8.3): the ONLY fields a
+# write role may add beyond its standard envelope.  Any other top-level field
+# (e.g. the forbidden ``encoded``) must be rejected fail-closed by
+# ``outputs.validate_role_output``, never silently stripped (F1).
+_WRITE_EXTENSIONS: dict[Role, tuple[str, ...]] = {
+    Role.IMPLEMENTER: ("patch_set",),
+    Role.QA: ("test_patch_set",),
+}
+
+
+def _write_envelope(role: Optional[Role], result: dict) -> dict:
+    """Extract the standard envelope from a write-role result.
+
+    Strips ONLY the role's legitimate patch extension so the complete write-
+    result schema is validated (envelope + extension).  Everything else stays
+    in the envelope so ``validate_role_output`` rejects forbidden/unknown
+    fields (fail-closed), never silently dropping them.
+    """
+    extensions = _WRITE_EXTENSIONS.get(role, ())
+    return {k: v for k, v in result.items() if k not in extensions}
+
+
+# ---------------------------------------------------------------------------
+# SupervisorStore
+# ---------------------------------------------------------------------------
+
+class SupervisorStore:
+    """Persistent supervisor ledger over the same ``Store`` as the Core.
+
+    Public queries are read-only; mutations use ``BEGIN IMMEDIATE``.  It may
+    read Core tables in a snapshot but never mutates them (Core mutations run
+    exclusively through ``Core``).
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        frontier_fn: Callable[[str], workflow.WorkflowFrontier],
+    ):
+        self._store = store
+        self._frontier_fn = frontier_fn
+
+    # -- read ---------------------------------------------------------------
+
+    def get_job(self, job_id: str) -> Optional[SupervisorState]:
+        row = self._store.get_supervisor_job(job_id)
+        if row is None:
+            return None
+        return self._build_state(row)
+
+    def get_job_for_task(self, task_id: str) -> Optional[SupervisorState]:
+        row = self._store.get_supervisor_job_for_task(task_id)
+        if row is None:
+            return None
+        return self._build_state(row)
+
+    def list_nonterminal_jobs(self) -> list[SupervisorState]:
+        rows = self._store.list_supervisor_jobs(nonterminal_only=True)
+        return [self._build_state(r) for r in rows]
+
+    def _job_row(self, job_id: str) -> Optional[dict]:
+        return self._store.get_supervisor_job(job_id)
+
+    # -- create (idempotent via deterministic id + command_idempotency, A6) --
+
+    def create_job(self, task_id: str, *, idempotency_key: str) -> SupervisorState:
+        job_id = "supervisor:" + task_id
+        args_hash = _sha256(_canonical_json({"task_id": task_id}))
+        with self._store._transaction():
+            existing = self._store.get_command_idempotency(
+                idempotency_key, "create_supervisor_job"
+            )
+            if existing is not None:
+                result_id, stored_hash = existing
+                if stored_hash != args_hash:
+                    raise IdempotencyError(
+                        f"idempotency key {idempotency_key!r} reused for "
+                        "create_supervisor_job with different arguments"
+                    )
+                row = self._store.get_supervisor_job(result_id)
+                if row is None:
+                    raise IdempotencyError(
+                        f"idempotent replay: supervisor job {result_id!r} missing"
+                    )
+                return self._build_state(row)
+            existing_job = self._store.get_supervisor_job_for_task(task_id)
+            if existing_job is not None:
+                self._store._set_command_idempotency(
+                    idempotency_key, "create_supervisor_job",
+                    existing_job["id"], args_hash, self._store.now_iso(),
+                )
+                return self._build_state(existing_job)
+            task = self._store.get_task(task_id)
+            if task is None:
+                raise NotFound(f"task {task_id!r} not found")
+            now = self._store.now_iso()
+            row = {
+                "id": job_id,
+                "task_id": task_id,
+                "status": SupervisorJobStatus.ACTIVE.value,
+                "workflow_state": task.state.value,
+                "expected_role": None,
+                "expected_dispatch_id": None,
+                "agent_id": None,
+                "session_id": None,
+                "run_id": None,
+                "attempt_no": 0,
+                "dispatch_status": None,
+                "result_status": NOT_OBSERVED,
+                "result_consumed": 0,
+                "current_handoff_id": None,
+                "open_findings_count": 0,
+                "rework_cycle": 1,
+                "recovery_state": RecoveryState.NONE.value,
+                "owner_gate_id": None,
+                "gate_status": None,
+                "gate_scope": None,
+                "gate_closed": 0,
+                "owner_prompted_at": None,
+                "owner_prompted_gate_id": None,
+                "next_action": ReconcileAction.NONE.value,
+                "next_wake_at": None,
+                "retry_count": 0,
+                "missing_confirmations": 0,
+                "last_error_code": None,
+                "last_progress_at": now,
+                "terminal": None,
+                "facts_version": 0,
+                "created_at": now,
+                "updated_at": now,
+            }
+            self._store._insert_supervisor_job(row)
+            self._store._set_command_idempotency(
+                idempotency_key, "create_supervisor_job", job_id, args_hash, now,
+            )
+            return self._build_state(row)
+
+    # -- projection ---------------------------------------------------------
+
+    def _current_dispatch(self, task_id: str) -> Optional[AgentDispatch]:
+        """The single active dispatch (PENDING/RUNNING/RECOVERY_PENDING)."""
+        for d in self._store.list_dispatches(task_id):
+            if d.status in (
+                DispatchStatus.PENDING,
+                DispatchStatus.RUNNING,
+                DispatchStatus.RECOVERY_PENDING,
+            ):
+                return d
+        return None
+
+    def _dispatch_at_frontier(
+        self, task_id: str, frontier: workflow.WorkflowFrontier
+    ) -> Optional[AgentDispatch]:
+        """Latest (max attempt) dispatch at the frontier position, if any."""
+        matches = [
+            d
+            for d in self._store.list_dispatches(task_id)
+            if d.cycle_no == frontier.cycle_no and d.position == frontier.position
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda d: d.attempt_no)
+
+    def _max_cycle(self, task_id: str) -> int:
+        dispatches = self._store.list_dispatches(task_id)
+        if not dispatches:
+            return 1
+        return max(d.cycle_no for d in dispatches)
+
+    def _current_gate(self, task_id: str):
+        approvals = self._store.list_approvals(task_id)
+        active = [
+            a for a in approvals
+            if a.status in (ApprovalStatus.PENDING, ApprovalStatus.APPROVED)
+        ]
+        if active:
+            return active[0], len(active)
+        if approvals:
+            # reflect the most recently created gate (closed reflection).
+            return approvals[-1], 0
+        return None, 0
+
+    def _build_state(self, row: dict) -> SupervisorState:
+        task_id = row["task_id"]
+        task = self._store.get_task(task_id)
+        frontier = self._frontier_fn(task_id) if task is not None else None
+
+        expected_role = frontier.expected_role if frontier else None
+        active = self._current_dispatch(task_id)
+        at_frontier = self._dispatch_at_frontier(task_id, frontier) if frontier else None
+        disp = active if active is not None else at_frontier
+
+        gate, _n = self._current_gate(task_id)
+
+        agent_id = AGENT_IDS.get(expected_role) if expected_role else None
+
+        open_findings = sum(
+            1 for f in self._store.list_findings(task_id)
+            if f.status.value == "open"
+        )
+
+        result_consumed = bool(
+            disp is not None
+            and disp.status is DispatchStatus.CONSUMED
+            and disp.consumed_at is not None
+        )
+
+        return SupervisorState(
+            supervisor_job_id=row["id"],
+            task_id=task_id,
+            status=row["status"],
+            workflow_state=task.state.value if task else row["workflow_state"],
+            expected_role=expected_role.value if expected_role else None,
+            expected_dispatch_id=disp.id if disp is not None else None,
+            agent_id=agent_id,
+            session_id=disp.child_session_id if disp is not None else None,
+            run_id=disp.openclaw_run_id if disp is not None else None,
+            attempt_no=disp.attempt_no if disp is not None else 0,
+            dispatch_status=disp.status.value if disp is not None else None,
+            result_status=row["result_status"],
+            result_consumed=result_consumed,
+            current_handoff_id=(
+                self._store.get_latest_handoff(task_id).id
+                if self._store.get_latest_handoff(task_id) is not None else None
+            ),
+            open_findings_count=open_findings,
+            rework_cycle=self._max_cycle(task_id),
+            recovery_state=row["recovery_state"],
+            owner_gate_id=gate.id if gate is not None else None,
+            gate_status=gate.status.value if gate is not None else None,
+            gate_scope=gate.scope if gate is not None else None,
+            gate_closed=bool(gate is not None and gate.closed_at is not None),
+            owner_prompted_at=row["owner_prompted_at"],
+            next_action=row["next_action"],
+            next_wake_at=row["next_wake_at"],
+            retry_count=row["retry_count"],
+            missing_confirmations=row["missing_confirmations"],
+            last_error_code=row["last_error_code"],
+            last_progress_at=row["last_progress_at"],
+            terminal=row["terminal"],
+            facts_version=row["facts_version"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# TrajectoryRunStatusProvider (SPEC V2C §6.2, A1/A4/A10)
+# ---------------------------------------------------------------------------
+
+class TrajectoryRunStatusProvider:
+    """Read-only, allow-list bound runtime adapter over OpenClaw trajectories.
+
+    Reads exactly ``~/.openclaw/agents/<agent_id>/sessions/dispatch-<id>
+    .trajectory.jsonl`` (plus the strictly validated ``sessionFile``).  No free
+    path is taken from agent output; no command is ever executed from the
+    trajectory content (it is external DATA).
+    """
+
+    def __init__(self, state_dir: Optional[Path] = None):
+        self._state_dir = Path(state_dir) if state_dir is not None \
+            else Path.home() / ".openclaw"
+
+    def _trajectory_path(self, agent_id: str, dispatch_id: str) -> Path:
+        return (
+            self._state_dir / "agents" / agent_id / "sessions"
+            / f"dispatch-{dispatch_id}.trajectory.jsonl"
+        )
+
+    def _session_dir(self, agent_id: str) -> Path:
+        return self._state_dir / "agents" / agent_id / "sessions"
+
+    def observe(self, lookup: RunLookup) -> RunObservation:
+        agent_id = lookup.agent_id
+        traj = self._trajectory_path(agent_id, lookup.dispatch_id)
+        session_dir = self._session_dir(agent_id)
+
+        # Authoritative NOT_FOUND requires the session dir to be readable.
+        if not session_dir.is_dir():
+            return self._unknown(lookup, "session_dir_missing")
+        if not traj.exists():
+            # The trajectory file is flushed late by the runtime (real runs
+            # only write it at/near completion).  An existing session file or
+            # its lock proves the agent process started and the run is ACTIVE
+            # - that is RUNNING, never NOT_FOUND (E2E finding from the real
+            # recovery smoke: slow runs must not burn the missing budget).
+            sess = session_dir / f"dispatch-{lookup.dispatch_id}.jsonl"
+            lock = session_dir / f"dispatch-{lookup.dispatch_id}.jsonl.lock"
+            if sess.exists() or lock.exists():
+                return RunObservation(
+                    status=RunStatus.RUNNING,
+                    agent_id=agent_id,
+                    session_id=session_key_for(agent_id, lookup.dispatch_id),
+                    run_id=None,
+                    provider=None,
+                    model=None,
+                    thinking_tier=None,
+                    started_at=None,
+                    finished_at=None,
+                    result=None,
+                    result_hash=None,
+                    authoritative_not_found=False,
+                    evidence_id=f"active_session:{sess.name}",
+                )
+            return RunObservation(
+                status=RunStatus.NOT_FOUND,
+                agent_id=agent_id,
+                session_id=None,
+                run_id=None,
+                provider=None,
+                model=None,
+                thinking_tier=None,
+                started_at=None,
+                finished_at=None,
+                result=None,
+                result_hash=None,
+                authoritative_not_found=True,
+                evidence_id=f"missing:{traj}",
+            )
+
+        lines: list[dict] = []
+        try:
+            raw = traj.read_text(encoding="utf-8")
+        except OSError:
+            return self._unknown(lookup, "trajectory_io_error")
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                # A trailing partial line or malformed JSONL -> UNKNOWN (never
+                # guess success).
+                return self._unknown(lookup, "malformed_jsonl")
+            # F-R4: every decoded row MUST be a JSON object.  A scalar/list/null
+            # top-level row is structurally malformed and cannot be interpreted
+            # as start/terminal/metadata -> deterministic UNKNOWN (never raise,
+            # never treated as a valid run).
+            if not isinstance(obj, dict):
+                return self._unknown(lookup, "malformed_row")
+            lines.append(obj)
+
+        started = [o for o in lines if o.get("type") == "session.started"]
+        ended = [o for o in lines if o.get("type") == "session.ended"]
+        metadata = [o for o in lines if o.get("type") == "trace.metadata"]
+
+        if not started:
+            return self._unknown(lookup, "no_session_started")
+
+        expected_session_key = session_key_for(agent_id, lookup.dispatch_id)
+
+        # F4: validate EVERY session.started row against the exact
+        # expected/bound tuple.  Any foreign sessionId label, missing/empty
+        # runId, wrong sessionKey/agentId, or a distinct runId is CONFLICT
+        # (never silently filter a foreign start just because the lookup is
+        # bound to a different run).
+        run_ids: list = []
+        providers: list = []
+        models: list = []
+        for o in started:
+            if o.get("sessionId") != lookup.expected_session_label:
+                return self._conflict(lookup, "start_session_label_mismatch")
+            rid = o.get("runId")
+            if not rid:
+                return self._conflict(lookup, "start_missing_run_id")
+            # F-R4 fail-closed: a PRESENT non-string ``runId`` (JSON list,
+            # dict, number, bool, ...) is structurally malformed identity data.
+            # It can never be a bindable run id and must never reach the
+            # ``set(run_ids)`` dedupe (unhashable list -> TypeError).  A
+            # deterministic CONFLICT, never raise.
+            if not isinstance(rid, str):
+                return self._conflict(lookup, "start_run_id_not_string")
+            if o.get("sessionKey") != expected_session_key:
+                return self._conflict(lookup, "start_session_key_mismatch")
+            adata = o.get("data")
+            # F-R5: distinguish field ABSENCE from PRESENCE.  An explicitly
+            # PRESENT non-object ``data`` (JSON null, bool, list, number,
+            # string) is a malformed start identity row -> CONFLICT (never
+            # RUNNING/SUCCEEDED).  An ABSENT ``data`` keeps the existing
+            # missing-agent-id semantics (start_missing_agent_id).
+            if "data" in o and not isinstance(o["data"], dict):
+                return self._conflict(lookup, "start_malformed_data")
+            if adata is None:
+                adata = {}
+            # F1: agent identity is a REQUIRED bound field on every start row;
+            # a missing ``data.agentId`` is a CONFLICT (never silently accepted).
+            if "agentId" not in adata:
+                return self._conflict(lookup, "start_missing_agent_id")
+            if adata.get("agentId") != agent_id:
+                return self._conflict(lookup, "start_agent_id_mismatch")
+            # F1: provider/model must match the persisted expected/bound tuple
+            # (fail-closed on any mismatch, including a missing field).
+            if (lookup.expected_provider is not None
+                    and o.get("provider") != lookup.expected_provider):
+                return self._conflict(lookup, "start_provider_binding_mismatch")
+            if (lookup.expected_model is not None
+                    and o.get("modelId") != lookup.expected_model):
+                return self._conflict(lookup, "start_model_binding_mismatch")
+            run_ids.append(rid)
+            providers.append(o.get("provider"))
+            models.append(o.get("modelId"))
+
+        distinct_run_ids = set(run_ids)
+        if len(distinct_run_ids) > 1:
+            return self._conflict(lookup, "multiple_run_ids")
+
+        run_id = next(iter(distinct_run_ids))
+        if lookup.bound_run_id is not None and run_id != lookup.bound_run_id:
+            return self._conflict(lookup, "foreign_run_id")
+        if (lookup.bound_session_id is not None
+                and expected_session_key != lookup.bound_session_id):
+            return self._conflict(lookup, "foreign_bound_session_id")
+
+        # Every start must agree on provider/model (F4: duplicate starts
+        # sharing one runId but disagreeing on provider/model are CONFLICT).
+        s = started[0]
+        provider = providers[0]
+        model = models[0]
+        if any(p != provider for p in providers):
+            return self._conflict(lookup, "start_provider_mismatch")
+        if any(m != model for m in models):
+            return self._conflict(lookup, "start_model_mismatch")
+        session_key = expected_session_key
+
+        # F-R5: a structurally malformed metadata row (PRESENT non-object
+        # ``data`` or PRESENT non-object ``data.model``) is uninterpretable
+        # corruption -> CONFLICT (never raise, never guess a tier, never
+        # SUCCEEDED).  Missing data/model is NOT malformed.
+        for m in metadata:
+            if self._metadata_malformed(m):
+                return self._conflict(lookup, "metadata_malformed")
+
+        # Thinking tier: trace.metadata.data.model.thinkLevel, else the C1 rule
+        # for OpenAI (lead/reviewer) which has no trace.metadata line (A1).
+        thinking = self._thinking_tier(metadata, run_id, provider, model, agent_id)
+        # F1: the observed thinking tier must match the persisted expected/bound
+        # tier (fail-closed).  The C1 rule (A1) guarantees lead/reviewer always
+        # yields 'high' (matching the dispatch); DeepSeek roles without a
+        # trace.metadata line stay None and must NOT be reported as CONFLICT for
+        # a missing metadata line alone (SPEC §6.2.3: CONFLICT only on
+        # provider/model contradiction).  A DETERMINED foreign tier is still
+        # rejected.
+        if (lookup.expected_thinking_tier is not None
+                and thinking is not None
+                and thinking != lookup.expected_thinking_tier):
+            return self._conflict(lookup, "thinking_tier_binding_mismatch")
+
+        started_at = s.get("ts")
+
+        # F4: terminal rows must match the exact runId, sessionId label,
+        # sessionKey, agentId, provider AND model of the single observed run;
+        # ANY mismatch (including a different runId) -> CONFLICT (never
+        # silently skipped, never SUCCEEDED).
+        matching_ended = []
+        for e in ended:
+            erid = e.get("runId")
+            # F-R4 fail-closed: a PRESENT non-string (or empty) terminal
+            # ``runId`` is structurally malformed identity data -> CONFLICT
+            # (never raise, never SUCCEEDED).  A string that merely differs
+            # from the observed start runId keeps the existing mismatch code.
+            if not isinstance(erid, str) or not erid:
+                return self._conflict(lookup, "terminal_run_id_not_string")
+            if erid != run_id:
+                return self._conflict(lookup, "terminal_run_id_mismatch")
+            if e.get("sessionId") != lookup.expected_session_label:
+                return self._conflict(lookup, "terminal_session_label_mismatch")
+            if e.get("sessionKey") != expected_session_key:
+                return self._conflict(lookup, "terminal_session_key_mismatch")
+            edata = e.get("data")
+            # F-R5: PRESENT non-object ``data`` (JSON null, bool, list,
+            # number, string) is malformed -> CONFLICT (never SUCCEEDED).
+            # ABSENT ``data`` keeps the existing missing-agent-id semantics.
+            if "data" in e and not isinstance(e["data"], dict):
+                return self._conflict(lookup, "terminal_malformed_data")
+            if edata is None:
+                edata = {}
+            # F1: agent identity is a REQUIRED bound field on every terminal row.
+            if "agentId" not in edata:
+                return self._conflict(lookup, "terminal_missing_agent_id")
+            if edata.get("agentId") != agent_id:
+                return self._conflict(lookup, "terminal_agent_id_mismatch")
+            if e.get("provider") != provider:
+                return self._conflict(lookup, "terminal_provider_mismatch")
+            if e.get("modelId") != model:
+                return self._conflict(lookup, "terminal_model_mismatch")
+            # F1: terminal provider/model must match the persisted expected/bound
+            # tuple as well (a consistently-foreign start+terminal tuple must not
+            # slip through the row-to-row checks).
+            if (lookup.expected_provider is not None
+                    and e.get("provider") != lookup.expected_provider):
+                return self._conflict(lookup, "terminal_provider_binding_mismatch")
+            if (lookup.expected_model is not None
+                    and e.get("modelId") != lookup.expected_model):
+                return self._conflict(lookup, "terminal_model_binding_mismatch")
+            matching_ended.append(e)
+
+        # Conflict: several different terminal lines / runIds.
+        terminal_states = set()
+        for e in matching_ended:
+            terminal_states.add(self._terminal_status(e))
+
+        if len(matching_ended) == 0:
+            status = RunStatus.RUNNING
+            finished_at = None
+        elif len(matching_ended) == 1:
+            status = self._terminal_status(matching_ended[0])
+            finished_at = matching_ended[0].get("ts")
+        else:
+            # Multiple session.ended lines -> CONFLICT unless all identical.
+            if len(terminal_states) == 1:
+                status = next(iter(terminal_states))
+                finished_at = matching_ended[-1].get("ts")
+            else:
+                return self._conflict(lookup, "conflicting_terminal")
+
+        result, result_hash = self._extract_result(
+            s, finished_at, session_dir
+        )
+
+        return RunObservation(
+            status=status,
+            agent_id=agent_id,
+            session_id=session_key,
+            run_id=run_id,
+            provider=provider,
+            model=model,
+            thinking_tier=thinking,
+            started_at=started_at,
+            finished_at=finished_at,
+            result=result,
+            result_hash=result_hash,
+            authoritative_not_found=False,
+            evidence_id=str(traj),
+        )
+
+    def _terminal_status(self, e: dict) -> RunStatus:
+        data = e.get("data")
+        if not isinstance(data, dict):
+            # F-R4: structurally malformed terminal row -> UNKNOWN (never
+            # raise, never SUCCEEDED).  Defensive; observe() rejects these
+            # rows as CONFLICT before reaching here.
+            return RunStatus.UNKNOWN
+        if data.get("status") == "success":
+            return RunStatus.SUCCEEDED
+        if data.get("aborted") or data.get("externalAbort"):
+            return RunStatus.CANCELLED
+        if data.get("timedOut"):
+            return RunStatus.FAILED
+        if data.get("status") in ("failed", "error", "timeout", "cancel"):
+            return RunStatus.CANCELLED if data.get("status") == "cancel" else RunStatus.FAILED
+        return RunStatus.UNKNOWN
+
+    @staticmethod
+    def _metadata_malformed(m: dict) -> bool:
+        """True when a ``trace.metadata`` row is structurally malformed:
+        a PRESENT non-object ``data`` (JSON null, bool, list, number,
+        string) or a PRESENT non-object ``data.model``.  A MISSING
+        ``data``/``model`` is NOT malformed (treated as "no thinkLevel")."""
+        if "data" in m and not isinstance(m["data"], dict):
+            return True
+        data = m.get("data")
+        if isinstance(data, dict) and "model" in data \
+                and not isinstance(data["model"], dict):
+            return True
+        return False
+
+    def _thinking_tier(
+        self, metadata, run_id, provider, model, agent_id
+    ) -> Optional[str]:
+        for m in metadata:
+            # F-R4: malformed/non-object metadata rows are uninterpretable ->
+            # skip (return None), never raise.
+            if not isinstance(m, dict) or self._metadata_malformed(m):
+                continue
+            if m.get("runId") != run_id:
+                continue
+            data = m.get("data")
+            model_data = data.get("model") if isinstance(data, dict) else None
+            if not isinstance(model_data, dict):
+                continue
+            if "thinkLevel" in model_data and model_data["thinkLevel"]:
+                return model_data["thinkLevel"]
+        # C1 rule (A1): OpenAI lead/reviewer have no trace.metadata; the
+        # canonical tuple implies the expected tier 'high'.  DeepSeek roles
+        # with a missing line stay UNKNOWN (never guessed).
+        if provider == "openai" and model == "gpt-5.6-sol":
+            return "high"
+        return None
+
+    def _extract_result(self, started, finished_at, session_dir: Path):
+        data = started.get("data") or {}
+        session_file = data.get("sessionFile")
+        if not session_file:
+            return None, None
+        # sessionFile is untrusted data: only a non-empty string is a usable
+        # path label (never raise on list/dict/number/bool/null).
+        if not isinstance(session_file, str):
+            return None, None
+        # Strict canonical path validation (A10 / §6.2.5): only under the
+        # expected agent session directory.
+        try:
+            sp = Path(session_file).resolve()
+        except OSError:
+            return None, None
+        if not self._within(session_dir.resolve(), sp):
+            return None, None
+        if not sp.is_file():
+            return None, None
+        try:
+            raw = sp.read_text(encoding="utf-8")
+        except OSError:
+            return None, None
+
+        # Timestamps are untrusted data: a non-string/non-ISO ``ts`` (JSON
+        # list/dict/number/bool/null) must NOT raise; treat it as "no
+        # timestamp" and skip the time filter (never fail the extraction).
+        start_s = _safe_parse_iso(started.get("ts"))
+        end_s = _safe_parse_iso(finished_at)
+
+        assistant_texts = []
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            # F-R4 structural guard (same as the trajectory decode loop): every
+            # decoded row MUST be a JSON object.  A top-level ``null`` / scalar
+            # / list row is uninterpretable -> skip (never raise).
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("type") != "message":
+                continue
+            msg = obj.get("message")
+            # ``message`` must be an object; a scalar/list/null message is
+            # uninterpretable -> skip (never raise).
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "assistant":
+                continue
+            ts = msg.get("timestamp")
+            if ts is not None:
+                ts_s = _safe_ms_to_seconds(ts)
+                if ts_s is not None:
+                    if start_s is not None and ts_s < start_s:
+                        continue
+                    if end_s is not None and ts_s > end_s:
+                        continue
+            text = self._assistant_text(msg)
+            if text is not None:
+                assistant_texts.append(text)
+        if not assistant_texts:
+            return None, None
+                # The FINAL assistant message is the agent's reply.  Intermediate
+        # assistant messages (status cards, partial JSON, tool summaries)
+        # must never be used: the first JSON object of a concatenation could
+        # come from such an intermediate message and carry a foreign task_id
+        # (real-E2E finding: consume was rejected with task_mismatch).
+        if not assistant_texts:
+            return None, None
+        last = assistant_texts[-1]
+        try:
+            result = extract_balanced_json(last)
+        except (ValueError, json.JSONDecodeError):
+            return None, None
+        return result, _sha256(_canonical_json(result))
+
+    @staticmethod
+    def _assistant_text(msg: dict) -> Optional[str]:
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [
+                b.get("text")
+                for b in content
+                if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)
+            ]
+            if parts:
+                return "\n".join(parts)
+        return None
+
+    @staticmethod
+    def _within(root: Path, path: Path) -> bool:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    def _unknown(self, lookup: RunLookup, code: str) -> RunObservation:
+        return RunObservation(
+            status=RunStatus.UNKNOWN,
+            agent_id=lookup.agent_id,
+            session_id=None,
+            run_id=None,
+            provider=None,
+            model=None,
+            thinking_tier=None,
+            started_at=None,
+            finished_at=None,
+            result=None,
+            result_hash=None,
+            authoritative_not_found=False,
+            evidence_id=code,
+            error_code=code,
+        )
+
+    def _conflict(self, lookup: RunLookup, code: str) -> RunObservation:
+        return RunObservation(
+            status=RunStatus.CONFLICT,
+            agent_id=lookup.agent_id,
+            session_id=None,
+            run_id=None,
+            provider=None,
+            model=None,
+            thinking_tier=None,
+            started_at=None,
+            finished_at=None,
+            result=None,
+            result_hash=None,
+            authoritative_not_found=False,
+            evidence_id=code,
+            error_code=code,
+        )
+
+
+# ---------------------------------------------------------------------------
+# RunLauncher (SPEC V2C §5.2 / §8.2 / A8)
+# ---------------------------------------------------------------------------
+
+class OpenClawRunLauncher:
+    """Launches role agents DETACHED (``start_new_session=True``).
+
+    The agent process survives a supervisor SIGKILL (prerequisite for the §13
+    recovery smoke).  Returns immediately; binding/result are discovered later
+    exclusively through the ``RunStatusProvider``.
+
+    If ``counter_path`` is given, a persistent per-dispatch launch counter is
+    incremented BEFORE the spawn so the actual launch invocation count survives
+    an abrupt supervisor SIGKILL (F8: independent no-double-spawn proof).
+    """
+
+    def __init__(self, counter_path: Optional[Path] = None):
+        self._counter_path = Path(counter_path) if counter_path is not None else None
+
+    @staticmethod
+    def _read_counter_file(counter_path: Optional[Path]) -> dict:
+        if counter_path is None:
+            return {}
+        try:
+            raw = counter_path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _write_counter_file(counter_path: Optional[Path], data: dict) -> None:
+        if counter_path is None:
+            return
+        counter_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = counter_path.with_name(counter_path.name + ".tmp")
+        tmp.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, counter_path)
+
+    def spawn(
+        self, *, agent_id: str, dispatch_id: str,
+        message_file: Path, timeout_seconds: int,
+    ) -> None:
+        # F8: increment the persistent launch counter BEFORE the detached spawn
+        # so the count is durable even if the supervisor is SIGKILLed right
+        # after the launcher returns (the independent no-double-spawn proof).
+        if self._counter_path is not None:
+            data = self._read_counter_file(self._counter_path)
+            data[dispatch_id] = int(data.get(dispatch_id, 0)) + 1
+            self._write_counter_file(self._counter_path, data)
+        cmd = [
+            "openclaw", "agent",
+            "--agent", agent_id,
+            "--session-id", f"dispatch-{dispatch_id}",
+            "--message-file", str(message_file),
+            "--json",
+            "--timeout", str(timeout_seconds),
+        ]
+        subprocess.Popen(
+            cmd,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+
+
+def read_launch_counter(counter_path) -> dict:
+    """Read a persistent launcher invocation counter file (F8)."""
+    if counter_path is None:
+        return {}
+    return OpenClawRunLauncher._read_counter_file(Path(counter_path))
+
+
+# ---------------------------------------------------------------------------
+# Workspace state provider (real, hash based) — §5.2 / §8.3
+# ---------------------------------------------------------------------------
+
+class WorkspaceHashProvider:
+    """Deterministic scope hash for broker crash reconciliation (§8.3)."""
+
+    def scoped_hash(self, scope_root: Path) -> str:
+        parts = []
+        root = Path(scope_root).resolve()
+        for p in sorted(root.rglob("*")):
+            if p.is_file():
+                rel = p.relative_to(root)
+                parts.append(f"{rel}:{_sha256(p.read_bytes().hex())}")
+        return _sha256("\n".join(parts))
+
+    def predicted_hash(self, scope_root: Path, patch_set: list) -> str:
+        # F2 §8.3: deterministic expected after-hash computed from the full
+        # patch set (matches the broker's write/delete effect on plain paths).
+        # Used for crash reconciliation: current scope hash == effect_hash means
+        # the patch set was already applied (exactly-once).
+        root = Path(scope_root).resolve()
+        files: dict[str, bytes] = {}
+        for p in sorted(root.rglob("*")):
+            if p.is_file():
+                files[str(p.relative_to(root))] = p.read_bytes()
+        for patch in patch_set:
+            if not isinstance(patch, dict):
+                continue
+            op = patch.get("op")
+            path = patch.get("path")
+            if not isinstance(path, str) or os.path.isabs(path):
+                continue
+            key = os.path.normpath(path)
+            if op == "write":
+                raw = patch.get("content")
+                if isinstance(raw, str):
+                    try:
+                        files[key] = base64.b64decode(raw, validate=True)
+                    except (binascii.Error, ValueError):
+                        continue
+            elif op == "delete":
+                files.pop(key, None)
+        parts = [
+            f"{rel}:{_sha256(content.hex())}"
+            for rel, content in sorted(files.items())
+        ]
+        return _sha256("\n".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# Supervisor
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Snapshot:
+    job: dict
+    task: object
+    frontier: Optional[workflow.WorkflowFrontier]
+    active_dispatch: Optional[AgentDispatch]
+    dispatch_at_frontier: Optional[AgentDispatch]
+    max_attempt_at_frontier: int
+    active_role_run: Optional[object]
+    gate: Optional[object]
+    open_gates_count: int
+    open_findings_count: int
+    latest_handoff_id: Optional[str]
+    action_journal_fingerprint: tuple
+
+
+@dataclass
+class _Plan:
+    action: ReconcileAction
+    reason: str
+    dispatch_id: Optional[str] = None
+    wake_at: Optional[str] = None
+    status: Optional[str] = None
+    recovery_state: Optional[str] = None
+    retry_count: Optional[int] = None
+    missing_confirmations: Optional[int] = None
+    last_error_code: Optional[str] = None
+    terminal: Optional[str] = None
+
+
+_RETRY = object()  # sentinel: snapshot changed, retry
+
+
+class Supervisor:
+    """Persistent, restart-proof supervisor over a Core instance."""
+
+    def __init__(
+        self,
+        core,
+        run_status_provider: RunStatusProvider,
+        run_launcher: Optional[RunLauncher] = None,
+        *,
+        controller_source: str = "role:lead",
+        owner_source: str = "owner:authenticated",
+        workspace_root: Optional[Path] = None,
+        workspace_state_provider: Optional[WorkspaceStateProvider] = None,
+        run_tests_fn: Optional[Callable] = None,
+        broker_factory: Optional[Callable[[], WorkspaceBroker]] = None,
+        clock: Optional[Callable[[], datetime]] = None,
+    ):
+        self.core = core
+        self.controller_source = controller_source
+        self.owner_source = owner_source
+        self.store = SupervisorStore(
+            core._store,
+            frontier_fn=lambda tid: core.workflow_frontier(tid, controller_source),
+        )
+        self._run_status = run_status_provider
+        self._launcher = run_launcher or OpenClawRunLauncher()
+        # F1 (R15): FREEZE the workspace root to a single canonical spelling at
+        # initialization, so every lock path, hash scope and broker reference
+        # uses the SAME physical path for the lifetime of this Supervisor.
+        # Two controllers naming the same physical workspace through different
+        # aliases (symlink vs real path) otherwise derive DIFFERENT lockfiles
+        # and BOTH bypass the cross-controller apply fence (exactly-once write
+        # pre-effects).  ``Path.resolve()`` collapses symlinks/relative segments
+        # to the canonical real path.
+        self._workspace_root = (
+            str(Path(workspace_root).resolve()) if workspace_root is not None else None
+        )
+        self._workspace_state = workspace_state_provider
+        self._run_tests_fn = run_tests_fn
+        self._broker_factory = broker_factory or (lambda: WorkspaceBroker())
+        self._clock = clock or utcnow
+
+    # ---------------------------------------------------------------- utils
+
+    def _now(self) -> datetime:
+        return self._clock()
+
+    def _now_iso(self) -> str:
+        return self.core._store.now_iso()
+
+    def _build_lookup(self, d: AgentDispatch) -> RunLookup:
+        return RunLookup(
+            dispatch_id=d.id,
+            agent_id=AGENT_IDS[d.role],
+            expected_session_label=f"dispatch-{d.id}",
+            bound_session_id=d.child_session_id,
+            bound_run_id=d.openclaw_run_id,
+            # Persisted expected/bound tuple: use the bound values once the
+            # dispatch is bound (bind_spawn_result enforces exact equality with
+            # the expected values), otherwise the expected values.
+            expected_provider=(
+                d.actual_provider if d.actual_provider is not None
+                else d.expected_agent_class
+            ),
+            expected_model=(
+                d.actual_model if d.actual_model is not None
+                else d.expected_model_class
+            ),
+            expected_thinking_tier=(
+                d.thinking_tier if d.thinking_tier is not None
+                else d.expected_thinking_tier
+            ),
+        )
+
+    # ------------------------------------------------------------- snapshot
+
+    def _read_core_facts(self, task_id: str, job_id: str) -> dict:
+        """Read every decision-relevant persisted fact (F6).
+
+        Must be called inside the read snapshot AND re-read inside the commit
+        transaction so the CAS key can compare them exactly.
+        """
+        task = self.core._store.get_task(task_id)
+        if task is None:
+            return None
+        frontier = self.core.workflow_frontier(task.id, self.controller_source)
+        active = self.store._current_dispatch(task.id)
+        at_frontier = self.store._dispatch_at_frontier(task.id, frontier)
+        matches = [
+            d for d in self.core._store.list_dispatches(task.id)
+            if d.cycle_no == frontier.cycle_no and d.position == frontier.position
+        ]
+        max_attempt = max((d.attempt_no for d in matches), default=0)
+        active_role_run = self.core._store.get_active_role_run(task.id)
+        gate, open_count = self.store._current_gate(task.id)
+        open_findings = sum(
+            1 for f in self.core._store.list_findings(task.id)
+            if f.status.value == "open"
+        )
+        latest_handoff = self.core._store.get_latest_handoff(task.id)
+        latest_handoff_id = latest_handoff.id if latest_handoff is not None else None
+        journal = tuple(sorted(
+            (a["action_key"], a["status"], a["attempt_count"])
+            for a in self.core._store.list_supervisor_actions(job_id)
+        ))
+        return {
+            "task": task, "frontier": frontier, "active": active,
+            "at_frontier": at_frontier, "max_attempt": max_attempt,
+            "active_role_run": active_role_run, "gate": gate,
+            "open_count": open_count, "open_findings": open_findings,
+            "latest_handoff_id": latest_handoff_id, "journal": journal,
+        }
+
+    def _read_snapshot(self, job_id: str) -> Optional[_Snapshot]:
+        # F6: complete snapshot under a single read transaction so every fact
+        # is observed at one consistent point in time.  F6-new: the ``finally``
+        # guarantees commit/rollback on EVERY return path (including the early
+        # missing-job/task returns), so ``in_transaction`` is never left True
+        # for the next Core write.
+        conn = self.core._store._conn
+        conn.execute("BEGIN")
+        try:
+            job = self.store._job_row(job_id)
+            if job is None:
+                return None
+            facts = self._read_core_facts(job["task_id"], job_id)
+            if facts is None:
+                return None
+            snap = _Snapshot(
+                job=job, task=facts["task"], frontier=facts["frontier"],
+                active_dispatch=facts["active"],
+                dispatch_at_frontier=facts["at_frontier"],
+                max_attempt_at_frontier=facts["max_attempt"],
+                active_role_run=facts["active_role_run"], gate=facts["gate"],
+                open_gates_count=facts["open_count"],
+                open_findings_count=facts["open_findings"],
+                latest_handoff_id=facts["latest_handoff_id"],
+                action_journal_fingerprint=facts["journal"],
+            )
+            conn.execute("COMMIT")
+            return snap
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+
+    def _guarded_observe(self, lookup: RunLookup) -> RunObservation:
+        """Observe through the guarded untrusted-runtime-data boundary (F3).
+
+        Shared by ``_observe`` (reconcile) and every action handler that reads
+        the provider directly.  A structural exception raised while
+        interpreting untrusted runtime data is converted into a fail-closed
+        CONFLICT observation (never raises), so neither the decision table nor
+        the loop can die.  Genuine ArgentError/NotFound keep their existing
+        semantics (not caught here).
+        """
+        try:
+            return self._run_status.observe(lookup)
+        except (TypeError, AttributeError, ValueError, KeyError) as exc:
+            return RunObservation(
+                status=RunStatus.CONFLICT,
+                agent_id=lookup.agent_id,
+                session_id=None,
+                run_id=None,
+                provider=None,
+                model=None,
+                thinking_tier=None,
+                started_at=None,
+                finished_at=None,
+                result=None,
+                result_hash=None,
+                authoritative_not_found=False,
+                evidence_id=f"adapter_exception:{type(exc).__name__}",
+                error_code="malformed_runtime_data",
+                adapter_exception_type=type(exc).__name__,
+            )
+
+    def _observe(self, snap: _Snapshot) -> Optional[RunObservation]:
+        d = snap.active_dispatch
+        if d is None:
+            return None
+        return self._guarded_observe(self._build_lookup(d))
+
+    @staticmethod
+    def _adapter_exception_type(obs: Optional[RunObservation]) -> Optional[str]:
+        """The structural adapter exception type behind an observation, or
+        None.  Only a fail-closed CONFLICT produced by ``_guarded_observe``
+        (the provider raised TypeError/AttributeError/ValueError/KeyError while
+        the runtime data was being interpreted) carries a non-None
+        ``adapter_exception_type``; a genuine provenance CONFLICT from the
+        provider does not and must keep its existing skipped/WAIT semantics.
+        """
+        if obs is None or obs.status is not RunStatus.CONFLICT:
+            return None
+        return obs.adapter_exception_type
+
+    def _action_adapter_conflict(
+        self, action: str, dispatch_id: Optional[str], obs: RunObservation,
+    ) -> Optional[ActionOutcome]:
+        """Marker outcome for an action-time structural provider failure.
+
+        Returns an ``ActionOutcome`` with status ``adapter_exception`` (detail =
+        the exception type) when ``obs`` is an exception-caused CONFLICT, else
+        None.  The caller (``perform_next_safe_action_if_required``) routes this
+        marker into ``adapter_exception_decision`` so the bounded backoff
+        (retry_count++, BACKOFF/WAIT, then sticky PERSISTENT_ERROR) applies to
+        action-time adapter failures exactly like reconcile-time ones.
+        """
+        etype = self._adapter_exception_type(obs)
+        if etype is None:
+            return None
+        return ActionOutcome(action, "adapter_exception", etype,
+                             dispatch_id=dispatch_id)
+
+    # ------------------------------------------------------------ reconcile
+
+    def reconcile(self, job_id: str) -> ReconcileDecision:
+        for _ in range(MAX_SNAPSHOT_RETRIES + 1):
+            snap = self._read_snapshot(job_id)
+            if snap is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            obs = self._observe(snap)
+            result = self._commit(job_id, snap, obs)
+            if result is _RETRY:
+                continue
+            return result
+        # Snapshot contention -> BACKOFF (no busy-loop).
+        return self._backoff_decision(job_id)
+
+    def _snapshot_key(self, snap: _Snapshot) -> tuple:
+        """Full decision-relevant facts tuple used as the commit CAS key (F6)."""
+        f = snap.frontier
+        ad = snap.active_dispatch
+        af = snap.dispatch_at_frontier
+        rr = snap.active_role_run
+        g = snap.gate
+        job = snap.job
+        return (
+            job["facts_version"], job["status"], job["retry_count"],
+            job["missing_confirmations"], job["owner_prompted_at"],
+            job.get("owner_prompted_gate_id"),
+            snap.task.state.value,
+            snap.task.resume_state.value if snap.task.resume_state else None,
+            f.cycle_no if f else None,
+            f.position if f else None,
+            f.sequence_kind.value if f else None,
+            f.expected_role.value if (f and f.expected_role) else None,
+            f.include_reviewer if f else None,
+            ad.id if ad else None,
+            ad.status.value if ad else None,
+            ad.openclaw_run_id if ad else None,
+            ad.child_session_id if ad else None,
+            ad.role.value if ad else None,
+            ad.cycle_no if ad else None,
+            ad.position if ad else None,
+            ad.attempt_no if ad else None,
+            ad.handoff_id if ad else None,
+            ad.actual_provider if ad else None,
+            ad.actual_model if ad else None,
+            af.id if af else None,
+            af.status.value if af else None,
+            af.attempt_no if af else None,
+            rr.id if rr else None,
+            rr.role.value if rr else None,
+            rr.status.value if rr else None,
+            g.id if g else None,
+            g.status.value if g else None,
+            g.closed_at if g else None,
+            g.binding_hash if g else None,
+            snap.open_gates_count,
+            snap.open_findings_count,
+            snap.latest_handoff_id,
+            snap.max_attempt_at_frontier,
+            snap.action_journal_fingerprint,
+        )
+
+    def _commit(self, job_id, snap, obs):
+        with self.core._store._transaction():
+            current_job = self.core._store.get_supervisor_job(job_id)
+            if current_job is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            if current_job["facts_version"] != snap.job["facts_version"]:
+                return _RETRY
+            # F6: re-read EVERY decision-relevant fact under BEGIN IMMEDIATE
+            # and compare against the snapshot; any drift -> RETRY.
+            facts = self._read_core_facts(snap.task.id, job_id)
+            if facts is None:
+                return _RETRY
+            fresh = _Snapshot(
+                job=current_job, task=facts["task"], frontier=facts["frontier"],
+                active_dispatch=facts["active"],
+                dispatch_at_frontier=facts["at_frontier"],
+                max_attempt_at_frontier=facts["max_attempt"],
+                active_role_run=facts["active_role_run"], gate=facts["gate"],
+                open_gates_count=facts["open_count"],
+                open_findings_count=facts["open_findings"],
+                latest_handoff_id=facts["latest_handoff_id"],
+                action_journal_fingerprint=facts["journal"],
+            )
+            if self._snapshot_key(fresh) != self._snapshot_key(snap):
+                return _RETRY
+            plan = self._decide(fresh, obs)
+            proj = self._projection_fields(fresh, obs)
+            fields = dict(proj)
+            fields["next_action"] = plan.action.value
+            fields["facts_version"] = current_job["facts_version"] + 1
+            fields["updated_at"] = self._now_iso()
+            if plan.wake_at is not None:
+                fields["next_wake_at"] = plan.wake_at
+            else:
+                fields["next_wake_at"] = None
+            if plan.status is not None:
+                fields["status"] = plan.status
+            if plan.recovery_state is not None:
+                fields["recovery_state"] = plan.recovery_state
+            if plan.retry_count is not None:
+                fields["retry_count"] = plan.retry_count
+            if plan.missing_confirmations is not None:
+                fields["missing_confirmations"] = plan.missing_confirmations
+            if plan.last_error_code is not None:
+                fields["last_error_code"] = plan.last_error_code
+            if plan.terminal is not None:
+                fields["terminal"] = plan.terminal
+                fields["status"] = SupervisorJobStatus.TERMINAL.value
+                fields["next_action"] = ReconcileAction.NONE.value
+                fields["next_wake_at"] = None
+            if plan.action in (
+                ReconcileAction.START_ROLE, ReconcileAction.CREATE_DISPATCH,
+                ReconcileAction.SPAWN_RUN, ReconcileAction.BIND_RUN,
+                ReconcileAction.APPLY_PATCH_SET, ReconcileAction.RUN_SANDBOX_TESTS,
+                ReconcileAction.RECORD_TEST_RESULT, ReconcileAction.CONSUME_RESULT,
+                ReconcileAction.MARK_RUN_FAILED, ReconcileAction.CORE_RECOVER,
+                ReconcileAction.PRESENT_OWNER_GATE,
+            ):
+                fields["last_progress_at"] = self._now_iso()
+            self.core._store._update_supervisor_job(job_id, **fields)
+            new_version = current_job["facts_version"] + 1
+        return ReconcileDecision(
+            job_id=job_id,
+            facts_version=new_version,
+            action=plan.action,
+            reason=plan.reason,
+            dispatch_id=plan.dispatch_id,
+            wake_at=plan.wake_at,
+        )
+
+    def _backoff_decision(self, job_id) -> ReconcileDecision:
+        now = self._now()
+        with self.core._store._transaction():
+            job = self.core._store.get_supervisor_job(job_id)
+            if job is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            retry = job["retry_count"]
+            wake = _iso(now + timedelta(seconds=backoff_seconds(retry)))
+            self.core._store._update_supervisor_job(
+                job_id,
+                status=SupervisorJobStatus.BACKOFF.value,
+                next_action=ReconcileAction.WAIT.value,
+                next_wake_at=wake,
+                updated_at=self._now_iso(),
+                facts_version=job["facts_version"] + 1,
+            )
+            version = job["facts_version"] + 1
+        return ReconcileDecision(
+            job_id=job_id, facts_version=version,
+            action=ReconcileAction.WAIT, reason="snapshot_contention",
+            wake_at=wake,
+        )
+
+    # ------------------------------------------------------------ projection
+
+    def _projection_fields(self, snap: _Snapshot, obs) -> dict:
+        f = snap.frontier
+        role = f.expected_role if f else None
+        disp = snap.active_dispatch if snap.active_dispatch is not None \
+            else snap.dispatch_at_frontier
+        result_status = obs.status.value if obs is not None else NOT_OBSERVED
+        gate = snap.gate
+        return {
+            "workflow_state": snap.task.state.value,
+            "expected_role": role.value if role else None,
+            "expected_dispatch_id": disp.id if disp is not None else None,
+            "agent_id": AGENT_IDS.get(role) if role else None,
+            "session_id": disp.child_session_id if disp is not None else None,
+            "run_id": disp.openclaw_run_id if disp is not None else None,
+            "attempt_no": disp.attempt_no if disp is not None else 0,
+            "dispatch_status": disp.status.value if disp is not None else None,
+            "result_status": result_status,
+            "result_consumed": (
+                1 if (disp is not None and disp.status is DispatchStatus.CONSUMED
+                       and disp.consumed_at is not None) else 0
+            ),
+            "current_handoff_id": (
+                self.core._store.get_latest_handoff(snap.task.id).id
+                if self.core._store.get_latest_handoff(snap.task.id) is not None
+                else None
+            ),
+            "open_findings_count": sum(
+                1 for fd in self.core._store.list_findings(snap.task.id)
+                if fd.status.value == "open"
+            ),
+            "rework_cycle": self.store._max_cycle(snap.task.id),
+            "owner_gate_id": gate.id if gate is not None else None,
+            "gate_status": gate.status.value if gate is not None else None,
+            "gate_scope": gate.scope if gate is not None else None,
+            "gate_closed": 1 if (gate is not None and gate.closed_at is not None) else 0,
+        }
+
+    # ------------------------------------------------------------- decision
+
+    def _decide(self, snap: _Snapshot, obs) -> _Plan:
+        job = snap.job
+        task = snap.task
+        frontier = snap.frontier
+
+        if job["terminal"] is not None:
+            return _Plan(ReconcileAction.NONE, "job_terminal")
+
+        # A persisted ERROR state is sticky: no further autonomous action
+        # (PERSISTENT_ERROR is not re-decided forever, SPEC V2C §9).
+        if job["status"] == SupervisorJobStatus.ERROR.value:
+            return _Plan(ReconcileAction.NONE, "error_state")
+
+        if task.state is TaskState.DONE:
+            return _Plan(ReconcileAction.CLOSE_DONE, "task_done")
+        if task.state in (TaskState.FAILED, TaskState.CANCELLED):
+            return _Plan(ReconcileAction.CLOSE_FAILED, "task_failed_cancelled")
+        if task.state is TaskState.BLOCKED:
+            return _Plan(ReconcileAction.CLOSE_BLOCKED, "task_blocked")
+
+        gate_plan = self._decide_gate(snap)
+        if gate_plan is not None:
+            return gate_plan
+
+        if frontier.expected_role is None:
+            return _Plan(ReconcileAction.PERSISTENT_ERROR, "frontier_exhausted",
+                         status=SupervisorJobStatus.ERROR.value,
+                         last_error_code="frontier_exhausted")
+
+        role = frontier.expected_role
+
+        ad = snap.active_dispatch
+        if ad is not None and (
+            ad.cycle_no != frontier.cycle_no
+            or ad.position != frontier.position
+            or ad.role is not role
+        ):
+            return _Plan(
+                ReconcileAction.PERSISTENT_ERROR, "ledger_conflict_active_dispatch",
+                dispatch_id=ad.id,
+                status=SupervisorJobStatus.ERROR.value,
+                last_error_code="ledger_conflict_active_dispatch",
+            )
+
+        if ad is None:
+            return self._decide_no_active(snap, role)
+
+        if ad.status is DispatchStatus.PENDING or (
+            ad.status is DispatchStatus.RECOVERY_PENDING
+            and ad.child_session_id is None
+        ):
+            return self._decide_unbound(snap, obs, role, ad)
+        return self._decide_bound(snap, obs, role, ad)
+
+    def _decide_gate(self, snap: _Snapshot) -> Optional[_Plan]:
+        job = snap.job
+        task = snap.task
+        if snap.open_gates_count > 1:
+            return _Plan(ReconcileAction.PERSISTENT_ERROR, "multiple_active_gates",
+                         status=SupervisorJobStatus.ERROR.value,
+                         last_error_code="multiple_active_gates")
+        gate = snap.gate
+        if task.state is TaskState.OWNER_APPROVAL_REQUIRED:
+            if gate is None or gate.status not in (
+                ApprovalStatus.PENDING, ApprovalStatus.APPROVED,
+            ):
+                return _Plan(ReconcileAction.PERSISTENT_ERROR,
+                             "gate_task_inconsistent_no_gate",
+                             status=SupervisorJobStatus.ERROR.value,
+                             last_error_code="gate_task_inconsistent")
+            if gate.status is ApprovalStatus.PENDING:
+                prompted_gate = job.get("owner_prompted_gate_id")
+                if job["owner_prompted_at"] is None or prompted_gate != gate.id:
+                    return _Plan(ReconcileAction.PRESENT_OWNER_GATE,
+                                 "present_gate",
+                                 status=SupervisorJobStatus.WAITING_GATE.value)
+                return _Plan(ReconcileAction.WAIT, "waiting_gate",
+                             status=SupervisorJobStatus.WAITING_GATE.value,
+                             wake_at=_iso(self._now() + timedelta(seconds=RUNNING_POLL_SECONDS)))
+            return _Plan(ReconcileAction.WAIT, "gate_approved_waiting_execution",
+                         status=SupervisorJobStatus.WAITING_GATE.value,
+                         wake_at=_iso(self._now() + timedelta(seconds=RUNNING_POLL_SECONDS)))
+        # Task not in gate state.
+        if gate is not None and gate.status in (
+            ApprovalStatus.PENDING, ApprovalStatus.APPROVED,
+        ):
+            return _Plan(ReconcileAction.PERSISTENT_ERROR,
+                         "gate_task_inconsistent_active_gate",
+                         status=SupervisorJobStatus.ERROR.value,
+                         last_error_code="gate_task_inconsistent")
+        return None
+
+    def _decide_no_active(self, snap: _Snapshot, role: Role) -> _Plan:
+        job = snap.job
+        latest = snap.dispatch_at_frontier
+        if latest is not None and latest.status in (
+            DispatchStatus.FAILED, DispatchStatus.REJECTED,
+        ):
+            if latest.attempt_no >= MAX_DISPATCH_ATTEMPTS_PER_STEP:
+                return _Plan(ReconcileAction.CLOSE_FAILED, "max_attempts")
+        active_rr = snap.active_role_run
+        if active_rr is None or active_rr.role is not role:
+            return _Plan(ReconcileAction.START_ROLE, "need_role",
+                         dispatch_id=latest.id if latest is not None else None)
+        return _Plan(ReconcileAction.CREATE_DISPATCH, "need_dispatch",
+                     dispatch_id=latest.id if latest is not None else None,
+                     missing_confirmations=0, retry_count=0)
+
+    def _decide_unbound(self, snap, obs, role, ad) -> _Plan:
+        job = snap.job
+        if obs is None:
+            return _Plan(ReconcileAction.WAIT, "no_observation",
+                         status=SupervisorJobStatus.WAITING_RUN.value,
+                         wake_at=_iso(self._now() + timedelta(seconds=RUNNING_POLL_SECONDS)))
+
+        if obs.status in (RunStatus.RUNNING, RunStatus.SUCCEEDED,
+                          RunStatus.FAILED, RunStatus.CANCELLED):
+            if obs.run_id is None or obs.session_id is None:
+                # The runtime flushes the trajectory late: an active session
+                # without bindable values yet must WAIT (bounded poll), never
+                # tight-loop on BIND_RUN (real-E2E finding).
+                return _Plan(ReconcileAction.WAIT, "run_active_no_binding_values",
+                             dispatch_id=ad.id,
+                             status=SupervisorJobStatus.WAITING_RUN.value,
+                             recovery_state=RecoveryState.DISCOVERING_RUN.value,
+                             wake_at=_iso(self._now() + timedelta(seconds=RUNNING_POLL_SECONDS)))
+            # NOTE: retry_count is deliberately NOT reset here.  A structural
+            # adapter failure during the BIND_RUN action re-observation is
+            # routed into ``adapter_exception_decision`` (retry_count++);
+            # resetting it to 0 on every re-decision would keep the job stuck
+            # in an unbounded busy-loop with retry_count pinned at 0.
+            return _Plan(ReconcileAction.BIND_RUN, "bind_observed_run",
+                         dispatch_id=ad.id,
+                         recovery_state=RecoveryState.RESTORING_BINDING.value,
+                         missing_confirmations=0)
+
+        if obs.status is RunStatus.NOT_FOUND:
+            spawn = self._spawn_action(ad.id)
+            # F3: an exhausted SPAWN_RUN (persisted FAILED row with
+            # attempt_count >= MAX_ACTION_RETRIES) is a terminal ambiguity, not
+            # a pending spawn.  Never keep waiting indefinitely (retry_count
+            # growing forever) — persist a sticky ERROR.
+            if (spawn is not None and spawn["status"] == "FAILED"
+                    and spawn["attempt_count"] >= MAX_ACTION_RETRIES):
+                return _Plan(ReconcileAction.PERSISTENT_ERROR,
+                             "spawn_run_exhausted", dispatch_id=ad.id,
+                             status=SupervisorJobStatus.ERROR.value,
+                             recovery_state=RecoveryState.PERSISTENT_ERROR.value,
+                             last_error_code="spawn_run_exhausted")
+            if not obs.authoritative_not_found:
+                return self._wait_missing(snap, ad, "not_found_non_authoritative",
+                                          RecoveryState.DISCOVERING_RUN.value)
+            if spawn is None:
+                return _Plan(ReconcileAction.SPAWN_RUN, "spawn_run",
+                             dispatch_id=ad.id,
+                             recovery_state=RecoveryState.DISCOVERING_RUN.value)
+            # Spawn already planned: wait / confirm.  Increment AND persist
+            # retry_count so the backoff actually grows (F3).  The wake uses
+            # the *pre-increment* count so the sequence is 1,2,4,8,16,30s.
+            missing = job["missing_confirmations"] + 1
+            retry = job["retry_count"] + 1
+            if missing >= MISSING_UNBOUND_SPAWN_CONFIRMATIONS:
+                return _Plan(ReconcileAction.CLOSE_BLOCKED,
+                             "spawn_unresolvable",
+                             recovery_state=RecoveryState.AMBIGUOUS_WRITER.value if _is_implementer(role) else None)
+            return _Plan(ReconcileAction.WAIT, "spawn_pending",
+                         dispatch_id=ad.id,
+                         status=SupervisorJobStatus.WAITING_RUN.value,
+                         recovery_state=RecoveryState.DISCOVERING_RUN.value,
+                         missing_confirmations=missing,
+                         retry_count=retry,
+                         wake_at=_iso(self._now() + timedelta(seconds=backoff_seconds(retry - 1))))
+
+        # UNKNOWN / CONFLICT
+        return self._adapter_backoff(snap, ad, obs)
+
+    def _decide_bound(self, snap, obs, role, ad) -> _Plan:
+        job = snap.job
+        if obs is None:
+            return _Plan(ReconcileAction.WAIT, "no_observation",
+                         status=SupervisorJobStatus.WAITING_RUN.value,
+                         wake_at=_iso(self._now() + timedelta(seconds=RUNNING_POLL_SECONDS)))
+
+        if obs.status is RunStatus.RUNNING:
+            return _Plan(ReconcileAction.WAIT, "run_running",
+                         dispatch_id=ad.id,
+                         status=SupervisorJobStatus.WAITING_RUN.value,
+                         wake_at=_iso(self._now() + timedelta(seconds=RUNNING_POLL_SECONDS)),
+                         retry_count=0)
+
+        if obs.status is RunStatus.SUCCEEDED:
+            if _is_write_role(role):
+                return self._decide_write_preconditions(snap, obs, ad)
+            # A permanently failed consume action (rejected result, exhausted
+            # retries) must NOT re-plan CONSUME_RESULT forever (real-E2E
+            # finding: rejected consume looped ~380x).  Route to the bounded
+            # run-failure policy instead.
+            act = self._consume_action(ad.id)
+            if act is not None and act["status"] == "FAILED" \
+                    and act["attempt_count"] >= MAX_ACTION_RETRIES:
+                return _Plan(ReconcileAction.MARK_RUN_FAILED,
+                             "consume_unresolvable", dispatch_id=ad.id,
+                             recovery_state=RecoveryState.RETRYING_STEP.value)
+            return _Plan(ReconcileAction.CONSUME_RESULT, "consume_result",
+                         dispatch_id=ad.id,
+                         recovery_state=RecoveryState.CONSUMING_RESULT.value)
+
+        if obs.status in (RunStatus.FAILED, RunStatus.CANCELLED):
+            return _Plan(ReconcileAction.MARK_RUN_FAILED, "run_failed",
+                         dispatch_id=ad.id,
+                         recovery_state=RecoveryState.RETRYING_STEP.value)
+
+        if obs.status is RunStatus.NOT_FOUND:
+            missing = job["missing_confirmations"] + 1
+            retry = job["retry_count"] + 1
+            if missing >= MISSING_BOUND_RUN_CONFIRMATIONS:
+                if _is_implementer(role):
+                    return _Plan(ReconcileAction.CLOSE_BLOCKED,
+                                 "ambiguous_writer",
+                                 recovery_state=RecoveryState.AMBIGUOUS_WRITER.value)
+                return _Plan(ReconcileAction.MARK_RUN_FAILED,
+                             "missing_bound_run", dispatch_id=ad.id,
+                             recovery_state=RecoveryState.CORE_RECOVERY_REQUIRED.value)
+            return _Plan(ReconcileAction.WAIT, "bound_run_missing",
+                         dispatch_id=ad.id,
+                         status=SupervisorJobStatus.WAITING_RUN.value,
+                         recovery_state=RecoveryState.DISCOVERING_RUN.value,
+                         missing_confirmations=missing,
+                         retry_count=retry,
+                         wake_at=_iso(self._now() + timedelta(seconds=backoff_seconds(retry - 1))))
+
+        return self._adapter_backoff(snap, ad, obs)
+
+    def _decide_write_preconditions(self, snap, obs, ad) -> _Plan:
+        # Implementer/QA: broker apply -> sandbox tests -> record test result
+        # -> consume (§8.3 + A7).  Each step is journaled; check their status.
+        job = snap.job
+        # F2: an exhausted (FAILED with retries >= MAX) precondition action must
+        # route to a persisted ERROR, never be re-planned forever.
+        for atype in ("APPLY_PATCH_SET", "RUN_SANDBOX_TESTS",
+                      "RECORD_TEST_RESULT", "CONSUME_RESULT"):
+            act = self._latest_action(ad.id, atype)
+            if act is not None and act["status"] == "FAILED" \
+                    and act["attempt_count"] >= MAX_ACTION_RETRIES:
+                return _Plan(ReconcileAction.PERSISTENT_ERROR,
+                             f"{atype.lower()}_exhausted", dispatch_id=ad.id,
+                             status=SupervisorJobStatus.ERROR.value,
+                             recovery_state=RecoveryState.PERSISTENT_ERROR.value,
+                             last_error_code=f"{atype.lower()}_exhausted")
+        # F1: a diverged canonical apply intent (workspace hash matched neither
+        # the persisted precondition nor effect after a partial broker-effect
+        # crash) is a bounded sticky error — never re-plan APPLY (which could
+        # mint a second result-keyed intent) and never advance the dispatch.
+        if self._diverged_apply_intent(ad.id) is not None:
+            return self._apply_diverged_plan(snap, ad)
+        apply_done = self._action_succeeded(ad.id, "APPLY_PATCH_SET")
+        tests_done = self._action_succeeded(ad.id, "RUN_SANDBOX_TESTS")
+        record_done = self._action_succeeded(ad.id, "RECORD_TEST_RESULT")
+        if not apply_done:
+            # R7-F1: plan APPLY_PATCH_SET whether or not a committed apply
+            # intent already exists.  ``_perform_apply_patch_set`` reconciles an
+            # existing RUNNING/UNCERTAIN intent exactly-once from its PERSISTED
+            # precondition/effect hashes (never minting a second intent, never
+            # trusting a changed observation).  A changed observation is failed
+            # closed on the NEXT decision via the frozen-hash backoff below.
+            return _Plan(ReconcileAction.APPLY_PATCH_SET, "apply_patch_set",
+                         dispatch_id=ad.id,
+                         recovery_state=RecoveryState.CONSUMING_RESULT.value)
+        # F1: once APPLY succeeded, the frozen write-result hash is the single
+        # immutable binding for the rest of the pipeline.  Recompute the
+        # canonical full-result hash from the CURRENT observation and require
+        # exact equality; a mismatch (provider result changed after apply) must
+        # NEVER proceed to tests/record/consume — bounded backoff instead.
+        frozen = self._frozen_write_result_hash(ad.id)
+        if frozen is not None \
+                and self._canonical_full_result_hash(obs.result) != frozen:
+            return self._write_hash_mismatch_plan(snap, ad)
+        if not tests_done:
+            return _Plan(ReconcileAction.RUN_SANDBOX_TESTS, "run_sandbox_tests",
+                         dispatch_id=ad.id,
+                         recovery_state=RecoveryState.CONSUMING_RESULT.value)
+        if not record_done:
+            return _Plan(ReconcileAction.RECORD_TEST_RESULT, "record_test_result",
+                         dispatch_id=ad.id,
+                         recovery_state=RecoveryState.CONSUMING_RESULT.value)
+        return _Plan(ReconcileAction.CONSUME_RESULT, "consume_result",
+                     dispatch_id=ad.id,
+                     recovery_state=RecoveryState.CONSUMING_RESULT.value)
+
+    def _adapter_backoff(self, snap, ad, obs) -> _Plan:
+        job = snap.job
+        retry = job["retry_count"] + 1
+        if retry >= MAX_RUNTIME_UNKNOWN:
+            return _Plan(ReconcileAction.PERSISTENT_ERROR,
+                         f"adapter_{obs.status.value.lower()}",
+                         dispatch_id=ad.id,
+                         status=SupervisorJobStatus.ERROR.value,
+                         recovery_state=RecoveryState.PERSISTENT_ERROR.value,
+                         retry_count=retry,
+                         last_error_code=f"adapter_{obs.status.value.lower()}")
+        return _Plan(ReconcileAction.WAIT, f"adapter_{obs.status.value.lower()}",
+                     dispatch_id=ad.id,
+                     status=SupervisorJobStatus.BACKOFF.value,
+                     recovery_state=RecoveryState.RUNTIME_UNKNOWN.value,
+                     retry_count=retry,
+                     wake_at=_iso(self._now() + timedelta(seconds=backoff_seconds(retry))))
+
+    def _write_hash_mismatch_plan(self, snap, ad) -> _Plan:
+        """Bounded backoff for a write-result hash mismatch (F1).
+
+        The current observation no longer describes the frozen write-result
+        hash (the provider result changed after APPLY).  Never proceed to
+        tests/record/consume; after MAX_RUNTIME_UNKNOWN backoffs land in a
+        sticky PERSISTENT_ERROR.
+        """
+        job = snap.job
+        retry = job["retry_count"] + 1
+        if retry >= MAX_RUNTIME_UNKNOWN:
+            return _Plan(ReconcileAction.PERSISTENT_ERROR,
+                         "write_result_hash_mismatch", dispatch_id=ad.id,
+                         status=SupervisorJobStatus.ERROR.value,
+                         recovery_state=RecoveryState.PERSISTENT_ERROR.value,
+                         retry_count=retry,
+                         last_error_code="write_result_hash_mismatch")
+        return _Plan(ReconcileAction.WAIT, "write_result_hash_mismatch",
+                     dispatch_id=ad.id,
+                     status=SupervisorJobStatus.BACKOFF.value,
+                     recovery_state=RecoveryState.RUNTIME_UNKNOWN.value,
+                     retry_count=retry,
+                     wake_at=_iso(self._now() + timedelta(seconds=backoff_seconds(retry))))
+
+    def _apply_diverged_plan(self, snap, ad) -> _Plan:
+        """Bounded backoff for a diverged canonical apply intent (F1).
+
+        The workspace hash matched neither the persisted precondition nor the
+        persisted effect (a partial broker-effect crash).  Never re-plan APPLY
+        (never mint a second result-keyed intent) and never advance to
+        tests/record/consume; after MAX_RUNTIME_UNKNOWN backoffs land in a
+        sticky PERSISTENT_ERROR.  Mirrors ``_write_hash_mismatch_plan``.
+        """
+        job = snap.job
+        retry = job["retry_count"] + 1
+        if retry >= MAX_RUNTIME_UNKNOWN:
+            return _Plan(ReconcileAction.PERSISTENT_ERROR,
+                         "workspace_diverged", dispatch_id=ad.id,
+                         status=SupervisorJobStatus.ERROR.value,
+                         recovery_state=RecoveryState.PERSISTENT_ERROR.value,
+                         retry_count=retry,
+                         last_error_code="workspace_diverged")
+        return _Plan(ReconcileAction.WAIT, "workspace_diverged",
+                     dispatch_id=ad.id,
+                     status=SupervisorJobStatus.BACKOFF.value,
+                     recovery_state=RecoveryState.RUNTIME_UNKNOWN.value,
+                     retry_count=retry,
+                     wake_at=_iso(self._now() + timedelta(seconds=backoff_seconds(retry))))
+
+    def _wait_missing(self, snap, ad, reason, recovery_state) -> _Plan:
+        job = snap.job
+        missing = job["missing_confirmations"] + 1
+        retry = job["retry_count"] + 1
+        return _Plan(ReconcileAction.WAIT, reason,
+                     dispatch_id=ad.id,
+                     status=SupervisorJobStatus.WAITING_RUN.value,
+                     recovery_state=recovery_state,
+                     missing_confirmations=missing,
+                     retry_count=retry,
+                     wake_at=_iso(self._now() + timedelta(seconds=backoff_seconds(retry - 1))))
+
+    def _spawn_action(self, dispatch_id: str) -> Optional[dict]:
+        return self.core._store.get_supervisor_action_by_key(
+            f"supervisor:dispatch:{dispatch_id}:spawn"
+        )
+
+    def _consume_action(self, dispatch_id: str) -> Optional[dict]:
+        """The most recent CONSUME_RESULT journal entry for a dispatch."""
+        return self._latest_action(dispatch_id, "CONSUME_RESULT")
+
+    def _action_succeeded(self, dispatch_id: str, action_type: str) -> bool:
+        rows = self.core._store.list_supervisor_actions()
+        for a in rows:
+            if a["dispatch_id"] == dispatch_id and a["action_type"] == action_type \
+                    and a["status"] == "SUCCEEDED":
+                return True
+        return False
+
+    # ---------------------------------------------------------- completion
+
+    def receive_completion_hint(self, dispatch_id, event_meta, result) -> ReceiveResult:
+        """Completion hint into the persisted pipeline (A9: fail-closed).
+
+        For write roles (Implementer/QA) a completion hint is ADVISORY ONLY: it
+        must NEVER consume the dispatch directly (that would bypass the
+        broker apply -> sandbox tests -> record test result -> consume flow).
+        The hint is dropped/deferred and the persisted provider observation
+        drives the normal pipeline via ``reconcile()``.  Non-write roles
+        (LEAD/ANALYST/REVIEWER) keep the direct ``Core.receive_agent_result``
+        fast path exactly as today.
+        """
+        d = self.core._store.get_dispatch(dispatch_id)
+        if d is not None and _is_write_role(d.role):
+            return ReceiveResult(
+                dispatch_id, "deferred",
+                reason="write_role_completion_is_advisory",
+            )
+        canonical = _canonical_json(result)
+        run_id = event_meta.get("run_id") if isinstance(event_meta, dict) else None
+        key = (
+            f"supervisor:consume:{dispatch_id}:{run_id}:"
+            f"{_sha256(canonical)}"
+        )
+        try:
+            return self.core.receive_agent_result(
+                dispatch_id, event_meta, result, self.controller_source,
+                idempotency_key=key,
+            )
+        except ArgentError as exc:
+            return ReceiveResult(
+                dispatch_id, "rejected", reason=f"completion_hint:{type(exc).__name__}"
+            )
+
+    # --------------------------------------------------- action execution
+
+    def perform_next_safe_action_if_required(
+        self, decision: ReconcileDecision,
+    ) -> ActionOutcome:
+        if decision.action in (ReconcileAction.NONE, ReconcileAction.WAIT):
+            return ActionOutcome(decision.action.value, "noop")
+
+        # Stale decision guard (§8.1).
+        job = self.core._store.get_supervisor_job(decision.job_id)
+        if job is None:
+            return ActionOutcome(decision.action.value, "skipped", "job_missing")
+        if job["facts_version"] != decision.facts_version:
+            return ActionOutcome(decision.action.value, "skipped", "stale_decision")
+
+        handler = getattr(self, f"_perform_{decision.action.value.lower()}", None)
+        if handler is None:
+            return ActionOutcome(decision.action.value, "skipped", "no_handler")
+        try:
+            result = handler(decision, job)
+        except IdempotencyError as exc:
+            # F2: an args-hash-mismatch is an invalid journal action and must
+            # never livelock the job in ACTIVE re-planning.  Persist a sticky
+            # ERROR atomically.
+            self._persist_error(
+                job["id"], f"{decision.action.value}_args_hash_mismatch"
+            )
+            return ActionOutcome(
+                decision.action.value, "failed",
+                f"args_hash_mismatch:{exc}", dispatch_id=decision.dispatch_id,
+            )
+        except ArgentError as exc:
+            return ActionOutcome(
+                decision.action.value, "failed", f"{type(exc).__name__}:{exc}",
+                dispatch_id=decision.dispatch_id,
+            )
+        if result.status == "exhausted":
+            # F2: an exhausted journal action (attempt_count >= MAX) must
+            # atomically persist an error state instead of returning the same
+            # exhausted outcome forever while the job stays ACTIVE.
+            self._persist_error(
+                job["id"], f"{decision.action.value}_exhausted"
+            )
+        elif result.status == "adapter_exception":
+            # F3: an action-time structural adapter failure (the handler
+            # re-observed the runtime and ``_guarded_observe`` turned a
+            # TypeError/AttributeError/ValueError/KeyError into a fail-closed
+            # CONFLICT) must be bounded exactly like a reconcile-time one:
+            # retry_count++, BACKOFF/WAIT, then sticky PERSISTENT_ERROR after
+            # MAX_RUNTIME_UNKNOWN.  Never a plain ``skipped`` that re-plans the
+            # action unboundedly with retry_count stuck at 0.
+            self.adapter_exception_decision(job["id"], result.detail)
+        return result
+
+    def _persist_error(self, job_id: str, error_code: str) -> None:
+        """Atomically persist a sticky job ERROR state (F2, no livelock).
+
+        Every exhausted / args-hash-mismatch / unreconciled-RUNNING journal
+        outcome must land here so the job leaves ACTIVE re-planning and is never
+        re-decided (``_decide`` short-circuits on status == ERROR).  Terminal
+        jobs are never downgraded.
+        """
+        with self.core._store._transaction():
+            cur = self.core._store.get_supervisor_job(job_id)
+            if cur is None or cur["terminal"] is not None:
+                return
+            self.core._store._update_supervisor_job(
+                job_id,
+                status=SupervisorJobStatus.ERROR.value,
+                recovery_state=RecoveryState.PERSISTENT_ERROR.value,
+                last_error_code=error_code,
+                next_action=ReconcileAction.NONE.value,
+                next_wake_at=None,
+                updated_at=self._now_iso(),
+                facts_version=cur["facts_version"] + 1,
+            )
+
+    def adapter_exception_decision(
+        self, job_id: str, type_name: str
+    ) -> ReconcileDecision:
+        """Persist a bounded backoff for a structural adapter exception (F3).
+
+        Mirrors ``_adapter_backoff``: increments ``retry_count``, persists
+        BACKOFF+WAIT (or a sticky PERSISTENT_ERROR after MAX_RUNTIME_UNKNOWN),
+        and returns a structured decision so ``SupervisorLoop.run_once`` never
+        dies on untrusted runtime data.  Only structural adapter exceptions
+        (TypeError/AttributeError/ValueError/KeyError) ever reach here; Core/DB
+        and ArgentError keep their normal semantics.
+        """
+        now = self._now()
+        error_code = f"adapter_exception:{type_name}"
+        with self.core._store._transaction():
+            job = self.core._store.get_supervisor_job(job_id)
+            if job is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            retry = job["retry_count"] + 1
+            if retry >= MAX_RUNTIME_UNKNOWN:
+                self.core._store._update_supervisor_job(
+                    job_id,
+                    status=SupervisorJobStatus.ERROR.value,
+                    recovery_state=RecoveryState.PERSISTENT_ERROR.value,
+                    last_error_code=error_code,
+                    next_action=ReconcileAction.NONE.value,
+                    next_wake_at=None,
+                    retry_count=retry,
+                    updated_at=self._now_iso(),
+                    facts_version=job["facts_version"] + 1,
+                )
+                return ReconcileDecision(
+                    job_id=job_id, facts_version=job["facts_version"] + 1,
+                    action=ReconcileAction.PERSISTENT_ERROR, reason=error_code,
+                )
+            wake = _iso(now + timedelta(seconds=backoff_seconds(retry)))
+            self.core._store._update_supervisor_job(
+                job_id,
+                status=SupervisorJobStatus.BACKOFF.value,
+                recovery_state=RecoveryState.RUNTIME_UNKNOWN.value,
+                last_error_code=error_code,
+                next_action=ReconcileAction.WAIT.value,
+                next_wake_at=wake,
+                retry_count=retry,
+                updated_at=self._now_iso(),
+                facts_version=job["facts_version"] + 1,
+            )
+            return ReconcileDecision(
+                job_id=job_id, facts_version=job["facts_version"] + 1,
+                action=ReconcileAction.WAIT, reason=error_code, wake_at=wake,
+            )
+
+    def _apply_job_backoff(self, job_id: str, error_code: str) -> None:
+        """Persist a contention-safe bounded backoff for an apply-fence
+        failure (F2/R15): lock unavailable or workspace-identity mismatch.
+
+        Mirrors ``adapter_exception_decision`` (the existing bounded budget):
+        increments AND persists ``retry_count``, sets a growing ``next_wake_at``
+        (BACKOFF + WAIT via ``backoff_seconds``), and transitions to a sticky
+        PERSISTENT_ERROR once ``retry_count >= MAX_RUNTIME_UNKNOWN``.  The
+        bounded error lives on the JOB level ONLY: the shared canonical RUNNING
+        intent row is NEVER touched, so another lock holder may still be
+        executing it (the intent stays RUNNING/UNCERTAIN as appropriate).
+        """
+        now = self._now()
+        with self.core._store._transaction():
+            job = self.core._store.get_supervisor_job(job_id)
+            if job is None:
+                return
+            retry = job["retry_count"] + 1
+            if retry >= MAX_RUNTIME_UNKNOWN:
+                self.core._store._update_supervisor_job(
+                    job_id,
+                    status=SupervisorJobStatus.ERROR.value,
+                    recovery_state=RecoveryState.PERSISTENT_ERROR.value,
+                    last_error_code=error_code,
+                    next_action=ReconcileAction.NONE.value,
+                    next_wake_at=None,
+                    retry_count=retry,
+                    updated_at=self._now_iso(),
+                    facts_version=job["facts_version"] + 1,
+                )
+                return
+            wake = _iso(now + timedelta(seconds=backoff_seconds(retry)))
+            self.core._store._update_supervisor_job(
+                job_id,
+                status=SupervisorJobStatus.BACKOFF.value,
+                recovery_state=RecoveryState.RUNTIME_UNKNOWN.value,
+                last_error_code=error_code,
+                next_action=ReconcileAction.WAIT.value,
+                next_wake_at=wake,
+                retry_count=retry,
+                updated_at=self._now_iso(),
+                facts_version=job["facts_version"] + 1,
+            )
+
+    # ---- journal helpers -------------------------------------------------
+
+    def _begin_action(self, key, action_type, job, dispatch_id, args_hash, *,
+                      input_hash=None, precondition_hash=None,
+                      effect_hash=None, patch_set_json=None):
+        """Atomically get-or-create the journal row and advance it to RUNNING.
+
+        Returns ``(row, outcome)`` where outcome is one of
+        ``new`` (fresh RUNNING row), ``retry`` (FAILED/PLANNED -> RUNNING,
+        attempt_count+1), ``running`` (already RUNNING/UNCERTAIN),
+        ``succeeded`` (already SUCCEEDED) or ``exhausted`` (retry budget
+        consumed).  ``args_hash`` is compared on replay so a key reuse with
+        different arguments fails closed (idempotency).
+        """
+        now = self._now_iso()
+        with self.core._store._transaction():
+            return self._begin_action_locked(
+                key, action_type, job, dispatch_id, args_hash, now,
+                input_hash=input_hash, precondition_hash=precondition_hash,
+                effect_hash=effect_hash, patch_set_json=patch_set_json,
+            )
+
+    def _begin_action_locked(self, key, action_type, job, dispatch_id, args_hash,
+                             now, *, input_hash=None, precondition_hash=None,
+                             effect_hash=None, patch_set_json=None):
+        """Transaction-scoped core of :meth:`_begin_action` (no own BEGIN)."""
+        existing = self.core._store.get_supervisor_action_by_key(key)
+        if existing is not None:
+            if existing["args_hash"] != args_hash:
+                raise IdempotencyError(
+                    f"action key {key!r} reused with different args_hash "
+                    f"({existing['args_hash']!r} != {args_hash!r})"
+                )
+            if existing["status"] == "SUCCEEDED":
+                return existing, "succeeded"
+            if existing["status"] in ("RUNNING", "UNCERTAIN"):
+                return existing, "running"
+            if existing["status"] in ("PLANNED", "FAILED"):
+                if existing["attempt_count"] >= MAX_ACTION_RETRIES:
+                    return existing, "exhausted"
+                updates = {
+                    "status": "RUNNING",
+                    "attempt_count": existing["attempt_count"] + 1,
+                    "started_at": now,
+                    "updated_at": now,
+                }
+                if input_hash is not None:
+                    updates["input_hash"] = input_hash
+                if precondition_hash is not None:
+                    updates["precondition_hash"] = precondition_hash
+                if effect_hash is not None:
+                    updates["effect_hash"] = effect_hash
+                if patch_set_json is not None:
+                    updates["patch_set_json"] = patch_set_json
+                self.core._store._update_supervisor_action(existing["id"], **updates)
+                return self.core._store.get_supervisor_action(existing["id"]), "retry"
+        aid = _sha256(key)[:32]
+        row = {
+            "id": aid, "supervisor_job_id": job["id"],
+            "dispatch_id": dispatch_id, "action_type": action_type,
+            "action_key": key, "args_hash": args_hash,
+            "input_hash": input_hash, "precondition_hash": precondition_hash,
+            "effect_hash": effect_hash, "patch_set_json": patch_set_json,
+            "status": "RUNNING", "attempt_count": 1,
+            "next_attempt_at": None, "started_at": now, "finished_at": None,
+            "last_error_code": None, "created_at": now, "updated_at": now,
+        }
+        self.core._store._insert_supervisor_action(row)
+        return row, "new"
+
+    def _begin_apply_action(self, key, job, dispatch_id, canonical_input_hash,
+                            args_hash, *, input_hash=None,
+                            precondition_hash=None, effect_hash=None,
+                            patch_set_json=None):
+        """Atomically claim the single canonical write intent for a dispatch
+        AND get-or-create its APPLY_PATCH_SET journal row (R13-F1).
+
+        The claim and the APPLY row INSERT happen in ONE ``BEGIN IMMEDIATE``
+        transaction, so no interleaving can observe zero intents twice.  The
+        ``dispatch_write_intents.dispatch_id`` primary key is the DB-enforced
+        single-intent-per-dispatch invariant.
+
+        Returns ``(conflict, winner_hash, winner_action_id, row, outcome)``:
+
+        - ``conflict=True``: an existing canonical intent with a DIFFERENT
+          hash already owns the dispatch (a concurrent controller won the
+          claim).  No new row is created; the caller must fail closed and
+          reconcile the WINNER's persisted intent.
+        - ``conflict=False``: ``(row, outcome)`` is the normal
+          ``_begin_action`` result, and ``(winner_hash, winner_action_id)``
+          are the canonical binding (equal to this observation's hash).
+        """
+        now = self._now_iso()
+        with self.core._store._transaction():
+            winner = self.core._store.get_dispatch_write_intent(dispatch_id)
+            if winner is not None:
+                if winner["canonical_input_hash"] != canonical_input_hash:
+                    return (True, winner["canonical_input_hash"],
+                            winner["intent_action_id"], None, None)
+                row, outcome = self._begin_action_locked(
+                    key, "APPLY_PATCH_SET", job, dispatch_id, args_hash, now,
+                    input_hash=input_hash, precondition_hash=precondition_hash,
+                    effect_hash=effect_hash, patch_set_json=patch_set_json,
+                )
+                return (False, winner["canonical_input_hash"],
+                        winner["intent_action_id"], row, outcome)
+            row, outcome = self._begin_action_locked(
+                key, "APPLY_PATCH_SET", job, dispatch_id, args_hash, now,
+                input_hash=input_hash, precondition_hash=precondition_hash,
+                effect_hash=effect_hash, patch_set_json=patch_set_json,
+            )
+            self.core._store._insert_dispatch_write_intent({
+                "dispatch_id": dispatch_id,
+                "canonical_input_hash": canonical_input_hash,
+                "intent_action_id": row["id"],
+                "created_at": now,
+                "updated_at": now,
+            })
+            return (False, canonical_input_hash, row["id"], row, outcome)
+
+    def _apply_conflict_outcome(self, job, dispatch_id, d, winner_action_id):
+        """Fail closed when another controller already owns the dispatch's
+        canonical write intent with a DIFFERENT full-result hash (R13-F1).
+
+        Never applies or journals OUR own observation; reconcile the WINNER's
+        persisted intent exactly-once (its persisted input/precondition/effect/
+        patch set, never the current observation) and report the fail-closed
+        hash-mismatch outcome.  The loser's own result is rejected at the
+        decision level via the frozen-hash backoff.
+        """
+        winner_row = self.core._store.get_supervisor_action(winner_action_id)
+        if winner_row is not None:
+            self._reconcile_existing_apply(job, dispatch_id, d, winner_row)
+        return ActionOutcome(
+            "APPLY_PATCH_SET", "failed", "write_result_hash_mismatch",
+            dispatch_id=dispatch_id,
+        )
+
+    def _finish_action(self, action_id, status, error_code=None):
+        now = self._now_iso()
+        with self.core._store._transaction():
+            self.core._store._update_supervisor_action(
+                action_id, status=status, finished_at=now,
+                last_error_code=error_code, updated_at=now,
+            )
+
+    def _frontier_attempt(self, task_id, f=None):
+        """The attempt number the next dispatch at the frontier will get."""
+        f = f or self.core.workflow_frontier(task_id, self.controller_source)
+        matches = [
+            d for d in self.core._store.list_dispatches(task_id)
+            if d.cycle_no == f.cycle_no and d.position == f.position
+        ]
+        return f.cycle_no, f.position, 1 + max((d.attempt_no for d in matches), default=0)
+
+    def _latest_action(self, dispatch_id, action_type):
+        """The most recent journal row of ``action_type`` for a dispatch."""
+        rows = self.core._store.list_supervisor_actions()
+        matches = [
+            a for a in rows
+            if a["dispatch_id"] == dispatch_id and a["action_type"] == action_type
+        ]
+        if not matches:
+            return None
+        return max(matches, key=lambda a: a["created_at"])
+
+    @staticmethod
+    def _canonical_full_result_hash(result) -> str:
+        """Canonical hash of the FULL result (F1), identical to the apply-time
+        freeze (``obs.result or {}``).  A missing/falsy result hashes as the
+        empty object, exactly as ``_perform_apply_patch_set`` freezes it."""
+        return _sha256(_canonical_json(result or {}))
+
+    def _committed_apply_intents(self, dispatch_id: str) -> list:
+        """APPLY_PATCH_SET rows that committed to a write, in persistence order.
+
+        A "committed" intent is any APPLY_PATCH_SET row in a non-terminal
+        (RUNNING/UNCERTAIN) or SUCCEEDED state; FAILED/PLANNED rows are
+        rejections or exhausted retries and never committed a write.  A
+        diverged canonical intent stays UNCERTAIN (never FAILED) so it remains
+        in this set and keeps its immutable binding forever (F1).  Rows are
+        returned in ``rowid`` (insertion) order, so the FIRST element is the
+        FIRST persisted intent — the canonical binding for the dispatch.
+        """
+        rows = self.core._store.list_supervisor_actions()
+        return [
+            a for a in rows
+            if a["dispatch_id"] == dispatch_id
+            and a["action_type"] == "APPLY_PATCH_SET"
+            and a["status"] in ("RUNNING", "UNCERTAIN", "SUCCEEDED")
+        ]
+
+    def _diverged_apply_intent(self, dispatch_id: str) -> Optional[dict]:
+        """The canonical apply intent when it is in the diverged/ambiguous state.
+
+        A diverged intent (workspace hash matched neither the persisted
+        precondition nor effect after a partial broker-effect crash) is kept as
+        ``UNCERTAIN`` + ``last_error_code='workspace_diverged'`` (never FAILED)
+        so it stays in ``_committed_apply_intents`` and remains the dispatch's
+        canonical binding forever.  Returns None when no such intent exists.
+        """
+        for a in self._committed_apply_intents(dispatch_id):
+            if a["status"] == "UNCERTAIN" \
+                    and a.get("last_error_code") == "workspace_diverged":
+                return a
+        return None
+
+    def _frozen_write_result_hash(self, dispatch_id: str) -> Optional[str]:
+        """The persisted frozen write-result hash for a dispatch (F1/R7-F1).
+
+        This is the canonical FULL-result hash persisted atomically with the
+        FIRST apply intent (its ``input_hash``) — frozen BEFORE the broker is
+        ever invoked and returned regardless of the row's status
+        (RUNNING/UNCERTAIN/SUCCEEDED).  It is the single immutable binding for
+        the entire write pipeline (APPLY -> RUN_SANDBOX_TESTS ->
+        RECORD_TEST_RESULT -> CONSUME_RESULT); every downstream stage
+        re-derives and compares against it and never trusts a freshly observed
+        result.  Never None while a committed apply intent exists.
+
+        R13-F1: the canonical ``dispatch_write_intents`` table is the
+        AUTHORITATIVE source (the winner's hash regardless of the action row's
+        status); the status-filtered ``_committed_apply_intents`` view is only
+        a fallback for intent rows persisted before this fix (crash-recovery
+        fixtures that never went through the atomic claim).
+        """
+        winner = self.core._store.get_dispatch_write_intent(dispatch_id)
+        if winner is not None:
+            return winner["canonical_input_hash"]
+        intents = self._committed_apply_intents(dispatch_id)
+        if not intents:
+            return None
+        return intents[0].get("input_hash")
+
+    @staticmethod
+    def _validate_patch_set(patch_set) -> Optional[str]:
+        """Return an error reason if ``patch_set`` is malformed, else None (F2).
+
+        Every entry must be a dict carrying ONLY the write-broker fields
+        (``op``/``path``/``content``): ``op`` in ('write','delete'), a non-empty
+        string ``path``, and (for 'write') a string ``content``.  The caller has
+        already verified ``patch_set`` is a list.
+        """
+        for patch in patch_set:
+            if not isinstance(patch, dict):
+                return "invalid_patch_entry_type"
+            for key in patch:
+                if key not in ("op", "path", "content"):
+                    return "invalid_patch_key"
+            op = patch.get("op")
+            if op not in ("write", "delete"):
+                return "invalid_patch_op"
+            path = patch.get("path")
+            if not isinstance(path, str) or not path:
+                return "invalid_patch_path"
+            if op == "write":
+                content = patch.get("content")
+                if not isinstance(content, str) or not content:
+                    return "invalid_patch_content"
+        return None
+
+    # ---- concrete actions -------------------------------------------------
+
+    def _perform_start_role(self, decision, job):
+        task_id = job["task_id"]
+        f = self.core.workflow_frontier(task_id, self.controller_source)
+        role = f.expected_role
+        if role is None:
+            return ActionOutcome("START_ROLE", "skipped", "no_role")
+        cycle, pos, attempt = self._frontier_attempt(task_id, f)
+        key = (f"supervisor:{job['id']}:cycle:{cycle}:pos:{pos}:"
+               f"attempt:{attempt}:start-role")
+        args_hash = _sha256(_canonical_json({
+            "task_id": task_id, "role": role.value,
+            "source": self.controller_source,
+        }))
+        row, outcome = self._begin_action(key, "START_ROLE", job, None, args_hash)
+        if outcome == "succeeded":
+            return ActionOutcome("START_ROLE", "already_succeeded")
+        if outcome == "exhausted":
+            return ActionOutcome("START_ROLE", "exhausted")
+        if outcome == "running":
+            active = self.core._store.get_active_role_run(task_id)
+            if active is not None and active.role is role:
+                self._finish_action(row["id"], "SUCCEEDED")
+                return ActionOutcome("START_ROLE", "executed", "reconciled")
+        try:
+            self.core.start_role(task_id, role, self.controller_source,
+                                 idempotency_key=key)
+        except ArgentError as exc:
+            self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
+            return ActionOutcome("START_ROLE", "failed", f"{type(exc).__name__}")
+        self._finish_action(row["id"], "SUCCEEDED")
+        return ActionOutcome("START_ROLE", "executed")
+
+    def _perform_create_dispatch(self, decision, job):
+        task_id = job["task_id"]
+        f = self.core.workflow_frontier(task_id, self.controller_source)
+        role = f.expected_role
+        if role is None:
+            return ActionOutcome("CREATE_DISPATCH", "skipped", "no_role")
+        task_run = self.core._store.get_latest_task_run(task_id)
+        if task_run is None:
+            return ActionOutcome("CREATE_DISPATCH", "skipped", "no_task_run")
+        cycle, pos, attempt = self._frontier_attempt(task_id, f)
+        key = (f"supervisor:{job['id']}:cycle:{cycle}:pos:{pos}:"
+               f"attempt:{attempt}:create-dispatch")
+        args_hash = _sha256(_canonical_json({
+            "task_id": task_id, "task_run_id": task_run.id, "role": role.value,
+            "position": pos, "cycle_no": cycle,
+            "sequence_kind": f.sequence_kind.value, "model_choice": None,
+            "source": self.controller_source, "parent_dispatch_id": None,
+        }))
+        row, outcome = self._begin_action(key, "CREATE_DISPATCH", job, None, args_hash)
+        if outcome == "succeeded":
+            return ActionOutcome("CREATE_DISPATCH", "already_succeeded")
+        if outcome == "exhausted":
+            return ActionOutcome("CREATE_DISPATCH", "exhausted")
+        if outcome == "running":
+            af = self.store._dispatch_at_frontier(task_id, f)
+            if af is not None and af.attempt_no == attempt:
+                self._finish_action(row["id"], "SUCCEEDED")
+                return ActionOutcome("CREATE_DISPATCH", "executed", "reconciled",
+                                     dispatch_id=af.id)
+        try:
+            d = self.core.create_dispatch(
+                task_id, task_run.id, role, pos, cycle, f.sequence_kind, None,
+                self.controller_source, idempotency_key=key,
+            )
+        except ArgentError as exc:
+            self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
+            return ActionOutcome("CREATE_DISPATCH", "failed",
+                                 f"{type(exc).__name__}")
+        self._finish_action(row["id"], "SUCCEEDED")
+        return ActionOutcome("CREATE_DISPATCH", "executed", dispatch_id=d.id)
+
+    def _perform_spawn_run(self, decision, job):
+        dispatch_id = decision.dispatch_id
+        d = self.core._store.get_dispatch(dispatch_id)
+        if d is None:
+            return ActionOutcome("SPAWN_RUN", "skipped", "dispatch_missing")
+        key = f"supervisor:dispatch:{dispatch_id}:spawn"
+        args_hash = _sha256(_canonical_json({"dispatch_id": dispatch_id}))
+        row, outcome = self._begin_action(key, "SPAWN_RUN", job, dispatch_id, args_hash)
+        if outcome == "succeeded":
+            return ActionOutcome("SPAWN_RUN", "already_succeeded",
+                                 dispatch_id=dispatch_id)
+        if outcome == "exhausted":
+            # F3: an exhausted SPAWN_RUN (persisted FAILED row with
+            # attempt_count >= MAX) must surface as 'exhausted' so the generic
+            # sticky-ERROR handler in perform_next_safe_action_if_required
+            # persists the job ERROR state.  The launcher is NEVER invoked
+            # (no double-spawn).
+            return ActionOutcome("SPAWN_RUN", "exhausted",
+                                 dispatch_id=dispatch_id)
+        if outcome == "running":
+            # SPAWN_RUN is the single non-transactional external action: the
+            # launcher must never be invoked twice for the same dispatch (§8.2).
+            return ActionOutcome("SPAWN_RUN", "already_running",
+                                 dispatch_id=dispatch_id)
+        # Build the prompt message file (task contract + context).
+        try:
+            message_file = self._build_message_file(d)
+            self._launcher.spawn(
+                agent_id=AGENT_IDS[d.role], dispatch_id=dispatch_id,
+                message_file=message_file, timeout_seconds=AGENT_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
+            return ActionOutcome("SPAWN_RUN", "failed", str(exc),
+                                 dispatch_id=dispatch_id)
+        self._finish_action(row["id"], "SUCCEEDED")
+        return ActionOutcome("SPAWN_RUN", "executed", dispatch_id=dispatch_id)
+
+    def _build_message_file(self, d: AgentDispatch) -> Path:
+        """Write a minimal, privacy-safe prompt to a temp file for the agent."""
+        import tempfile
+        task = self.core._store.get_task(d.task_id)
+        prompt = (
+            "You are an agent in a deterministic, isolated development team.\n"
+            f"task_id: {d.task_id}\n"
+            f"dispatch_id: {d.id}\n"
+            f"role: {d.role.value}\n"
+            f"title: {task.title}\n"
+            f"{task.description or ''}\n"
+            "Reply with exactly one JSON object matching your role schema.\n"
+        )
+        fd, path = tempfile.mkstemp(suffix=".md", prefix="argent-supervisor-", text=True)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(prompt)
+        return Path(path)
+
+    def _perform_bind_run(self, decision, job):
+        dispatch_id = decision.dispatch_id
+        d = self.core._store.get_dispatch(dispatch_id)
+        if d is None:
+            return ActionOutcome("BIND_RUN", "skipped", "dispatch_missing")
+        obs = self._guarded_observe(self._build_lookup(d))
+        conflict = self._action_adapter_conflict("BIND_RUN", dispatch_id, obs)
+        if conflict is not None:
+            return conflict
+        if obs.status in (RunStatus.RUNNING, RunStatus.SUCCEEDED,
+                          RunStatus.FAILED, RunStatus.CANCELLED):
+            if obs.session_id is None or obs.run_id is None:
+                return ActionOutcome("BIND_RUN", "skipped", "no_binding_values")
+            key = f"supervisor:dispatch:{dispatch_id}:bind:{obs.run_id}"
+            args_hash = _sha256(_canonical_json({
+                "dispatch_id": dispatch_id,
+                "child_session_id": obs.session_id,
+                "openclaw_run_id": obs.run_id,
+                "actual_provider": obs.provider, "actual_model": obs.model,
+                "thinking_tier": obs.thinking_tier,
+                "source": self.controller_source,
+            }))
+            row, outcome = self._begin_action(
+                key, "BIND_RUN", job, dispatch_id, args_hash)
+            if outcome == "succeeded":
+                return ActionOutcome("BIND_RUN", "already_succeeded",
+                                     dispatch_id=dispatch_id)
+            if outcome == "exhausted":
+                return ActionOutcome("BIND_RUN", "exhausted",
+                                     dispatch_id=dispatch_id)
+            if outcome == "running":
+                dd = self.core._store.get_dispatch(dispatch_id)
+                if dd is not None and dd.status is DispatchStatus.RUNNING \
+                        and dd.child_session_id == obs.session_id \
+                        and dd.openclaw_run_id == obs.run_id:
+                    self._finish_action(row["id"], "SUCCEEDED")
+                    return ActionOutcome("BIND_RUN", "executed", "reconciled",
+                                         dispatch_id=dispatch_id)
+            # Bind with OBSERVED values only (A2); never the dispatch-expected
+            # values (the Core CAS is the provenance boundary).
+            try:
+                self.core.bind_spawn_result(
+                    dispatch_id, obs.session_id, obs.run_id,
+                    obs.provider, obs.model, obs.thinking_tier,
+                    self.controller_source, idempotency_key=key,
+                )
+            except ArgentError as exc:
+                self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
+                return ActionOutcome("BIND_RUN", "failed", f"{type(exc).__name__}",
+                                     dispatch_id=dispatch_id)
+            self._finish_action(row["id"], "SUCCEEDED")
+            return ActionOutcome("BIND_RUN", "executed", dispatch_id=dispatch_id)
+        return ActionOutcome("BIND_RUN", "skipped", f"status_{obs.status.value}",
+                             dispatch_id=dispatch_id)
+
+    @staticmethod
+    def _persisted_patch_set(row) -> Optional[list]:
+        """The canonical patch set persisted on an apply intent, or None."""
+        raw = row.get("patch_set_json")
+        if raw is None:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, list) else None
+
+    # ---- cross-controller apply fence (R14-F1, SPEC V2C §17) ----------------
+    #
+    # The DB (dispatch_write_intents PRIMARY KEY + the APPLY action key)
+    # guarantees a single canonical INTENT per dispatch, but it does NOT
+    # guarantee exclusive broker EXECUTION: two controllers sharing one
+    # RUNNING canonical intent can both observe workspace == precondition_hash
+    # and both fall through to ``broker.apply_patch_set`` (interleaved
+    # multi-file writes, competing rollback snapshots, competing journal
+    # completion).  This fence makes broker execution exactly-once across
+    # separate Core/SQLite connections.
+    #
+    # Lock design choice: an ``fcntl.flock`` on a per-dispatch lockfile.  For
+    # this single-host local workspace this is the most robust, deadlock-free
+    # option:
+    #   * advisory, released automatically if the holder dies (no stale-lock
+    #     cleanup, no lost-wakeup after a crash in the critical section);
+    #   * contends correctly across separate PROCESSES and across separate
+    #     THREADS of one process (each ``os.open`` yields a distinct file
+    #     description, so two threads do not share the lock);
+    #   * independent of the SQLite connection, so it does not interact with
+    #     ``BEGIN IMMEDIATE`` transactions or the thread-bound connection.
+    # A SQLite advisory-lock row was rejected: holding a ``BEGIN IMMEDIATE``
+    # transaction across the broker's file I/O would block every other DB
+    # writer (including the journal ``_finish_action`` on the same connection)
+    # and is not deadlock-free.  The lockfile lives OUTSIDE the workspace so
+    # ``WorkspaceHashProvider.scoped_hash`` (which hashes every file under the
+    # workspace) is never perturbed by lock state.
+
+    def _apply_lock_path(self, dispatch_id: str) -> Path:
+        # ``self._workspace_root`` is the FROZEN canonical spelling (resolved at
+        # ``__init__``), so two controllers naming the same physical workspace
+        # through different aliases (symlink vs real path) derive the SAME
+        # lockfile and cannot bypass the fence by path spelling.
+        root = Path(self._workspace_root)
+        return root.parent / APPLY_LOCK_DIRNAME / f"apply-{dispatch_id}.lock"
+
+    def _acquire_dispatch_lock(self, dispatch_id: str):
+        """Acquire the per-dispatch apply lock (bounded, fail-closed).
+
+        Returns an open file descriptor holding the exclusive lock, or ``None``
+        if the lock could not be acquired within the bounded timeout (the
+        caller must then fail closed: no broker invocation without the lock).
+        """
+        if self._workspace_root is None:
+            return None
+        try:
+            lock_path = self._apply_lock_path(dispatch_id)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            return None
+        deadline = time.monotonic() + APPLY_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError:
+                if time.monotonic() >= deadline:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    return None
+                time.sleep(APPLY_LOCK_POLL_SECONDS)
+
+    @staticmethod
+    def _release_dispatch_lock(fd) -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _apply_patch_set_fenced(self, job, dispatch_id, d, row):
+        """Fenced broker critical section (R14-F1, SPEC V2C §17 exactly-once).
+
+        The ONLY entry point that may invoke ``broker.apply_patch_set`` for an
+        APPLY intent.  Acquires the per-dispatch interprocess lock BEFORE the
+        workspace-hash recheck + broker invocation and releases it AFTER the
+        journal row is updated, so two controllers sharing one canonical
+        RUNNING intent can never both execute the broker.
+
+        ``row`` is the persisted APPLY_PATCH_SET row for the current claim
+        (``new``/``retry``/``running`` from ``_begin_apply_action``, or an
+        existing committed intent from ``_reconcile_existing_apply``).
+        """
+        fd = self._acquire_dispatch_lock(dispatch_id)
+        if fd is None:
+            # F2 (R15): lock-acquisition failure (open OSError or timeout) is a
+            # bounded job-level backoff -> sticky PERSISTENT_ERROR, NOT a
+            # silent ACTIVE retry with retry_count pinned at 0.  The shared
+            # canonical RUNNING intent row is left UNTOUCHED (another lock
+            # holder may still be executing it); the bounded error lives on the
+            # JOB level only.  The broker is never invoked without the lock.
+            self._apply_job_backoff(job["id"], "apply_lock_unavailable")
+            return ActionOutcome("APPLY_PATCH_SET", "failed", "lock_unavailable",
+                                 dispatch_id=dispatch_id)
+        try:
+            return self._apply_patch_set_locked(job, dispatch_id, d, row)
+        finally:
+            self._release_dispatch_lock(fd)
+
+    def _apply_patch_set_locked(self, job, dispatch_id, d, row):
+        """Critical-section body: decide exactly-once under the apply lock."""
+        # REFETCH the persisted row AFTER acquiring the lock.  A winner
+        # controller may have finished (SUCCEEDED/FAILED/UNCERTAIN) while we
+        # waited for the lock; we must never re-invoke the broker on top of
+        # the winner's execution.
+        fresh = self.core._store.get_supervisor_action(row["id"])
+        if fresh is None:
+            fresh = row
+        if fresh["status"] == "SUCCEEDED":
+            return ActionOutcome("APPLY_PATCH_SET", "already_succeeded",
+                                 dispatch_id=dispatch_id)
+        if fresh["status"] != "RUNNING":
+            # The winner already executed this claim and finished it in a
+            # non-success state (FAILED = broker errors/rollback, UNCERTAIN =
+            # divergence).  Never re-invoke from this overlap; the bounded
+            # retry / sticky-error machinery owns the next attempt.
+            if fresh["status"] == "UNCERTAIN":
+                return ActionOutcome("APPLY_PATCH_SET", "failed",
+                                     "workspace_diverged", dispatch_id=dispatch_id)
+            return ActionOutcome("APPLY_PATCH_SET", "failed",
+                                 fresh.get("last_error_code") or "broker_failed",
+                                 dispatch_id=dispatch_id)
+        if self._workspace_root is None:
+            return ActionOutcome("APPLY_PATCH_SET", "skipped", "no_workspace_root",
+                                 dispatch_id=dispatch_id)
+        if self._workspace_state is None:
+            self._workspace_state = WorkspaceHashProvider()
+        current = self._workspace_state.scoped_hash(self._workspace_root)
+        if fresh["effect_hash"] is not None and current == fresh["effect_hash"]:
+            # The winner already applied before we acquired the lock.
+            self._finish_action(fresh["id"], "SUCCEEDED")
+            return ActionOutcome("APPLY_PATCH_SET", "executed", "reconciled",
+                                 dispatch_id=dispatch_id)
+        if fresh["precondition_hash"] is not None \
+                and current == fresh["precondition_hash"]:
+            return self._invoke_broker_locked(job, dispatch_id, d, fresh)
+        # Neither the persisted precondition nor the persisted effect matches:
+        # the workspace diverged (e.g. a hard kill DURING a multi-file broker
+        # loop left a partial write).  Keep the canonical intent in a bounded
+        # ambiguity state (UNCERTAIN + error code) so it stays in
+        # ``_committed_apply_intents`` and remains the dispatch's immutable
+        # binding FOREVER (never FAILED — a second result-keyed intent must
+        # not be minted while this canonical intent exists).
+        self._finish_action(fresh["id"], "UNCERTAIN", "workspace_diverged")
+        return ActionOutcome("APPLY_PATCH_SET", "failed", "workspace_diverged",
+                             dispatch_id=dispatch_id)
+
+    def _invoke_broker_locked(self, job, dispatch_id, d, row):
+        """Invoke the broker for a persisted APPLY intent exactly once (locked).
+
+        Re-derives the patch set from the PERSISTED ``patch_set_json`` (never
+        from a possibly-changed observation), verifies the persisted args_hash,
+        then applies all-or-nothing and reconciles the effect hash.
+        """
+        patch_set = self._persisted_patch_set(row)
+        if patch_set is None:
+            # F1: the intent committed (persisted precondition/effect) but its
+            # persisted patch set is missing — divergence/ambiguity, NOT a
+            # pre-commit rejection.  Keep the row UNCERTAIN so it stays in
+            # ``_committed_apply_intents`` and remains the canonical binding.
+            self._finish_action(row["id"], "UNCERTAIN", "workspace_diverged")
+            return ActionOutcome("APPLY_PATCH_SET", "failed", "workspace_diverged",
+                                 dispatch_id=dispatch_id)
+        recomputed = _sha256(_canonical_json(
+            {"dispatch_id": dispatch_id, "patch_set": patch_set,
+             "workspace_root": self._workspace_root}))
+        if recomputed != row["args_hash"]:
+            # F1 (R15): the persisted intent's workspace identity (or its
+            # patch-set/dispatch arguments) disagrees with the local canonical
+            # workspace.  Fail CLOSED: never invoke the broker, never mark the
+            # canonical intent FAILED (which would drop it from
+            # ``_committed_apply_intents`` and allow a second result-keyed
+            # intent to be minted).  The bounded error lives on the JOB level.
+            self._apply_job_backoff(job["id"], "workspace_identity_mismatch")
+            return ActionOutcome("APPLY_PATCH_SET", "failed",
+                                 "workspace_identity_mismatch",
+                                 dispatch_id=dispatch_id)
+        broker = self._broker_factory()
+        res = broker.apply_patch_set(
+            self._workspace_root, patch_set, d.role, self.controller_source)
+        if res.errors:
+            self._finish_action(row["id"], "FAILED", f"broker:{len(res.errors)}")
+            return ActionOutcome("APPLY_PATCH_SET", "failed",
+                                 f"broker_errors:{len(res.errors)}",
+                                 dispatch_id=dispatch_id)
+        current = self._workspace_state.scoped_hash(self._workspace_root)
+        if current != row["effect_hash"]:
+            # F1: the broker was invoked and the workspace no longer equals the
+            # persisted effect — divergence AFTER broker invocation, never a
+            # plain rejection that drops the canonical binding.
+            self._finish_action(row["id"], "UNCERTAIN", "workspace_diverged")
+            return ActionOutcome("APPLY_PATCH_SET", "failed", "workspace_diverged",
+                                 dispatch_id=dispatch_id)
+        self._finish_action(row["id"], "SUCCEEDED")
+        return ActionOutcome("APPLY_PATCH_SET", "executed", "reconciled",
+                             dispatch_id=dispatch_id)
+
+    def _reconcile_existing_apply(self, job, dispatch_id, d, existing):
+        """Reconcile an existing broker-bound apply intent exactly-once (R7-F1).
+
+        A committed intent (persisted precondition/effect hashes) already exists
+        for this dispatch.  Reconcile it from the PERSISTED hashes and PERSISTED
+        patch set — never re-derive the patch set from the current observation
+        (which may describe a DIFFERENT result after a crash) and never mint a
+        second intent.
+        """
+        if existing["status"] == "SUCCEEDED":
+            return ActionOutcome("APPLY_PATCH_SET", "already_succeeded",
+                                 dispatch_id=dispatch_id)
+        # F1: a diverged canonical intent is sticky.  The workspace hash
+        # already matched neither the persisted precondition nor effect (a
+        # partial broker-effect crash).  NEVER re-examine the workspace,
+        # re-apply, mark FAILED (which would drop it from
+        # ``_committed_apply_intents`` and let a second result-keyed intent be
+        # minted), or advance the dispatch.  The decision table routes it to a
+        # bounded sticky PERSISTENT_ERROR.
+        if existing["status"] == "UNCERTAIN" \
+                and existing.get("last_error_code") == "workspace_diverged":
+            return ActionOutcome("APPLY_PATCH_SET", "failed",
+                                 "workspace_diverged", dispatch_id=dispatch_id)
+        # A no-op intent (empty patch set) persisted no precondition/effect
+        # hashes: recover it SUCCEEDED exactly-once (nothing to apply).
+        if existing["precondition_hash"] is None \
+                and existing["effect_hash"] is None:
+            self._finish_action(existing["id"], "SUCCEEDED")
+            return ActionOutcome("APPLY_PATCH_SET", "executed", "noop",
+                                 dispatch_id=dispatch_id)
+        if self._workspace_root is None:
+            return ActionOutcome("APPLY_PATCH_SET", "skipped", "no_workspace_root",
+                                 dispatch_id=dispatch_id)
+        # R14-F1: the workspace-hash recheck + broker invocation run inside the
+        # single cross-controller fenced critical section (exactly-once).
+        return self._apply_patch_set_fenced(job, dispatch_id, d, existing)
+
+    def _perform_apply_patch_set(self, decision, job):
+        dispatch_id = decision.dispatch_id
+        d = self.core._store.get_dispatch(dispatch_id)
+        if d is None:
+            return ActionOutcome("APPLY_PATCH_SET", "skipped", "dispatch_missing")
+        obs = self._guarded_observe(self._build_lookup(d))
+        conflict = self._action_adapter_conflict("APPLY_PATCH_SET", dispatch_id, obs)
+        if conflict is not None:
+            return conflict
+
+        # R7-F1 / F1: enforce one-broker-intent-per-dispatch.  If ANY committed
+        # apply intent exists (RUNNING/UNCERTAIN/SUCCEEDED — including a
+        # diverged UNCERTAIN row), reconcile it exactly-once BEFORE any
+        # observation-derived action.  A new observation B must NEVER mint a
+        # second result-keyed APPLY intent while the canonical A intent exists.
+        committed = self._committed_apply_intents(dispatch_id)
+        if committed:
+            return self._reconcile_existing_apply(
+                job, dispatch_id, d, committed[0])
+
+        result = obs.result or {}
+
+        # F1: recompute the canonical result hash locally and use it for every
+        # apply key and input_hash.  An adapter-supplied hash that disagrees
+        # with the canonical hash is rejected fail-closed (never trust it).
+        canonical_result_hash = _sha256(_canonical_json(result))
+        if obs.result_hash is not None and obs.result_hash != canonical_result_hash:
+            return self._fail_apply(job, dispatch_id, canonical_result_hash,
+                                    "result_hash_mismatch")
+        result_hash = canonical_result_hash
+
+        # F1: validate the complete write-result schema (envelope + the role's
+        # legitimate patch extension).  Only the role's patch extension is
+        # separated; any other field (e.g. the forbidden 'encoded') stays in
+        # the envelope and is rejected by validate_role_output (never silently
+        # stripped) BEFORE any broker action.
+        envelope = _write_envelope(d.role, result)
+        try:
+            outputs.validate_role_output(d.role, envelope)
+        except ArgentError as exc:
+            return self._fail_apply(job, dispatch_id, result_hash,
+                                    f"invalid_envelope:{type(exc).__name__}")
+        if envelope.get("task_id") != d.task_id:
+            return self._fail_apply(job, dispatch_id, result_hash, "task_mismatch")
+        if envelope.get("dispatch_id") != d.id:
+            return self._fail_apply(job, dispatch_id, result_hash, "dispatch_mismatch")
+
+        # F2: distinguish field ABSENCE from PRESENCE.  A PRESENT but non-list
+        # patch field (including falsy scalars/objects) is malformed and must
+        # fail-closed (never a silent no-op).  Only a legit empty list is a
+        # valid no-op.  Each entry is then structurally validated BEFORE any
+        # broker action or no-op journaling.
+        patch_field = "patch_set" if d.role is Role.IMPLEMENTER else "test_patch_set"
+        if patch_field in result:
+            raw_patch_set = result[patch_field]
+            if not isinstance(raw_patch_set, list):
+                return self._fail_apply(job, dispatch_id, result_hash,
+                                        "invalid_patch_set_type")
+            patch_error = self._validate_patch_set(raw_patch_set)
+            if patch_error is not None:
+                return self._fail_apply(job, dispatch_id, result_hash, patch_error)
+            patch_set = raw_patch_set
+        else:
+            patch_set = []
+
+        if not patch_set:
+            # Nothing to apply: the precondition is trivially satisfied.
+            key = f"supervisor:dispatch:{dispatch_id}:apply:{result_hash}"
+            (conflict, _winner_hash, winner_action_id,
+             row, outcome) = self._begin_apply_action(
+                key, job, dispatch_id, result_hash, _sha256("empty"),
+                input_hash=result_hash)
+            if conflict:
+                return self._apply_conflict_outcome(
+                    job, dispatch_id, d, winner_action_id)
+            if outcome in ("new", "retry", "running"):
+                self._finish_action(row["id"], "SUCCEEDED")
+            return ActionOutcome("APPLY_PATCH_SET", "executed", "noop",
+                                 dispatch_id=dispatch_id)
+
+        if self._workspace_root is None:
+            return ActionOutcome("APPLY_PATCH_SET", "skipped", "no_workspace_root",
+                                 dispatch_id=dispatch_id)
+        if self._workspace_state is None:
+            self._workspace_state = WorkspaceHashProvider()
+
+        # F2 §8.3: persist the expected before-hash and the deterministic
+        # after-hash BEFORE applying, so a crash between the broker mutation
+        # and the journal-success can be reconciled exactly-once.
+        precondition_hash = self._workspace_state.scoped_hash(self._workspace_root)
+        effect_hash = self._workspace_state.predicted_hash(
+            self._workspace_root, patch_set)
+        key = f"supervisor:dispatch:{dispatch_id}:apply:{result_hash}"
+        # F1 (R15): bind the canonical workspace identity into the apply
+        # intent's args_hash, so the persisted intent records WHICH canonical
+        # workspace it applies to.  A controller whose frozen workspace root
+        # disagrees with the persisted one fails closed at invoke time (never
+        # invokes the broker; the bounded error lives on the JOB level).
+        args_hash = _sha256(_canonical_json(
+            {"dispatch_id": dispatch_id, "patch_set": patch_set,
+             "workspace_root": self._workspace_root}))
+        (conflict, _winner_hash, winner_action_id,
+         row, outcome) = self._begin_apply_action(
+            key, job, dispatch_id, result_hash, args_hash,
+            input_hash=result_hash, precondition_hash=precondition_hash,
+            effect_hash=effect_hash, patch_set_json=_canonical_json(patch_set))
+        if conflict:
+            return self._apply_conflict_outcome(
+                job, dispatch_id, d, winner_action_id)
+        if outcome == "succeeded":
+            return ActionOutcome("APPLY_PATCH_SET", "already_succeeded",
+                                 dispatch_id=dispatch_id)
+        if outcome == "exhausted":
+            return ActionOutcome("APPLY_PATCH_SET", "exhausted",
+                                 dispatch_id=dispatch_id)
+        # R14-F1: every broker invocation (new/retry/running) runs inside the
+        # single cross-controller fenced critical section, re-decided from the
+        # PERSISTED row under the interprocess lock (exactly-once).
+        return self._apply_patch_set_fenced(job, dispatch_id, d, row)
+
+    def _fail_apply(self, job, dispatch_id, result_hash, reason):
+        """Journal an APPLY_PATCH_SET rejection (bounded, never applies)."""
+        key = f"supervisor:dispatch:{dispatch_id}:apply:{result_hash}"
+        row, outcome = self._begin_action(
+            key, "APPLY_PATCH_SET", job, dispatch_id,
+            _sha256(_canonical_json({"invalid": reason})), input_hash=result_hash)
+        if outcome not in ("succeeded", "exhausted"):
+            self._finish_action(row["id"], "FAILED", reason)
+        return ActionOutcome("APPLY_PATCH_SET", "failed", reason,
+                             dispatch_id=dispatch_id)
+
+    def _perform_run_sandbox_tests(self, decision, job):
+        dispatch_id = decision.dispatch_id
+        if self._workspace_root is None or self._run_tests_fn is None:
+            return ActionOutcome("RUN_SANDBOX_TESTS", "skipped", "no_test_runner")
+        frozen = self._frozen_write_result_hash(dispatch_id)
+        if frozen is None:
+            return ActionOutcome("RUN_SANDBOX_TESTS", "skipped",
+                                 "no_frozen_result_hash")
+        d = self.core._store.get_dispatch(dispatch_id)
+        if d is None:
+            return ActionOutcome("RUN_SANDBOX_TESTS", "skipped", "dispatch_missing")
+        # F1: verify the CURRENT observation still describes the frozen result
+        # before invoking the sandbox (never test a workspace against a foreign
+        # result).
+        obs = self._guarded_observe(self._build_lookup(d))
+        conflict = self._action_adapter_conflict("RUN_SANDBOX_TESTS", dispatch_id, obs)
+        if conflict is not None:
+            return conflict
+        if self._canonical_full_result_hash(obs.result) != frozen:
+            return ActionOutcome("RUN_SANDBOX_TESTS", "skipped",
+                                 "result_hash_mismatch")
+        key = f"supervisor:dispatch:{dispatch_id}:tests:{frozen}"
+        args_hash = _sha256(_canonical_json(
+            {"workspace": str(self._workspace_root), "result_hash": frozen}))
+        row, outcome = self._begin_action(
+            key, "RUN_SANDBOX_TESTS", job, dispatch_id, args_hash)
+        if outcome == "succeeded":
+            return ActionOutcome("RUN_SANDBOX_TESTS", "already_succeeded")
+        if outcome == "exhausted":
+            return ActionOutcome("RUN_SANDBOX_TESTS", "exhausted")
+        # RUNNING: the bwrap run is read-only; re-running it is safe and
+        # bounded by MAX_ACTION_RETRIES via the journal retry budget.
+        res = self._run_tests_fn(self._workspace_root)
+        self._finish_action(
+            row["id"],
+            "SUCCEEDED" if res.exit_code == 0 else "FAILED",
+            None if res.exit_code == 0 else f"exit_code_{res.exit_code}",
+        )
+        return ActionOutcome("RUN_SANDBOX_TESTS", "executed",
+                             dispatch_id=dispatch_id)
+
+    def _perform_record_test_result(self, decision, job):
+        dispatch_id = decision.dispatch_id
+        d = self.core._store.get_dispatch(dispatch_id)
+        if d is None:
+            return ActionOutcome("RECORD_TEST_RESULT", "skipped", "dispatch_missing")
+        frozen = self._frozen_write_result_hash(dispatch_id)
+        if frozen is None:
+            return ActionOutcome("RECORD_TEST_RESULT", "skipped",
+                                 "no_frozen_result_hash")
+        # F1: verify the CURRENT observation still describes the frozen result
+        # before recording the test outcome.
+        obs = self._guarded_observe(self._build_lookup(d))
+        conflict = self._action_adapter_conflict("RECORD_TEST_RESULT", dispatch_id, obs)
+        if conflict is not None:
+            return conflict
+        if self._canonical_full_result_hash(obs.result) != frozen:
+            return ActionOutcome("RECORD_TEST_RESULT", "skipped",
+                                 "result_hash_mismatch")
+        key = f"supervisor:dispatch:{dispatch_id}:record-test:{frozen}"
+        passed = self._action_succeeded(dispatch_id, "RUN_SANDBOX_TESTS")
+        result = "passed" if passed else "failed"
+        role_source = f"role:{d.role.value}"
+        args_hash = _sha256(_canonical_json({
+            "task_id": d.task_id, "result": result, "source": role_source,
+            "result_hash": frozen}))
+        row, outcome = self._begin_action(
+            key, "RECORD_TEST_RESULT", job, dispatch_id, args_hash)
+        if outcome == "succeeded":
+            return ActionOutcome("RECORD_TEST_RESULT", "already_succeeded")
+        if outcome == "exhausted":
+            return ActionOutcome("RECORD_TEST_RESULT", "exhausted")
+        if outcome == "running":
+            # Reconcile from the persisted test_run row via Core idempotency.
+            if self.core._store.get_command_idempotency(key, "record_test_run") is not None:
+                self._finish_action(row["id"], "SUCCEEDED")
+                return ActionOutcome("RECORD_TEST_RESULT", "executed", "reconciled")
+        try:
+            self.core.record_test_run(
+                d.task_id, result, role_source, detail="supervisor sandbox run",
+                idempotency_key=key,
+            )
+        except ArgentError as exc:
+            self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
+            return ActionOutcome("RECORD_TEST_RESULT", "failed",
+                                 f"{type(exc).__name__}")
+        self._finish_action(row["id"], "SUCCEEDED")
+        return ActionOutcome("RECORD_TEST_RESULT", "executed",
+                             dispatch_id=dispatch_id)
+
+    def _perform_consume_result(self, decision, job):
+        dispatch_id = decision.dispatch_id
+        d = self.core._store.get_dispatch(dispatch_id)
+        if d is None:
+            return ActionOutcome("CONSUME_RESULT", "skipped", "dispatch_missing")
+        obs = self._guarded_observe(self._build_lookup(d))
+        conflict = self._action_adapter_conflict("CONSUME_RESULT", dispatch_id, obs)
+        if conflict is not None:
+            return conflict
+        if obs.status is not RunStatus.SUCCEEDED:
+            return ActionOutcome("CONSUME_RESULT", "skipped",
+                                 f"status_{obs.status.value}")
+        result = obs.result or {}
+        envelope = _write_envelope(d.role, result)
+        # Validate envelope (fail-closed) before consume.
+        try:
+            outputs.validate_role_output(d.role, envelope)
+        except ArgentError as exc:
+            return self._fail_consume(job, dispatch_id, envelope,
+                                      f"invalid_envelope:{type(exc).__name__}")
+        run_id = obs.run_id or d.openclaw_run_id
+        # F1: bind the consume idempotency key to the FULL result hash (not the
+        # stripped envelope); for write roles the observation must still equal
+        # the persisted frozen hash before consuming.
+        full_hash = _sha256(_canonical_json(result))
+        if _is_write_role(d.role):
+            frozen = self._frozen_write_result_hash(dispatch_id)
+            if frozen is None:
+                return ActionOutcome("CONSUME_RESULT", "skipped",
+                                     "no_frozen_result_hash")
+            if full_hash != frozen:
+                return ActionOutcome("CONSUME_RESULT", "skipped",
+                                     "result_hash_mismatch")
+            canonical = _canonical_json(result)  # FULL result (incl. patch ext)
+        else:
+            canonical = _canonical_json(envelope)
+        key = f"supervisor:consume:{dispatch_id}:{run_id}:{_sha256(canonical)}"
+        row, outcome = self._begin_action(
+            key, "CONSUME_RESULT", job, dispatch_id, _sha256(canonical))
+        if outcome == "succeeded":
+            return ActionOutcome("CONSUME_RESULT", "already_succeeded")
+        if outcome == "exhausted":
+            return ActionOutcome("CONSUME_RESULT", "exhausted")
+        if outcome == "running":
+            # Reconcile from dispatch status: a CONSUMED dispatch means the
+            # consume already happened (crash between CAS and journal-success).
+            dd = self.core._store.get_dispatch(dispatch_id)
+            if dd is not None and dd.status is DispatchStatus.CONSUMED:
+                self._finish_action(row["id"], "SUCCEEDED")
+                return ActionOutcome("CONSUME_RESULT", "executed", "reconciled",
+                                     dispatch_id=dispatch_id)
+        event_meta = {
+            "task_id": d.task_id,
+            "child_session_id": d.child_session_id,
+            "run_id": d.openclaw_run_id,
+            "parent_dispatch_id": d.parent_dispatch_id,
+            "event_type": "agent.completed",
+            "status": "completed",
+        }
+        try:
+            res = self.core.receive_agent_result(
+                dispatch_id, event_meta, envelope, self.controller_source,
+                idempotency_key=key,
+            )
+        except ArgentError as exc:
+            self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
+            return ActionOutcome("CONSUME_RESULT", "failed",
+                                 f"{type(exc).__name__}", dispatch_id=dispatch_id)
+        # exactly-once: "duplicate" is a success (already consumed).  Any
+        # rejection (wrong provenance, malformed envelope the pre-check
+        # missed, task/run mismatch) must FAIL the action so the bounded
+        # retry policy applies - never a silent infinite re-plan.
+        if res.status in ("consumed", "duplicate"):
+            self._finish_action(row["id"], "SUCCEEDED")
+            return ActionOutcome("CONSUME_RESULT", "executed",
+                                 detail=res.status, dispatch_id=dispatch_id)
+        self._finish_action(row["id"], "FAILED", f"consume_{res.status}")
+        return ActionOutcome("CONSUME_RESULT", "failed",
+                             f"consume_{res.status}", dispatch_id=dispatch_id)
+
+    def _fail_consume(self, job, dispatch_id, envelope, reason):
+        """Journal a malformed-envelope consume rejection (bounded retries)."""
+        try:
+            canonical = _canonical_json(envelope)
+        except Exception:
+            canonical = "{}"
+        d = self.core._store.get_dispatch(dispatch_id)
+        run_id = d.openclaw_run_id if d is not None else "unknown"
+        key = f"supervisor:consume:{dispatch_id}:{run_id}:{_sha256(canonical)}"
+        row, outcome = self._begin_action(
+            key, "CONSUME_RESULT", job, dispatch_id, _sha256(canonical))
+        if outcome not in ("succeeded", "exhausted"):
+            self._finish_action(row["id"], "FAILED", reason)
+        return ActionOutcome("CONSUME_RESULT", "failed", reason,
+                             dispatch_id=dispatch_id)
+
+    def _perform_mark_run_failed(self, decision, job):
+        dispatch_id = decision.dispatch_id
+        d = self.core._store.get_dispatch(dispatch_id)
+        if d is None:
+            return ActionOutcome("MARK_RUN_FAILED", "skipped", "dispatch_missing")
+        run_id = d.openclaw_run_id or "unknown"
+        key = f"supervisor:dispatch:{dispatch_id}:fail:{run_id}"
+        args_hash = _sha256(_canonical_json({
+            "dispatch_id": dispatch_id, "reason": "run_failed",
+            "source": self.controller_source}))
+        row, outcome = self._begin_action(
+            key, "MARK_RUN_FAILED", job, dispatch_id, args_hash)
+        if outcome == "succeeded":
+            return ActionOutcome("MARK_RUN_FAILED", "already_succeeded",
+                                 dispatch_id=dispatch_id)
+        if outcome == "exhausted":
+            return ActionOutcome("MARK_RUN_FAILED", "exhausted",
+                                 dispatch_id=dispatch_id)
+        if outcome == "running":
+            dd = self.core._store.get_dispatch(dispatch_id)
+            if dd is not None and dd.status is DispatchStatus.FAILED:
+                self._finish_action(row["id"], "SUCCEEDED")
+                return ActionOutcome("MARK_RUN_FAILED", "executed", "reconciled",
+                                     dispatch_id=dispatch_id)
+        try:
+            self.core.mark_agent_failed(dispatch_id, "run_failed",
+                                        self.controller_source,
+                                        idempotency_key=key)
+        except ArgentError as exc:
+            self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
+            return ActionOutcome("MARK_RUN_FAILED", "failed",
+                                 f"{type(exc).__name__}", dispatch_id=dispatch_id)
+        self._finish_action(row["id"], "SUCCEEDED")
+        return ActionOutcome("MARK_RUN_FAILED", "executed",
+                             dispatch_id=dispatch_id)
+
+    def _perform_core_recover(self, decision, job):
+        key = f"supervisor:{job['id']}:core-recover"
+        args_hash = _sha256(_canonical_json({"source": self.owner_source}))
+        row, outcome = self._begin_action(key, "CORE_RECOVER", job, None, args_hash)
+        if outcome == "succeeded":
+            return ActionOutcome("CORE_RECOVER", "already_succeeded")
+        if outcome == "exhausted":
+            return ActionOutcome("CORE_RECOVER", "exhausted")
+        # RUNNING: Core.recover is idempotent via its own idempotency key.
+        try:
+            self.core.recover(self.owner_source, idempotency_key=key)
+        except ArgentError as exc:
+            self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
+            return ActionOutcome("CORE_RECOVER", "failed", f"{type(exc).__name__}")
+        self._finish_action(row["id"], "SUCCEEDED")
+        return ActionOutcome("CORE_RECOVER", "executed")
+
+    def _perform_present_owner_gate(self, decision, job):
+        gate, _n = self.store._current_gate(job["task_id"])
+        gate_id = gate.id if gate is not None else None
+        key = f"supervisor:{job['id']}:present-gate:{gate_id}"
+        args_hash = _sha256(_canonical_json({"gate_id": gate_id}))
+        row, outcome = self._begin_action(
+            key, "PRESENT_OWNER_GATE", job, None, args_hash)
+        if outcome == "succeeded":
+            return ActionOutcome("PRESENT_OWNER_GATE", "already_succeeded")
+        if outcome == "exhausted":
+            return ActionOutcome("PRESENT_OWNER_GATE", "exhausted")
+        if outcome == "running":
+            cur = self.core._store.get_supervisor_job(job["id"])
+            if cur is not None and cur.get("owner_prompted_at") is not None \
+                    and cur.get("owner_prompted_gate_id") == gate_id:
+                self._finish_action(row["id"], "SUCCEEDED")
+                return ActionOutcome("PRESENT_OWNER_GATE", "executed", "reconciled")
+        with self.core._store._transaction():
+            self.core._store._update_supervisor_job(
+                job["id"],
+                owner_prompted_at=self._now_iso(),
+                owner_prompted_gate_id=gate_id,
+                updated_at=self._now_iso(),
+            )
+        self._finish_action(row["id"], "SUCCEEDED")
+        return ActionOutcome("PRESENT_OWNER_GATE", "executed")
+
+    def _perform_close_done(self, decision, job):
+        return self._close_job(job, "DONE")
+
+    def _perform_close_failed(self, decision, job):
+        return self._close_job(job, "FAILED")
+
+    def _perform_close_blocked(self, decision, job):
+        return self._close_job(job, "BLOCKED")
+
+    def _close_job(self, job, terminal):
+        # F2: the CLOSE_JOB journal effect and the terminal persistence happen
+        # in ONE transaction so a terminal job can never exist without its
+        # journaled CLOSE_JOB row (and vice versa).  CLOSE_JOB is journaled
+        # exactly once (unique action_key).
+        key = f"supervisor:{job['id']}:close:{terminal}"
+        args_hash = _sha256(_canonical_json({"terminal": terminal}))
+        now = self._now_iso()
+        with self.core._store._transaction():
+            cur = self.core._store.get_supervisor_job(job["id"])
+            if cur is None:
+                return ActionOutcome("CLOSE_JOB", "skipped", "job_missing")
+            existing = self.core._store.get_supervisor_action_by_key(key)
+            if existing is not None:
+                if existing["args_hash"] != args_hash:
+                    raise IdempotencyError(
+                        f"action key {key!r} reused with different args_hash"
+                    )
+                action_id = existing["id"]
+                if existing["status"] != "SUCCEEDED":
+                    self.core._store._update_supervisor_action(
+                        action_id, status="SUCCEEDED", finished_at=now,
+                        last_error_code=None, updated_at=now,
+                    )
+            else:
+                action_id = _sha256(key)[:32]
+                self.core._store._insert_supervisor_action({
+                    "id": action_id, "supervisor_job_id": job["id"],
+                    "dispatch_id": None, "action_type": "CLOSE_JOB",
+                    "action_key": key, "args_hash": args_hash,
+                    "input_hash": None, "precondition_hash": None,
+                    "effect_hash": None, "status": "SUCCEEDED",
+                    "attempt_count": 1, "next_attempt_at": None,
+                    "started_at": now, "finished_at": now,
+                    "last_error_code": None, "created_at": now,
+                    "updated_at": now,
+                })
+            if cur["terminal"] != terminal:
+                self.core._store._update_supervisor_job(
+                    job["id"], terminal=terminal,
+                    status=SupervisorJobStatus.TERMINAL.value,
+                    next_action=ReconcileAction.NONE.value,
+                    next_wake_at=None, updated_at=now,
+                    facts_version=cur["facts_version"] + 1,
+                )
+        return ActionOutcome("CLOSE_JOB", "executed", detail=terminal)
+
+    def _perform_persistent_error(self, decision, job):
+        with self.core._store._transaction():
+            self.core._store._update_supervisor_job(
+                job["id"], status=SupervisorJobStatus.ERROR.value,
+                last_error_code=decision.reason, updated_at=self._now_iso(),
+                next_action=ReconcileAction.NONE.value,
+            )
+        return ActionOutcome("PERSISTENT_ERROR", "executed", detail=decision.reason)
+
+
+# ---------------------------------------------------------------------------
+# SupervisorLoop + Waiter (SPEC V2C §9)
+# ---------------------------------------------------------------------------
+
+class Waiter:
+    """Interruptible sleep-based waiter (default)."""
+
+    def __init__(self, clock: Optional[Callable[[], datetime]] = None):
+        self._clock = clock or utcnow
+
+    def wait_until(self, wake_at: Optional[str], stop_event=None) -> bool:
+        if stop_event is not None and stop_event.is_set():
+            return True
+        if not wake_at:
+            return False
+        try:
+            target = _parse_iso(wake_at)
+        except (ValueError, TypeError):
+            return False
+        now = self._clock().timestamp()
+        delay = target - now
+        if delay <= 0:
+            return False
+        if stop_event is not None:
+            stop_event.wait(delay)
+        else:
+            import time
+            time.sleep(delay)
+        return True
+
+
+class SupervisorLoop:
+    """Local, restart-proof loop (no background installation in Phase 2C)."""
+
+    def __init__(
+        self, supervisor: Supervisor, waiter: Optional[Waiter] = None,
+        stop_event=None,
+    ):
+        self.supervisor = supervisor
+        self.waiter = waiter or Waiter(clock=supervisor._clock)
+        self._stop_event = stop_event
+
+    def run_once(self, job_id: str) -> ReconcileDecision:
+        # F3: loop-level containment — a structural adapter exception escaping
+        # reconcile()/perform_next_safe_action_if_required() must never kill
+        # the loop.  Convert it to a structured decision and let the existing
+        # backoff/sticky-error machinery handle it.  Core/DB/ArgentError are
+        # NOT caught here.
+        try:
+            decision = self.supervisor.reconcile(job_id)
+        except (TypeError, AttributeError, ValueError, KeyError) as exc:
+            return self.supervisor.adapter_exception_decision(
+                job_id, type(exc).__name__)
+        try:
+            self.supervisor.perform_next_safe_action_if_required(decision)
+        except (TypeError, AttributeError, ValueError, KeyError) as exc:
+            return self.supervisor.adapter_exception_decision(
+                job_id, type(exc).__name__)
+        return decision
+
+    def run_until_terminal(self, job_id: str, stop_event=None) -> Optional[SupervisorState]:
+        stop_event = stop_event or self._stop_event
+        while True:
+            state = self.supervisor.store.get_job(job_id)
+            if state is None:
+                return None
+            if state.terminal is not None:
+                return state
+            if stop_event is not None and stop_event.is_set():
+                return state
+            decision = self.run_once(job_id)
+            state = self.supervisor.store.get_job(job_id)
+            if state is None or state.terminal is not None:
+                return state
+            if stop_event is not None and stop_event.is_set():
+                return state
+            self.waiter.wait_until(state.next_wake_at, stop_event)

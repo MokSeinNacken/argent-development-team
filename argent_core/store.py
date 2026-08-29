@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Optional
 
 from . import events as events_mod
+from .gates import binding_hash
 from .models import (
     ActionExecution,
     ActionExecutionStatus,
@@ -54,7 +55,7 @@ from .models import (
     TestRun,
 )
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 _TASK_STATES = "', '".join(s.value for s in TaskState)
 _TASK_RUN_STATUSES = "', '".join(s.value for s in TaskRunStatus)
@@ -192,7 +193,12 @@ _SCHEMA: tuple[str, ...] = (
         decided_at     TEXT,
         consumed_at    TEXT,
         expires_at     TEXT NOT NULL,
-        idempotency_key TEXT UNIQUE
+        idempotency_key TEXT UNIQUE,
+        binding_hash   TEXT NOT NULL,
+        approved_at    TEXT,
+        execution_id   TEXT,
+        executed_at    TEXT,
+        closed_at      TEXT
     )
     """,
     """
@@ -299,6 +305,95 @@ _SCHEMA: tuple[str, ...] = (
         created_at         TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS supervisor_jobs (
+        id                    TEXT PRIMARY KEY,
+        task_id               TEXT NOT NULL
+                              REFERENCES tasks(id) ON DELETE CASCADE,
+        status                TEXT NOT NULL CHECK (status IN
+                              ('ACTIVE','WAITING_RUN','WAITING_GATE','BACKOFF',
+                               'RECOVERING','ERROR','TERMINAL')),
+        workflow_state        TEXT NOT NULL,
+        expected_role         TEXT,
+        expected_dispatch_id  TEXT REFERENCES agent_dispatches(id),
+        agent_id              TEXT,
+        session_id            TEXT,
+        run_id                TEXT,
+        attempt_no            INTEGER NOT NULL DEFAULT 0 CHECK (attempt_no >= 0),
+        dispatch_status       TEXT,
+        result_status         TEXT NOT NULL DEFAULT 'NOT_OBSERVED' CHECK (result_status IN
+                              ('NOT_OBSERVED','NOT_FOUND','RUNNING','SUCCEEDED',
+                               'FAILED','CANCELLED','UNKNOWN','CONFLICT')),
+        result_consumed       INTEGER NOT NULL DEFAULT 0 CHECK (result_consumed IN (0,1)),
+        current_handoff_id    TEXT,
+        open_findings_count   INTEGER NOT NULL DEFAULT 0 CHECK (open_findings_count >= 0),
+        rework_cycle          INTEGER NOT NULL DEFAULT 1 CHECK (rework_cycle >= 1),
+        recovery_state        TEXT NOT NULL DEFAULT 'NONE',
+        owner_gate_id         TEXT REFERENCES owner_approvals(id),
+        gate_status           TEXT,
+        gate_scope            TEXT,
+        gate_closed           INTEGER NOT NULL DEFAULT 0 CHECK (gate_closed IN (0,1)),
+        owner_prompted_at     TEXT,
+        owner_prompted_gate_id TEXT,
+        next_action           TEXT NOT NULL DEFAULT 'NONE',
+        next_wake_at          TEXT,
+        retry_count           INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+        missing_confirmations INTEGER NOT NULL DEFAULT 0 CHECK (missing_confirmations >= 0),
+        last_error_code       TEXT,
+        last_progress_at      TEXT NOT NULL,
+        terminal              TEXT CHECK (terminal IS NULL OR terminal IN
+                              ('DONE','FAILED','BLOCKED')),
+        facts_version         INTEGER NOT NULL DEFAULT 0 CHECK (facts_version >= 0),
+        created_at            TEXT NOT NULL,
+        updated_at            TEXT NOT NULL,
+        CHECK ((terminal IS NULL) OR (status = 'TERMINAL' AND next_action = 'NONE'))
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_supervisor_jobs_active_task
+        ON supervisor_jobs(task_id) WHERE terminal IS NULL
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS supervisor_actions (
+        id                 TEXT PRIMARY KEY,
+        supervisor_job_id  TEXT NOT NULL REFERENCES supervisor_jobs(id) ON DELETE CASCADE,
+        dispatch_id        TEXT REFERENCES agent_dispatches(id),
+        action_type        TEXT NOT NULL CHECK (action_type IN
+                           ('START_ROLE','CREATE_DISPATCH','SPAWN_RUN','BIND_RUN',
+                            'APPLY_PATCH_SET','RUN_SANDBOX_TESTS','RECORD_TEST_RESULT',
+                            'CONSUME_RESULT','MARK_RUN_FAILED','CORE_RECOVER',
+                            'PRESENT_OWNER_GATE','CLOSE_JOB')),
+        action_key         TEXT NOT NULL UNIQUE,
+        args_hash          TEXT NOT NULL,
+        input_hash         TEXT,
+        precondition_hash  TEXT,
+        effect_hash        TEXT,
+        patch_set_json     TEXT,
+        status             TEXT NOT NULL CHECK (status IN
+                           ('PLANNED','RUNNING','SUCCEEDED','FAILED','UNCERTAIN')),
+        attempt_count      INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        next_attempt_at    TEXT,
+        started_at         TEXT,
+        finished_at        TEXT,
+        last_error_code    TEXT,
+        created_at         TEXT NOT NULL,
+        updated_at         TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_supervisor_one_spawn_per_dispatch
+        ON supervisor_actions(dispatch_id, action_type)
+        WHERE action_type = 'SPAWN_RUN'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS dispatch_write_intents (
+        dispatch_id          TEXT PRIMARY KEY REFERENCES agent_dispatches(id),
+        canonical_input_hash TEXT NOT NULL,
+        intent_action_id     TEXT NOT NULL,
+        created_at           TEXT NOT NULL,
+        updated_at           TEXT NOT NULL
+    )
+    """,
 )
 
 
@@ -386,7 +481,110 @@ class Store:
                 "ALTER TABLE agent_dispatches ADD COLUMN "
                 "expected_thinking_tier TEXT NOT NULL DEFAULT 'medium'"
             )
-        # UPSERT the schema version to 3 after successful DDL.
+
+        # --- V4: owner-gate closure/binding fields (SPEC V2C §4.3) ---------
+        # Additive columns only.  SQLite cannot reliably add a NOT NULL column
+        # via ALTER, so the fresh CREATE TABLE carries ``binding_hash TEXT NOT
+        # NULL`` and a migrated V3 table is backfilled + guarded by triggers.
+        acols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(owner_approvals)")
+        }
+        for col, ddl in (
+            ("binding_hash", "ALTER TABLE owner_approvals ADD COLUMN binding_hash TEXT"),
+            ("approved_at", "ALTER TABLE owner_approvals ADD COLUMN approved_at TEXT"),
+            ("execution_id", "ALTER TABLE owner_approvals ADD COLUMN execution_id TEXT"),
+            ("executed_at", "ALTER TABLE owner_approvals ADD COLUMN executed_at TEXT"),
+            ("closed_at", "ALTER TABLE owner_approvals ADD COLUMN closed_at TEXT"),
+        ):
+            if col not in acols:
+                self._conn.execute(ddl)
+
+        # Deterministic closure backfill (§4.3).  A consumed approval without
+        # exactly one execution row, or with several, fails the whole migration
+        # (no guessed closure).
+        arows = self._conn.execute(
+            "SELECT id, task_id, action, scope, status, decided_at, "
+            "consumed_at, expires_at FROM owner_approvals"
+        ).fetchall()
+        for r in arows:
+            bh = binding_hash(r["task_id"], r["action"], r["scope"])
+            status = r["status"]
+            approved_at = r["decided_at"] if status in ("approved", "consumed") else None
+            closed_at = None
+            execution_id = None
+            executed_at = None
+            if status == "rejected":
+                closed_at = r["decided_at"]
+            elif status == "expired":
+                closed_at = r["expires_at"]
+            elif status == "consumed":
+                exrows = self._conn.execute(
+                    "SELECT id, created_at FROM action_executions "
+                    "WHERE approval_id = ? ORDER BY rowid",
+                    (r["id"],),
+                ).fetchall()
+                if len(exrows) != 1:
+                    raise sqlite3.IntegrityError(
+                        f"V4 migration fail-closed: consumed approval {r['id']!r} "
+                        f"has {len(exrows)} execution row(s) (expected exactly 1)"
+                    )
+                execution_id = exrows[0]["id"]
+                executed_at = exrows[0]["created_at"]
+                closed_at = r["consumed_at"]
+            self._conn.execute(
+                "UPDATE owner_approvals SET binding_hash = ?, approved_at = ?, "
+                "execution_id = ?, executed_at = ?, closed_at = ? WHERE id = ?",
+                (bh, approved_at, execution_id, executed_at, closed_at, r["id"]),
+            )
+
+        # Enforce a non-null binding_hash for future rows on a migrated V3 table
+        # (the fresh CREATE TABLE already has NOT NULL).
+        self._conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_owner_approvals_binding_hash_insert "
+            "BEFORE INSERT ON owner_approvals "
+            "WHEN NEW.binding_hash IS NULL "
+            "BEGIN SELECT RAISE(ABORT, 'binding_hash must not be null'); END"
+        )
+        self._conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_owner_approvals_binding_hash_update "
+            "BEFORE UPDATE ON owner_approvals "
+            "WHEN NEW.binding_hash IS NULL "
+            "BEGIN SELECT RAISE(ABORT, 'binding_hash must not be null'); END"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_owner_approvals_execution_id "
+            "ON owner_approvals(execution_id) WHERE execution_id IS NOT NULL"
+        )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_action_execution_one_per_approval "
+            "ON action_executions(approval_id) WHERE approval_id IS NOT NULL"
+        )
+
+        # F5 (SPEC V2C §10): gate-scoped owner-prompt memory (additive).
+        # Fresh V4 tables carry the column in CREATE TABLE; an already-created
+        # supervisor_jobs table (earlier build) gains it idempotently here.
+        sjcols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(supervisor_jobs)")
+        }
+        if "owner_prompted_gate_id" not in sjcols:
+            self._conn.execute(
+                "ALTER TABLE supervisor_jobs ADD COLUMN "
+                "owner_prompted_gate_id TEXT"
+            )
+
+        # R7-F1 (SPEC V2C §17): persist the canonical patch-set JSON on each
+        # APPLY intent so a crash before journal-success can re-apply the
+        # SAME patch set exactly-once (never re-derived from a later, changed
+        # observation).  Additive column only.
+        sact_cols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(supervisor_actions)")
+        }
+        if "patch_set_json" not in sact_cols:
+            self._conn.execute(
+                "ALTER TABLE supervisor_actions ADD COLUMN patch_set_json TEXT"
+            )
+
+        # UPSERT the schema version after successful DDL + migration.
         self._conn.execute(
             "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -944,11 +1142,13 @@ class Store:
     # -- owner_approvals -----------------------------------------------------
 
     def _insert_approval(self, a: OwnerApproval) -> None:
+        bh = binding_hash(a.task_id, a.action, a.scope)
         self._conn.execute(
             "INSERT INTO owner_approvals (id, task_id, action, scope, status, "
             "requested_by, source_class, created_at, decided_at, consumed_at, "
-            "expires_at, idempotency_key) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "expires_at, idempotency_key, binding_hash, approved_at, "
+            "execution_id, executed_at, closed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 a.id,
                 a.task_id,
@@ -962,6 +1162,11 @@ class Store:
                 a.consumed_at,
                 a.expires_at,
                 None,
+                bh,
+                a.approved_at,
+                a.execution_id,
+                a.executed_at,
+                a.closed_at,
             ),
         )
 
@@ -984,6 +1189,7 @@ class Store:
 
     @staticmethod
     def _row_to_approval(row: sqlite3.Row) -> OwnerApproval:
+        keys = row.keys()
         return OwnerApproval(
             id=row["id"],
             task_id=row["task_id"],
@@ -996,23 +1202,30 @@ class Store:
             decided_at=row["decided_at"],
             consumed_at=row["consumed_at"],
             expires_at=row["expires_at"],
+            binding_hash=row["binding_hash"] if "binding_hash" in keys else None,
+            approved_at=row["approved_at"] if "approved_at" in keys else None,
+            execution_id=row["execution_id"] if "execution_id" in keys else None,
+            executed_at=row["executed_at"] if "executed_at" in keys else None,
+            closed_at=row["closed_at"] if "closed_at" in keys else None,
         )
 
     # Atomic approval transitions (return rowcount for single-use enforcement).
 
     def _mark_approved(self, approval_id: str, now_iso: str) -> int:
         cur = self._conn.execute(
-            "UPDATE owner_approvals SET status = 'approved', decided_at = ? "
+            "UPDATE owner_approvals SET status = 'approved', decided_at = ?, "
+            "approved_at = ? "
             "WHERE id = ? AND status = 'pending' AND expires_at > ?",
-            (now_iso, approval_id, now_iso),
+            (now_iso, now_iso, approval_id, now_iso),
         )
         return cur.rowcount
 
     def _mark_rejected(self, approval_id: str, now_iso: str) -> int:
         cur = self._conn.execute(
-            "UPDATE owner_approvals SET status = 'rejected', decided_at = ? "
+            "UPDATE owner_approvals SET status = 'rejected', decided_at = ?, "
+            "closed_at = ? "
             "WHERE id = ? AND status = 'pending'",
-            (now_iso, approval_id),
+            (now_iso, now_iso, approval_id),
         )
         return cur.rowcount
 
@@ -1026,12 +1239,24 @@ class Store:
         )
         return cur.rowcount
 
+    def _consume_approval_with_execution(
+        self, approval_id: str, now_iso: str, execution_id: str
+    ) -> int:
+        """Consume an approval AND bind its execution row atomically (V4)."""
+        cur = self._conn.execute(
+            "UPDATE owner_approvals SET status = 'consumed', consumed_at = ?, "
+            "execution_id = ?, executed_at = ?, closed_at = ? "
+            "WHERE id = ? AND status = 'approved' AND expires_at > ?",
+            (now_iso, execution_id, now_iso, now_iso, approval_id, now_iso),
+        )
+        return cur.rowcount
+
     def _mark_expired(self, approval_id: str, now_iso: str) -> int:
         # Covers both 'pending' and 'approved' (SPEC V1.2 12.3): an expired
         # 'approved' approval must also transition to 'expired' so the unique
-        # index no longer blocks a fresh request.
+        # index no longer blocks a fresh request.  V4: closed_at = expires_at.
         cur = self._conn.execute(
-            "UPDATE owner_approvals SET status = 'expired' "
+            "UPDATE owner_approvals SET status = 'expired', closed_at = expires_at "
             "WHERE id = ? AND status IN ('pending', 'approved') "
             "AND expires_at <= ?",
             (approval_id, now_iso),
@@ -1441,6 +1666,168 @@ class Store:
             )
             for r in rows
         ]
+
+    # -- supervisor jobs (V4, SPEC V2C §4.1) --------------------------------
+    # The supervisor subsystem lives in ``argent_core/supervisor.py``; these
+    # methods are the only persistence surface it uses.  Rows are returned as
+    # plain dicts (never the raw connection), and every mutator is private.
+
+    _SUPERVISOR_JOB_COLUMNS: frozenset[str] = frozenset(
+        {
+            "id", "task_id", "status", "workflow_state", "expected_role",
+            "expected_dispatch_id", "agent_id", "session_id", "run_id",
+            "attempt_no", "dispatch_status", "result_status", "result_consumed",
+            "current_handoff_id", "open_findings_count", "rework_cycle",
+            "recovery_state", "owner_gate_id", "gate_status", "gate_scope",
+            "gate_closed", "owner_prompted_at", "owner_prompted_gate_id",
+            "next_action", "next_wake_at",
+            "retry_count", "missing_confirmations", "last_error_code",
+            "last_progress_at", "terminal", "facts_version", "created_at",
+            "updated_at",
+        }
+    )
+
+    _SUPERVISOR_ACTION_COLUMNS: frozenset[str] = frozenset(
+        {
+            "id", "supervisor_job_id", "dispatch_id", "action_type", "action_key",
+            "args_hash", "input_hash", "precondition_hash", "effect_hash",
+            "patch_set_json",
+            "status", "attempt_count", "next_attempt_at", "started_at",
+            "finished_at", "last_error_code", "created_at", "updated_at",
+        }
+    )
+
+    def get_supervisor_job(self, job_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_supervisor_job_for_task(self, task_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM supervisor_jobs WHERE task_id = ? "
+            "AND terminal IS NULL ORDER BY rowid DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_supervisor_jobs(self, nonterminal_only: bool = False) -> list[dict]:
+        q = "SELECT * FROM supervisor_jobs"
+        if nonterminal_only:
+            q += " WHERE terminal IS NULL"
+        q += " ORDER BY rowid"
+        rows = self._conn.execute(q).fetchall()
+        return [dict(r) for r in rows]
+
+    def _insert_supervisor_job(self, row: dict) -> None:
+        missing = [c for c in self._SUPERVISOR_JOB_COLUMNS if c not in row]
+        if missing:
+            raise ValueError(f"missing supervisor_jobs columns: {missing}")
+        cols = sorted(row.keys())
+        ph = ", ".join("?" for _ in cols)
+        self._conn.execute(
+            f"INSERT INTO supervisor_jobs ({', '.join(cols)}) VALUES ({ph})",
+            tuple(row[c] for c in cols),
+        )
+
+    def _update_supervisor_job(self, job_id: str, **fields) -> int:
+        unknown = set(fields) - (self._SUPERVISOR_JOB_COLUMNS - {"id", "created_at"})
+        if unknown:
+            raise ValueError(f"unknown supervisor_jobs columns: {sorted(unknown)}")
+        if not fields:
+            return 0
+        assignments = ", ".join(f"{c} = ?" for c in fields)
+        cur = self._conn.execute(
+            f"UPDATE supervisor_jobs SET {assignments} WHERE id = ?",
+            list(fields.values()) + [job_id],
+        )
+        return cur.rowcount
+
+    def get_supervisor_action(self, action_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM supervisor_actions WHERE id = ?", (action_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_supervisor_action_by_key(self, action_key: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM supervisor_actions WHERE action_key = ?", (action_key,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_supervisor_actions(self, job_id: Optional[str] = None) -> list[dict]:
+        q = "SELECT * FROM supervisor_actions"
+        params: list = []
+        if job_id is not None:
+            q += " WHERE supervisor_job_id = ?"
+            params.append(job_id)
+        q += " ORDER BY rowid"
+        rows = self._conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def _insert_supervisor_action(self, row: dict) -> None:
+        row = dict(row)
+        # ``patch_set_json`` is a newly added nullable column; existing callers
+        # (and older persisted rows) may omit it, so default it here.
+        if "patch_set_json" not in row:
+            row["patch_set_json"] = None
+        missing = [c for c in self._SUPERVISOR_ACTION_COLUMNS if c not in row]
+        if missing:
+            raise ValueError(f"missing supervisor_actions columns: {missing}")
+        cols = sorted(row.keys())
+        ph = ", ".join("?" for _ in cols)
+        self._conn.execute(
+            f"INSERT INTO supervisor_actions ({', '.join(cols)}) VALUES ({ph})",
+            tuple(row[c] for c in cols),
+        )
+
+    def _update_supervisor_action(self, action_id: str, **fields) -> int:
+        unknown = set(fields) - (self._SUPERVISOR_ACTION_COLUMNS - {"id"})
+        if unknown:
+            raise ValueError(f"unknown supervisor_actions columns: {sorted(unknown)}")
+        if not fields:
+            return 0
+        assignments = ", ".join(f"{c} = ?" for c in fields)
+        cur = self._conn.execute(
+            f"UPDATE supervisor_actions SET {assignments} WHERE id = ?",
+            list(fields.values()) + [action_id],
+        )
+        return cur.rowcount
+
+    # -- canonical write intents (V4, SPEC V2C §17 R13) ---------------------
+    # The DB-enforced single-canonical-APPLY-intent-per-dispatch binding.  A
+    # row is inserted exactly once per dispatch (in the SAME transaction as
+    # the APPLY journal row it binds) and is immutable thereafter.
+
+    _DISPATCH_WRITE_INTENT_COLUMNS: frozenset[str] = frozenset(
+        {
+            "dispatch_id", "canonical_input_hash", "intent_action_id",
+            "created_at", "updated_at",
+        }
+    )
+
+    def get_dispatch_write_intent(self, dispatch_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM dispatch_write_intents WHERE dispatch_id = ?",
+            (dispatch_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _insert_dispatch_write_intent(self, row: dict) -> None:
+        missing = [
+            c for c in self._DISPATCH_WRITE_INTENT_COLUMNS if c not in row
+        ]
+        if missing:
+            raise ValueError(f"missing dispatch_write_intents columns: {missing}")
+        self._conn.execute(
+            "INSERT INTO dispatch_write_intents "
+            "(dispatch_id, canonical_input_hash, intent_action_id, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                row["dispatch_id"], row["canonical_input_hash"],
+                row["intent_action_id"], row["created_at"], row["updated_at"],
+            ),
+        )
 
 
 class Queries:
