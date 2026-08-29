@@ -33,8 +33,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
-from . import outputs, workflow
+from . import notifications, outputs, workflow
 from .core import ReceiveResult
+from .notifications import NotificationStatus, NotificationType
 from .models import (
     AgentDispatch,
     ApprovalStatus,
@@ -1607,6 +1608,14 @@ class Supervisor:
             ):
                 fields["last_progress_at"] = self._now_iso()
             self.core._store._update_supervisor_job(job_id, **fields)
+            # SPEC V3A §7: enqueue notifications for transitions that first
+            # set a sticky ERROR or a WAITING_GATE, in the SAME transaction
+            # as the authoritative status change (dedup-guarded, no-op for
+            # non-first transitions).
+            if plan.action is ReconcileAction.PERSISTENT_ERROR:
+                self._enqueue_persistent_error_notification(current_job)
+            elif plan.action is ReconcileAction.PRESENT_OWNER_GATE:
+                self._enqueue_waiting_gate_notification(current_job, fresh.gate)
             new_version = current_job["facts_version"] + 1
         return ReconcileDecision(
             job_id=job_id,
@@ -2101,6 +2110,107 @@ class Supervisor:
                 dispatch_id, "rejected", reason=f"completion_hint:{type(exc).__name__}"
             )
 
+    # --------------------------------------------------- notifications
+    # (SPEC V3A §7, Amendments 2/3) Dedup-guarded, atomic
+    # ``notification_outbox`` enqueue.  The helper NEVER changes
+    # job/dispatch/action/gate status and is never an authority; it only
+    # projects an already-authoritative transition into the outbox.  It MUST
+    # be called inside the caller's ``BEGIN IMMEDIATE`` transaction.  A
+    # ``dedup_key`` UNIQUE conflict is a silent no-op (no exception).
+
+    def _task_state_value(self, task_id: str) -> Optional[str]:
+        task = self.core._store.get_task(task_id)
+        return task.state.value if task is not None else None
+
+    def _task_has_rejected_gate(self, task_id: str) -> bool:
+        for a in self.core._store.list_approvals(task_id):
+            if a.status is ApprovalStatus.REJECTED:
+                return True
+        return False
+
+    def _enqueue_notification(
+        self, job, *, notification_type, reason_code, event_ref,
+        event_version=1, gate_id=None, binding_hash=None,
+    ) -> bool:
+        """Single dedup-guarded outbox INSERT (Amendment 3)."""
+        ntype = (
+            notification_type
+            if isinstance(notification_type, NotificationType)
+            else NotificationType(notification_type)
+        )
+        if ntype is NotificationType.OWNER_APPROVAL_REQUIRED:
+            dedup_key = notifications.gate_dedup_key(
+                job["id"], gate_id, binding_hash, event_version)
+        else:
+            dedup_key = notifications.normal_dedup_key(
+                job["id"], ntype, event_ref, event_version)
+        now = self._now_iso()
+        scope = notifications.scope_ref(binding_hash) if binding_hash else None
+        payload = notifications.build_payload(
+            notification_type=ntype.value, supervisor_job_id=job["id"],
+            task_id=job["task_id"], event_ref=event_ref, event_at=now,
+            reason_code=reason_code, gate_id=gate_id, scope_ref=scope,
+        )
+        payload_hash = notifications.payload_hash(payload)
+        row = {
+            "id": notifications.outbox_id(dedup_key),
+            "supervisor_job_id": job["id"],
+            "task_id": job["task_id"],
+            "dispatch_id": None,
+            "gate_id": gate_id,
+            "notification_type": ntype.value,
+            "event_ref": event_ref,
+            "event_version": event_version,
+            "dedup_key": dedup_key,
+            "payload_json": notifications.canonical_payload_json(payload),
+            "payload_hash": payload_hash,
+            "status": NotificationStatus.PENDING.value,
+            "attempt_count": 0,
+            "next_attempt_at": None,
+            "claimed_at": None,
+            "claim_token": None,
+            "last_attempt_at": None,
+            "sent_at": None,
+            "last_error_code": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        return self.core._store._insert_notification(row)
+
+    def _enqueue_close_notification(self, job, terminal: str, reason: str) -> bool:
+        """Project a CLOSE_JOB transition (DONE/FAILED/BLOCKED) into the
+        outbox, deriving the outgoing code from the internal reason + the
+        same-transaction ``tasks.state`` / ``owner_approvals`` facts
+        (Amendments 2b/2c)."""
+        task_state = self._task_state_value(job["task_id"])
+        gate_rejected = self._task_has_rejected_gate(job["task_id"])
+        outcome = notifications.resolve_close_outcome(
+            terminal, reason, task_state=task_state, gate_rejected=gate_rejected)
+        if outcome is None:
+            return False
+        ntype, code = outcome
+        return self._enqueue_notification(
+            job, notification_type=ntype, reason_code=code,
+            event_ref=notifications.event_ref_close(job["id"], terminal),
+        )
+
+    def _enqueue_persistent_error_notification(self, job) -> bool:
+        ntype, code = notifications.persistent_error_outcome()
+        return self._enqueue_notification(
+            job, notification_type=ntype, reason_code=code,
+            event_ref=notifications.event_ref_persistent_error(job["id"]),
+        )
+
+    def _enqueue_waiting_gate_notification(self, job, gate) -> bool:
+        ntype, code = notifications.waiting_gate_outcome()
+        gate_id = gate.id if gate is not None else None
+        bh = gate.binding_hash if gate is not None else None
+        return self._enqueue_notification(
+            job, notification_type=ntype, reason_code=code,
+            event_ref=notifications.event_ref_gate(job["id"], gate_id),
+            gate_id=gate_id, binding_hash=bh,
+        )
+
     # --------------------------------------------------- action execution
 
     def perform_next_safe_action_if_required(
@@ -2177,6 +2287,9 @@ class Supervisor:
                 updated_at=self._now_iso(),
                 facts_version=cur["facts_version"] + 1,
             )
+            # SPEC V3A Amendment 3: first transition to sticky ERROR -> one
+            # PERSISTENT_ERROR notification (dedup-guarded).
+            self._enqueue_persistent_error_notification(cur)
 
     def adapter_exception_decision(
         self, job_id: str, type_name: str
@@ -2209,6 +2322,7 @@ class Supervisor:
                     updated_at=self._now_iso(),
                     facts_version=job["facts_version"] + 1,
                 )
+                self._enqueue_persistent_error_notification(job)
                 return ReconcileDecision(
                     job_id=job_id, facts_version=job["facts_version"] + 1,
                     action=ReconcileAction.PERSISTENT_ERROR, reason=error_code,
@@ -2260,6 +2374,7 @@ class Supervisor:
                     updated_at=self._now_iso(),
                     facts_version=job["facts_version"] + 1,
                 )
+                self._enqueue_persistent_error_notification(job)
                 return
             wake = _iso(now + timedelta(seconds=backoff_seconds(retry)))
             self.core._store._update_supervisor_job(
@@ -3369,15 +3484,15 @@ class Supervisor:
         return ActionOutcome("PRESENT_OWNER_GATE", "executed")
 
     def _perform_close_done(self, decision, job):
-        return self._close_job(job, "DONE")
+        return self._close_job(job, "DONE", reason=decision.reason)
 
     def _perform_close_failed(self, decision, job):
-        return self._close_job(job, "FAILED")
+        return self._close_job(job, "FAILED", reason=decision.reason)
 
     def _perform_close_blocked(self, decision, job):
-        return self._close_job(job, "BLOCKED")
+        return self._close_job(job, "BLOCKED", reason=decision.reason)
 
-    def _close_job(self, job, terminal):
+    def _close_job(self, job, terminal, reason=None):
         # F2: the CLOSE_JOB journal effect and the terminal persistence happen
         # in ONE transaction so a terminal job can never exist without its
         # journaled CLOSE_JOB row (and vice versa).  CLOSE_JOB is journaled
@@ -3422,6 +3537,9 @@ class Supervisor:
                     next_wake_at=None, updated_at=now,
                     facts_version=cur["facts_version"] + 1,
                 )
+                # SPEC V3A §7: first-time terminal transition -> one outbox
+                # row (dedup-guarded) in the SAME transaction.
+                self._enqueue_close_notification(job, terminal, reason or "")
         return ActionOutcome("CLOSE_JOB", "executed", detail=terminal)
 
     def _perform_persistent_error(self, decision, job):
@@ -3470,11 +3588,24 @@ class SupervisorLoop:
 
     def __init__(
         self, supervisor: Supervisor, waiter: Optional[Waiter] = None,
-        stop_event=None,
+        stop_event=None, notification_delivery=None,
     ):
         self.supervisor = supervisor
         self.waiter = waiter or Waiter(clock=supervisor._clock)
         self._stop_event = stop_event
+        # Optional non-blocking delivery kick target (SPEC V3A §3.5).  None
+        # (default) makes kick a no-op so existing callers are unaffected.
+        self._notification_delivery = notification_delivery
+
+    def _kick_delivery(self) -> None:
+        # Amendment 4: the kick is internally catch-all and must never
+        # propagate a notification exception into the loop.
+        if self._notification_delivery is None:
+            return
+        try:
+            self._notification_delivery.kick()
+        except BaseException:  # noqa: BLE001 - never escape into the loop
+            pass
 
     def run_once(self, job_id: str) -> ReconcileDecision:
         # F3: loop-level containment — a structural adapter exception escaping
@@ -3485,13 +3616,17 @@ class SupervisorLoop:
         try:
             decision = self.supervisor.reconcile(job_id)
         except (TypeError, AttributeError, ValueError, KeyError) as exc:
-            return self.supervisor.adapter_exception_decision(
+            decision = self.supervisor.adapter_exception_decision(
                 job_id, type(exc).__name__)
-        try:
-            self.supervisor.perform_next_safe_action_if_required(decision)
-        except (TypeError, AttributeError, ValueError, KeyError) as exc:
-            return self.supervisor.adapter_exception_decision(
-                job_id, type(exc).__name__)
+        else:
+            try:
+                self.supervisor.perform_next_safe_action_if_required(decision)
+            except (TypeError, AttributeError, ValueError, KeyError) as exc:
+                decision = self.supervisor.adapter_exception_decision(
+                    job_id, type(exc).__name__)
+        # SPEC V3A §3.5 + Amendment 4: kick OUTSIDE both exception handlers,
+        # O(1), never blocking, never propagating.
+        self._kick_delivery()
         return decision
 
     def run_until_terminal(self, job_id: str, stop_event=None) -> Optional[SupervisorState]:
@@ -3499,15 +3634,30 @@ class SupervisorLoop:
         while True:
             state = self.supervisor.store.get_job(job_id)
             if state is None:
+                self._kick_delivery()
                 return None
             if state.terminal is not None:
+                self._kick_delivery()
+                return state
+            # F2: a sticky ERROR job must return immediately after one final
+            # delivery kick (SPEC V3A Amendment 4) — never re-enter run_once
+            # for the same sticky ERROR state (which would tight-loop kicking
+            # short-lived delivery workers on a next_wake_at of None).
+            if state.status == SupervisorJobStatus.ERROR.value:
+                self._kick_delivery()
                 return state
             if stop_event is not None and stop_event.is_set():
+                self._kick_delivery()
                 return state
             decision = self.run_once(job_id)
             state = self.supervisor.store.get_job(job_id)
             if state is None or state.terminal is not None:
+                self._kick_delivery()
+                return state
+            if state.status == SupervisorJobStatus.ERROR.value:
+                self._kick_delivery()
                 return state
             if stop_event is not None and stop_event.is_set():
+                self._kick_delivery()
                 return state
             self.waiter.wait_until(state.next_wake_at, stop_event)

@@ -55,7 +55,7 @@ from .models import (
     TestRun,
 )
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 _TASK_STATES = "', '".join(s.value for s in TaskState)
 _TASK_RUN_STATUSES = "', '".join(s.value for s in TaskRunStatus)
@@ -393,6 +393,59 @@ _SCHEMA: tuple[str, ...] = (
         created_at           TEXT NOT NULL,
         updated_at           TEXT NOT NULL
     )
+    """,
+    # V5 (SPEC V3A §4.2): the persistent, outbound-only notification outbox.
+    # A projection of already-authoritative events; never a state machine and
+    # never an authority for task/dispatch/gate/recovery/terminal.  No secret
+    # columns (no credential, target, URL, header, response body or inbound
+    # content).  Raw transport responses are never persisted.
+    """
+    CREATE TABLE IF NOT EXISTS notification_outbox (
+        id                    TEXT PRIMARY KEY,
+        supervisor_job_id     TEXT NOT NULL
+                              REFERENCES supervisor_jobs(id) ON DELETE CASCADE,
+        task_id               TEXT NOT NULL
+                              REFERENCES tasks(id) ON DELETE CASCADE,
+        dispatch_id           TEXT
+                              REFERENCES agent_dispatches(id) ON DELETE SET NULL,
+        gate_id               TEXT
+                              REFERENCES owner_approvals(id) ON DELETE SET NULL,
+        notification_type     TEXT NOT NULL CHECK (notification_type IN
+                              ('DONE','FAILED','BLOCKED',
+                               'OWNER_APPROVAL_REQUIRED')),
+        event_ref             TEXT NOT NULL,
+        event_version         INTEGER NOT NULL DEFAULT 1 CHECK (event_version >= 1),
+        dedup_key             TEXT NOT NULL,
+        payload_json          TEXT NOT NULL,
+        payload_hash          TEXT NOT NULL CHECK (length(payload_hash) = 64),
+        status                TEXT NOT NULL DEFAULT 'PENDING' CHECK (status IN
+                              ('PENDING','SENDING','SENT','FAILED','DISCARDED')),
+        attempt_count         INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        next_attempt_at       TEXT,
+        claimed_at            TEXT,
+        claim_token           TEXT,
+        last_attempt_at       TEXT,
+        sent_at               TEXT,
+        last_error_code       TEXT,
+        created_at            TEXT NOT NULL,
+        updated_at            TEXT NOT NULL,
+        CHECK ((status = 'SENDING' AND claim_token IS NOT NULL
+                AND claimed_at IS NOT NULL)
+            OR (status <> 'SENDING' AND claim_token IS NULL)),
+        CHECK (status <> 'SENT' OR sent_at IS NOT NULL)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_outbox_dedup
+        ON notification_outbox(dedup_key)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_notification_outbox_due
+        ON notification_outbox(status, next_attempt_at, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_notification_outbox_job
+        ON notification_outbox(supervisor_job_id, created_at)
     """,
 )
 
@@ -1828,6 +1881,154 @@ class Store:
                 row["intent_action_id"], row["created_at"], row["updated_at"],
             ),
         )
+
+    # -- notification outbox (V5, SPEC V3A §4) -----------------------------
+    # The only persistence surface the notification subsystem uses.  Rows are
+    # plain dicts (never the raw connection); every mutator is private and all
+    # queries read/write ONLY ``notification_outbox``.
+
+    _NOTIFICATION_OUTBOX_COLUMNS: frozenset[str] = frozenset(
+        {
+            "id", "supervisor_job_id", "task_id", "dispatch_id", "gate_id",
+            "notification_type", "event_ref", "event_version", "dedup_key",
+            "payload_json", "payload_hash", "status", "attempt_count",
+            "next_attempt_at", "claimed_at", "claim_token", "last_attempt_at",
+            "sent_at", "last_error_code", "created_at", "updated_at",
+        }
+    )
+
+    def get_notification(self, notification_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM notification_outbox WHERE id = ?", (notification_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_notifications(self, job_id: Optional[str] = None) -> list[dict]:
+        q = "SELECT * FROM notification_outbox"
+        params: list = []
+        if job_id is not None:
+            q += " WHERE supervisor_job_id = ?"
+            params.append(job_id)
+        q += " ORDER BY created_at, rowid"
+        rows = self._conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def _insert_notification(self, row: dict) -> bool:
+        """Insert a notification row idempotently on ``dedup_key`` (SPEC V3A
+        Amendment 3).
+
+        Returns True if a row was inserted, False on a ``dedup_key`` UNIQUE
+        conflict (silent no-op).  Any OTHER constraint violation (CHECK / FK /
+        NOT NULL) still raises.  Must be called inside the caller's
+        transaction (the authoritative transition's ``BEGIN IMMEDIATE``).
+        """
+        missing = [c for c in self._NOTIFICATION_OUTBOX_COLUMNS if c not in row]
+        if missing:
+            raise ValueError(f"missing notification_outbox columns: {missing}")
+        cur = self._conn.execute(
+            "INSERT INTO notification_outbox (id, supervisor_job_id, task_id, "
+            "dispatch_id, gate_id, notification_type, event_ref, event_version, "
+            "dedup_key, payload_json, payload_hash, status, attempt_count, "
+            "next_attempt_at, claimed_at, claim_token, last_attempt_at, "
+            "sent_at, last_error_code, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+            "?, ?, ?) "
+            "ON CONFLICT(dedup_key) DO NOTHING",
+            (
+                row["id"], row["supervisor_job_id"], row["task_id"],
+                row["dispatch_id"], row["gate_id"], row["notification_type"],
+                row["event_ref"], row["event_version"], row["dedup_key"],
+                row["payload_json"], row["payload_hash"], row["status"],
+                row["attempt_count"], row["next_attempt_at"], row["claimed_at"],
+                row["claim_token"], row["last_attempt_at"], row["sent_at"],
+                row["last_error_code"], row["created_at"], row["updated_at"],
+            ),
+        )
+        return cur.rowcount == 1
+
+    def _select_due_notification(
+        self, now_iso: str, lease_seconds: int
+    ) -> Optional[dict]:
+        """The oldest due row: PENDING, retryable FAILED with
+        ``next_attempt_at <= now``, or lease-expired SENDING with
+        ``claimed_at + lease <= now`` (SPEC V3A §9.2).  Returns None when
+        nothing is due."""
+        cutoff = _format_dt(self._clock() - timedelta(seconds=lease_seconds))
+        row = self._conn.execute(
+            "SELECT * FROM notification_outbox "
+            "WHERE status = 'PENDING' "
+            "   OR (status = 'FAILED' AND next_attempt_at IS NOT NULL "
+            "       AND next_attempt_at <= ?) "
+            "   OR (status = 'SENDING' AND claimed_at IS NOT NULL "
+            "       AND claimed_at <= ?) "
+            "ORDER BY created_at, rowid LIMIT 1",
+            (now_iso, cutoff),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _claim_notification(
+        self, notification_id: str, claim_token: str, now_iso: str,
+        lease_seconds: int,
+    ) -> bool:
+        """Atomically claim the oldest due row under ``BEGIN IMMEDIATE``
+        (SPEC V3A §9.2): status SENDING, a fresh claim_token, time fields and
+        ``attempt_count += 1``.  Returns True iff this caller performed the
+        claim for ``notification_id``."""
+        with self._transaction():
+            row = self._select_due_notification(now_iso, lease_seconds)
+            if row is None or row["id"] != notification_id:
+                return False
+            cur = self._conn.execute(
+                "UPDATE notification_outbox SET status = 'SENDING', "
+                "claim_token = ?, claimed_at = ?, last_attempt_at = ?, "
+                "attempt_count = attempt_count + 1, next_attempt_at = NULL, "
+                "updated_at = ? "
+                "WHERE id = ? AND status IN ('PENDING', 'FAILED', 'SENDING')",
+                (claim_token, now_iso, now_iso, now_iso, notification_id),
+            )
+            return cur.rowcount == 1
+
+    def _complete_notification_sent(
+        self, notification_id: str, claim_token: str, now_iso: str,
+    ) -> bool:
+        """Completion CAS (SPEC V3A §9.3): SENDING -> SENT, sent_at=now, and
+        clear the claim/attempt fields.  Returns True iff this claim won."""
+        cur = self._conn.execute(
+            "UPDATE notification_outbox SET status = 'SENT', sent_at = ?, "
+            "claim_token = NULL, claimed_at = NULL, next_attempt_at = NULL, "
+            "last_error_code = NULL, last_attempt_at = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'SENDING' AND claim_token = ?",
+            (now_iso, now_iso, now_iso, notification_id, claim_token),
+        )
+        return cur.rowcount == 1
+
+    def _mark_notification_failed(
+        self, notification_id: str, claim_token: str, now_iso: str, *,
+        next_attempt_at: str, error_code: str,
+    ) -> bool:
+        """CAS transition SENDING -> FAILED (retryable) with backoff + code."""
+        cur = self._conn.execute(
+            "UPDATE notification_outbox SET status = 'FAILED', "
+            "claim_token = NULL, claimed_at = NULL, next_attempt_at = ?, "
+            "last_error_code = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'SENDING' AND claim_token = ?",
+            (next_attempt_at, error_code, now_iso, notification_id, claim_token),
+        )
+        return cur.rowcount == 1
+
+    def _discard_notification(
+        self, notification_id: str, claim_token: str, now_iso: str, *,
+        error_code: str,
+    ) -> bool:
+        """CAS transition SENDING -> DISCARDED (terminal) with a code."""
+        cur = self._conn.execute(
+            "UPDATE notification_outbox SET status = 'DISCARDED', "
+            "claim_token = NULL, claimed_at = NULL, next_attempt_at = NULL, "
+            "last_error_code = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'SENDING' AND claim_token = ?",
+            (error_code, now_iso, notification_id, claim_token),
+        )
+        return cur.rowcount == 1
 
 
 class Queries:
