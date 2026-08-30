@@ -291,14 +291,14 @@ def test_g3_migration_failure_rolls_back_v2_structure(tmp_path, monkeypatch):
     assert row[0] == "2"
     conn.close()
 
-    # A subsequent open succeeds and migrates to V5.
+    # A subsequent open succeeds and migrates to V6.
     c = Core(db)
     tcols2 = {r[1] for r in c._store._conn.execute("PRAGMA table_info(tasks)")}
     assert "description" in tcols2
     row2 = c._store._conn.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
-    assert row2["value"] == "5"
+    assert row2["value"] == "6"
     c.close()
 
 

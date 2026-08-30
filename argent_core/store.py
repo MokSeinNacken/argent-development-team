@@ -55,7 +55,7 @@ from .models import (
     TestRun,
 )
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 _TASK_STATES = "', '".join(s.value for s in TaskState)
 _TASK_RUN_STATUSES = "', '".join(s.value for s in TaskRunStatus)
@@ -447,6 +447,129 @@ _SCHEMA: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_notification_outbox_job
         ON notification_outbox(supervisor_job_id, created_at)
     """,
+    # V6 (SPEC V3C §8.1): owner-approval challenges + Telegram inbound dedup
+    # and offset cursor.  Transport-neutral persistence only: the raw challenge
+    # token is NEVER stored (only its sha256 token_hash) and the real
+    # chat/sender IDs are NEVER stored (only authorized booleans, §8.2).
+    """
+    CREATE TABLE IF NOT EXISTS approval_challenges (
+        id                       TEXT PRIMARY KEY,
+        approval_id              TEXT NOT NULL
+                                 REFERENCES owner_approvals(id) ON DELETE CASCADE,
+        task_id                  TEXT NOT NULL
+                                 REFERENCES tasks(id) ON DELETE CASCADE,
+        supervisor_job_id        TEXT NOT NULL
+                                 REFERENCES supervisor_jobs(id) ON DELETE CASCADE,
+        binding_hash             TEXT NOT NULL
+                                 CHECK (length(binding_hash) = 64),
+        notification_outbox_id   TEXT UNIQUE
+                                 REFERENCES notification_outbox(id)
+                                 ON DELETE SET NULL,
+        token_hash               TEXT NOT NULL
+                                 CHECK (length(token_hash) = 64),
+        status                   TEXT NOT NULL CHECK (status IN
+                                 ('ISSUED','CONSUMED_APPROVED',
+                                  'CONSUMED_REJECTED','EXPIRED','INVALIDATED')),
+        created_at               TEXT NOT NULL,
+        expires_at               TEXT NOT NULL,
+        consumed_at              TEXT,
+        consumed_update_id       INTEGER UNIQUE,
+        invalidated_at           TEXT,
+        CHECK (expires_at > created_at),
+        CHECK (
+            (status = 'ISSUED'
+             AND consumed_at IS NULL
+             AND consumed_update_id IS NULL
+             AND invalidated_at IS NULL)
+            OR
+            (status IN ('CONSUMED_APPROVED','CONSUMED_REJECTED')
+             AND consumed_at IS NOT NULL
+             AND consumed_update_id IS NOT NULL
+             AND invalidated_at IS NULL)
+            OR
+            (status IN ('EXPIRED','INVALIDATED')
+             AND consumed_at IS NULL
+             AND consumed_update_id IS NULL
+             AND invalidated_at IS NOT NULL)
+        )
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_challenges_token_hash
+        ON approval_challenges(token_hash)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_challenges_active_approval
+        ON approval_challenges(approval_id)
+        WHERE status = 'ISSUED'
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_approval_challenges_due
+        ON approval_challenges(status, expires_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_approval_challenges_approval
+        ON approval_challenges(approval_id, created_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS telegram_update_log (
+        update_id          INTEGER PRIMARY KEY CHECK (update_id >= 0),
+        message_date       INTEGER,
+        chat_authorized    INTEGER NOT NULL
+                           CHECK (chat_authorized IN (0,1)),
+        sender_authorized  INTEGER NOT NULL
+                           CHECK (sender_authorized IN (0,1)),
+        decision           TEXT CHECK
+                           (decision IS NULL OR decision IN ('APPROVE','REJECT')),
+        challenge_id       TEXT
+                           REFERENCES approval_challenges(id) ON DELETE SET NULL,
+        approval_id        TEXT
+                           REFERENCES owner_approvals(id) ON DELETE SET NULL,
+        outcome            TEXT NOT NULL CHECK (outcome IN (
+                           'PROCESSING',
+                           'APPROVED',
+                           'REJECTED',
+                           'WRONG_CHAT',
+                           'SPOOFED_SENDER',
+                           'MALFORMED',
+                           'UNKNOWN_TOKEN',
+                           'USED_TOKEN',
+                           'EXPIRED_TOKEN',
+                           'EXPIRED_APPROVAL',
+                           'APPROVAL_NOT_PENDING',
+                           'STALE_MESSAGE',
+                           'STALE_UPDATE',
+                           'BINDING_MISMATCH')),
+        received_at        TEXT NOT NULL,
+        processed_at       TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_telegram_update_log_outcome
+        ON telegram_update_log(outcome, processed_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_telegram_update_log_challenge
+        ON telegram_update_log(challenge_id, processed_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS telegram_inbound_state (
+        stream_id       TEXT PRIMARY KEY
+                        CHECK (stream_id = 'telegram-owner-approval-v1'),
+        next_update_id  INTEGER NOT NULL CHECK (next_update_id >= 0),
+        updated_at      TEXT NOT NULL
+    )
+    """,
+    """
+    INSERT INTO telegram_inbound_state (
+        stream_id, next_update_id, updated_at
+    )
+    SELECT 'telegram-owner-approval-v1', 0, CURRENT_TIMESTAMP
+    WHERE NOT EXISTS (
+        SELECT 1 FROM telegram_inbound_state
+        WHERE stream_id = 'telegram-owner-approval-v1'
+    )
+    """,
 )
 
 
@@ -470,6 +593,7 @@ class Store:
 
     def __init__(self, db_path: str, clock: Optional[Callable[[], datetime]] = None):
         # isolation_level=None -> autocommit; we drive transactions explicitly.
+        self._db_path = db_path
         self._conn = sqlite3.connect(db_path, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -655,6 +779,59 @@ class Store:
             raise
         else:
             self._conn.execute("COMMIT")
+
+    def open_inbound_connection(self) -> sqlite3.Connection:
+        """Open a dedicated inbound connection with ``busy_timeout=0``
+        (SPEC V3C §14: immediate termination on DB lock).
+
+        Used by the approval callback processor so a concurrent writer lock
+        aborts ``BEGIN IMMEDIATE`` immediately instead of blocking the
+        supervisor.  The main ``self._conn`` is left untouched."""
+        conn = sqlite3.connect(self._db_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 0")
+        return conn
+
+    def _bound(self, conn: sqlite3.Connection) -> "Store":
+        """Return a connection-scoped :class:`Store` view bound to ``conn``.
+
+        Shares this Store's clock; every reader/mutator runs on ``conn`` while
+        ``self._conn`` is left completely untouched.  Used by inbound callback
+        processing so the supervisor's main connection stays usable
+        concurrently (SPEC V3C §14).  The returned view is ephemeral: the
+        caller owns ``conn`` and must close it; the view itself must never be
+        closed.
+        """
+        view = Store.__new__(Store)
+        view._db_path = self._db_path
+        view._conn = conn
+        view._clock = self._clock
+        return view
+
+    @contextmanager
+    def _inbound_transaction(self) -> Iterator["Store"]:
+        """Run a block inside a dedicated ``BEGIN IMMEDIATE`` transaction with
+        ``busy_timeout=0`` (immediate termination on DB lock, SPEC V3C §14).
+
+        Yields a connection-scoped :class:`Store` bound to the dedicated
+        inbound connection so every store mutator AND the approval decision
+        bridge participate in the SAME transaction.  ``self._conn`` is NEVER
+        swapped or touched: the main supervisor connection remains open and
+        usable concurrently throughout and after the inbound pass."""
+        inbound = self.open_inbound_connection()
+        bound = self._bound(inbound)
+        try:
+            inbound.execute("BEGIN IMMEDIATE")
+            try:
+                yield bound
+            except BaseException:
+                inbound.execute("ROLLBACK")
+                raise
+            else:
+                inbound.execute("COMMIT")
+        finally:
+            inbound.close()
 
     # -- projects ------------------------------------------------------------
 
@@ -2029,6 +2206,193 @@ class Store:
             (error_code, now_iso, notification_id, claim_token),
         )
         return cur.rowcount == 1
+
+    # -- owner-approval challenges (V6, SPEC V3C §8.1) ---------------------
+    # The only persistence surface for the challenge core.  Rows are plain
+    # dicts; every mutator is private.  These methods read/write ONLY
+    # ``approval_challenges``.
+
+    _APPROVAL_CHALLENGE_COLUMNS: frozenset[str] = frozenset(
+        {
+            "id", "approval_id", "task_id", "supervisor_job_id",
+            "binding_hash", "notification_outbox_id", "token_hash", "status",
+            "created_at", "expires_at", "consumed_at", "consumed_update_id",
+            "invalidated_at",
+        }
+    )
+
+    def _insert_challenge(self, row: dict) -> None:
+        """Insert a full challenge row (must be called inside a transaction)."""
+        missing = [c for c in self._APPROVAL_CHALLENGE_COLUMNS if c not in row]
+        if missing:
+            raise ValueError(f"missing approval_challenges columns: {missing}")
+        self._conn.execute(
+            "INSERT INTO approval_challenges (id, approval_id, task_id, "
+            "supervisor_job_id, binding_hash, notification_outbox_id, "
+            "token_hash, status, created_at, expires_at, consumed_at, "
+            "consumed_update_id, invalidated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row["id"], row["approval_id"], row["task_id"],
+                row["supervisor_job_id"], row["binding_hash"],
+                row["notification_outbox_id"], row["token_hash"], row["status"],
+                row["created_at"], row["expires_at"], row["consumed_at"],
+                row["consumed_update_id"], row["invalidated_at"],
+            ),
+        )
+
+    def get_challenge(self, challenge_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM approval_challenges WHERE id = ?", (challenge_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_active_challenge_for_approval(
+        self, approval_id: str
+    ) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM approval_challenges "
+            "WHERE approval_id = ? AND status = 'ISSUED'",
+            (approval_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_challenge_by_token_hash(self, token_hash: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM approval_challenges WHERE token_hash = ?",
+            (token_hash,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_challenges(
+        self,
+        task_id: Optional[str] = None,
+        supervisor_job_id: Optional[str] = None,
+    ) -> list[dict]:
+        q = "SELECT * FROM approval_challenges"
+        params: list = []
+        clauses: list[str] = []
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if supervisor_job_id is not None:
+            clauses.append("supervisor_job_id = ?")
+            params.append(supervisor_job_id)
+        if clauses:
+            q += " WHERE " + " AND ".join(clauses)
+        q += " ORDER BY created_at, rowid"
+        rows = self._conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def _consume_challenge(
+        self, challenge_id: str, status: str, consumed_at: str,
+        consumed_update_id: int,
+    ) -> int:
+        """CAS ISSUED -> CONSUMED_APPROVED / CONSUMED_REJECTED (single-use).
+
+        Returns the rowcount (exactly 1 iff this caller won)."""
+        cur = self._conn.execute(
+            "UPDATE approval_challenges SET status = ?, consumed_at = ?, "
+            "consumed_update_id = ? "
+            "WHERE id = ? AND status = 'ISSUED'",
+            (status, consumed_at, consumed_update_id, challenge_id),
+        )
+        return cur.rowcount
+
+    def _mark_challenge_expired(self, challenge_id: str, now_iso: str) -> int:
+        """CAS ISSUED -> EXPIRED (terminal; invalidated_at set)."""
+        cur = self._conn.execute(
+            "UPDATE approval_challenges SET status = 'EXPIRED', "
+            "invalidated_at = ? WHERE id = ? AND status = 'ISSUED'",
+            (now_iso, challenge_id),
+        )
+        return cur.rowcount
+
+    def _mark_challenge_invalidated(self, challenge_id: str, now_iso: str) -> int:
+        """CAS ISSUED -> INVALIDATED (terminal; invalidated_at set)."""
+        cur = self._conn.execute(
+            "UPDATE approval_challenges SET status = 'INVALIDATED', "
+            "invalidated_at = ? WHERE id = ? AND status = 'ISSUED'",
+            (now_iso, challenge_id),
+        )
+        return cur.rowcount
+
+    # -- telegram update log + inbound cursor (V6, SPEC V3C §8.1) ---------
+    # Update-ID dedup + restart-fixed offset.  Real chat/sender IDs are never
+    # stored; only ``chat_authorized`` / ``sender_authorized`` booleans (§8.2).
+
+    _UPDATE_LOG_COLUMNS: frozenset[str] = frozenset(
+        {
+            "update_id", "message_date", "chat_authorized", "sender_authorized",
+            "decision", "challenge_id", "approval_id", "outcome",
+            "received_at", "processed_at",
+        }
+    )
+
+    def _insert_update_log(self, row: dict) -> bool:
+        """Insert an update-log row idempotently on ``update_id`` (the PK).
+
+        Returns True iff a row was inserted; False on a PK (duplicate update)
+        conflict.  Any OTHER constraint violation (CHECK/FK/NOT NULL) raises.
+        Must be called inside the caller's transaction."""
+        missing = [c for c in self._UPDATE_LOG_COLUMNS if c not in row]
+        if missing:
+            raise ValueError(f"missing telegram_update_log columns: {missing}")
+        cur = self._conn.execute(
+            "INSERT INTO telegram_update_log (update_id, message_date, "
+            "chat_authorized, sender_authorized, decision, challenge_id, "
+            "approval_id, outcome, received_at, processed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(update_id) DO NOTHING",
+            (
+                row["update_id"], row["message_date"], row["chat_authorized"],
+                row["sender_authorized"], row["decision"], row["challenge_id"],
+                row["approval_id"], row["outcome"], row["received_at"],
+                row["processed_at"],
+            ),
+        )
+        return cur.rowcount == 1
+
+    def _finalize_update_log(
+        self, update_id: int, *, decision: Optional[str],
+        challenge_id: Optional[str], approval_id: Optional[str],
+        outcome: str, processed_at: str,
+    ) -> bool:
+        """Move a ``PROCESSING`` update-log row to its terminal outcome.
+
+        Must be called inside the caller's transaction (SPEC V3C §10.2 step 16).
+        Returns True iff exactly one row was updated (it always should be, since
+        the row was inserted with ``PROCESSING`` in the same transaction)."""
+        cur = self._conn.execute(
+            "UPDATE telegram_update_log SET decision = ?, challenge_id = ?, "
+            "approval_id = ?, outcome = ?, processed_at = ? WHERE update_id = ?",
+            (decision, challenge_id, approval_id, outcome, processed_at, update_id),
+        )
+        return cur.rowcount == 1
+
+    def get_update_log(self, update_id: int) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM telegram_update_log WHERE update_id = ?", (update_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_inbound_state(self) -> Optional[dict]:
+        """The single-row cursor (stream_id is fixed to the one V6 stream)."""
+        row = self._conn.execute(
+            "SELECT * FROM telegram_inbound_state "
+            "WHERE stream_id = 'telegram-owner-approval-v1'",
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def _set_inbound_state(self, next_update_id: int, updated_at: str) -> None:
+        """UPSERT the single cursor row (monotonic next_update_id)."""
+        self._conn.execute(
+            "INSERT INTO telegram_inbound_state (stream_id, next_update_id, "
+            "updated_at) VALUES ('telegram-owner-approval-v1', ?, ?) "
+            "ON CONFLICT(stream_id) DO UPDATE SET next_update_id = excluded."
+            "next_update_id, updated_at = excluded.updated_at",
+            (next_update_id, updated_at),
+        )
 
 
 class Queries:

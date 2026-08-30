@@ -333,7 +333,7 @@ def test_fresh_db_version5_and_table_indexes(db_path):
         row = core._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "5"
+        assert row["value"] == "6"
         names = {r["name"] for r in core._store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "notification_outbox" in names
@@ -365,7 +365,7 @@ def test_v4_to_v5_preserves_data_and_recreates_table(db_path):
         row = core2._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "5"
+        assert row["value"] == "6"
         names = {r["name"] for r in core2._store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "notification_outbox" in names
@@ -387,7 +387,7 @@ def test_no_backfill_on_upgrade(db_path):
     )
     core.close()
 
-    # Reopen (V4 -> V5): no historical rows are backfilled.
+    # Reopen (V4 -> V6): no historical rows are backfilled.
     core2 = Core(db_path)
     try:
         assert core2._store.list_notifications() == []
@@ -413,13 +413,13 @@ def test_migration_rollback_on_error(db_path, monkeypatch):
     finally:
         conn.close()
 
-    # A subsequent open succeeds (V5, table present).
+    # A subsequent open succeeds (V6, table present).
     core = Core(db_path)
     try:
         row = core._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "5"
+        assert row["value"] == "6"
         names = {r["name"] for r in core._store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "notification_outbox" in names

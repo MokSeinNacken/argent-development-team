@@ -55,7 +55,7 @@ def test_schema_meta_version(db_path, core):
         ).fetchone()
     finally:
         conn.close()
-    assert row is not None and row["value"] == "5"
+    assert row is not None and row["value"] == "6"
 
 
 def test_foreign_keys_enabled(core):
@@ -247,7 +247,7 @@ def test_migration_from_v2_adds_columns(tmp_path):
     row = c._store._conn.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
-    assert row is not None and row["value"] == "5"
+    assert row is not None and row["value"] == "6"
     # The migrated task still exists and gained the defaults.
     t = c.queries.get_task("t1")
     assert t.risk_class.value == "NORMAL"

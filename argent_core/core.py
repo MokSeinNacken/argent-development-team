@@ -979,6 +979,58 @@ class Core:
 
     # ------------------------------------------------------------ owner gates
 
+    def _approve_work_in_transaction(
+        self, ap: OwnerApproval, task_id: str, action: str, scope: str
+    ) -> OwnerApproval:
+        """Inner approve work (SPEC V3C §10.1).  MUST run inside an open
+        ``BEGIN IMMEDIATE`` transaction; it opens none itself.  The public
+        ``approve()`` and the Telegram approval bridge share this exact body
+        (binding, status, expiry, single CAS, event)."""
+        self._check_full_binding(ap, task_id, action, scope)
+        now = self._store.now_iso()
+        if ap.status is not ApprovalStatus.PENDING:
+            raise ApprovalError(
+                f"approval {ap.id!r} is not pending ({ap.status.value})"
+            )
+        if ap.expires_at <= now:
+            raise _ApprovalExpired(ap.id)
+        rc = self._store._mark_approved(ap.id, now)
+        if rc == 0:
+            raise ApprovalError(f"approval {ap.id!r} could not be approved")
+        self._emit("gate.owner_approved", task_id=ap.task_id,
+                   payload={"approval_id": ap.id})
+        return self._store.get_approval(ap.id)
+
+    def _reject_work_in_transaction(
+        self, ap: OwnerApproval, task_id: str, action: str, scope: str
+    ) -> OwnerApproval:
+        """Inner reject work (SPEC V3C §10.1).  MUST run inside an open
+        ``BEGIN IMMEDIATE`` transaction; it opens none itself.  The public
+        ``reject()`` and the Telegram approval bridge share this exact body.
+
+        A7/§12: the reject path now also fails closed on an expired approval
+        (the approval CAS ``_mark_rejected`` carries no ``expires_at`` predicate,
+        so the expiry guard is enforced here explicitly)."""
+        self._check_full_binding(ap, task_id, action, scope)
+        now = self._store.now_iso()
+        if ap.expires_at <= now:
+            raise _ApprovalExpired(ap.id)
+        rc = self._store._mark_rejected(ap.id, now)
+        if rc == 0:
+            ap2 = self._store.get_approval(ap.id)
+            raise ApprovalError(
+                f"approval {ap.id!r} is not pending ({ap2.status.value})"
+            )
+        task = self._store.get_task(ap.task_id)
+        if task is not None and task.state is TaskState.OWNER_APPROVAL_REQUIRED:
+            state_machine.validate_transition(
+                task.state, TaskState.BLOCKED, task.resume_state
+            )
+            self._apply_transition(task, TaskState.BLOCKED, None)
+        self._emit("gate.owner_rejected", task_id=ap.task_id,
+                   payload={"approval_id": ap.id})
+        return self._store.get_approval(ap.id)
+
     def approve(
         self,
         approval_id: str,
@@ -999,20 +1051,7 @@ class Core:
             ap = self._store.get_approval(approval_id)
             if ap is None:
                 raise ApprovalError(f"approval {approval_id!r} not found")
-            self._check_full_binding(ap, task_id, action, scope)
-            now = self._store.now_iso()
-            if ap.status is not ApprovalStatus.PENDING:
-                raise ApprovalError(
-                    f"approval {approval_id!r} is not pending ({ap.status.value})"
-                )
-            if ap.expires_at <= now:
-                raise _ApprovalExpired(approval_id)
-            rc = self._store._mark_approved(approval_id, now)
-            if rc == 0:
-                raise ApprovalError(f"approval {approval_id!r} could not be approved")
-            self._emit("gate.owner_approved", task_id=ap.task_id,
-                       payload={"approval_id": approval_id})
-            return self._store.get_approval(approval_id), approval_id
+            return self._approve_work_in_transaction(ap, task_id, action, scope), approval_id
 
         try:
             return self._idempotent(
@@ -1044,28 +1083,17 @@ class Core:
             ap = self._store.get_approval(approval_id)
             if ap is None:
                 raise ApprovalError(f"approval {approval_id!r} not found")
-            self._check_full_binding(ap, task_id, action, scope)
-            now = self._store.now_iso()
-            rc = self._store._mark_rejected(approval_id, now)
-            if rc == 0:
-                ap2 = self._store.get_approval(approval_id)
-                raise ApprovalError(
-                    f"approval {approval_id!r} is not pending ({ap2.status.value})"
-                )
-            task = self._store.get_task(ap.task_id)
-            if task is not None and task.state is TaskState.OWNER_APPROVAL_REQUIRED:
-                state_machine.validate_transition(
-                    task.state, TaskState.BLOCKED, task.resume_state
-                )
-                self._apply_transition(task, TaskState.BLOCKED, None)
-            self._emit("gate.owner_rejected", task_id=ap.task_id,
-                       payload={"approval_id": approval_id})
-            return self._store.get_approval(approval_id), approval_id
+            return self._reject_work_in_transaction(ap, task_id, action, scope), approval_id
 
-        return self._idempotent(
-            idempotency_key, "reject", args, work,
-            lambda rid: self._approval_binding_refetch(rid, task_id, action, scope),
-        )
+        try:
+            return self._idempotent(
+                idempotency_key, "reject", args, work,
+                lambda rid: self._approval_binding_refetch(rid, task_id, action, scope),
+            )
+        except _ApprovalExpired as exc:
+            with self._store._transaction():
+                self._expire_and_release(exc.approval_id)
+            raise ApprovalError(f"approval {exc.approval_id!r} expired") from None
 
     def _expire_and_release(self, approval_id: str) -> None:
         """Expire an approval and release its task from the gate (SPEC V1.3 13.2).

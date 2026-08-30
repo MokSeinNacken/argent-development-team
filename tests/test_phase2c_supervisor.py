@@ -1712,8 +1712,9 @@ def test_r13_dispatch_write_intents_primary_key_blocks_second_row(db_path, tmp_p
 
 def test_r13_dispatch_write_intents_migration_existing_v4(tmp_path):
     """R13-F1: a pre-existing V4 DB (built before this table) gains
-    dispatch_write_intents on reopen.  The schema is now V5 (additive
-    notification_outbox migration), so the version is UPSERTed to 5."""
+    dispatch_write_intents on reopen.  The schema is now V6 (additive
+    notification_outbox + owner-approval-challenge migration), so the version
+    is UPSERTed to 6."""
     db = str(tmp_path / "v4.db")
     c = Core(db)
     c._store._conn.execute("DROP TABLE dispatch_write_intents")
@@ -1726,7 +1727,7 @@ def test_r13_dispatch_write_intents_migration_existing_v4(tmp_path):
         assert "dispatch_write_intents" in names
         row = c2._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
-        assert row["value"] == "5"
+        assert row["value"] == "6"
     finally:
         c2.close()
 
