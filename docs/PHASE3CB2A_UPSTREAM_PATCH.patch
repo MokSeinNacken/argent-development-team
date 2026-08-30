@@ -1,0 +1,112 @@
+diff --git a/extensions/telegram/src/bot-handlers.callback-router-controls.ts b/extensions/telegram/src/bot-handlers.callback-router-controls.ts
+index 71c9cc78..58755ae7 100644
+--- a/extensions/telegram/src/bot-handlers.callback-router-controls.ts
++++ b/extensions/telegram/src/bot-handlers.callback-router-controls.ts
+@@ -442,6 +442,8 @@ export async function handleTelegramInteractiveCallback(params: {
+   callbackThreadId?: number;
+   senderId: string;
+   senderUsername: string;
++  updateId: number | null;
++  messageDate: number;
+   isGroup: boolean;
+   isForum: boolean;
+   storeAllowFrom: string[];
+@@ -460,6 +462,8 @@ export async function handleTelegramInteractiveCallback(params: {
+     callbackThreadId,
+     senderId,
+     senderUsername,
++    updateId,
++    messageDate,
+     isGroup,
+     isForum,
+     storeAllowFrom,
+@@ -563,6 +567,8 @@ export async function handleTelegramInteractiveCallback(params: {
+     ctx: {
+       accountId,
+       callbackId: callback.id,
++      updateId,
++      messageDate,
+       conversationId: callbackConversationId,
+       parentConversationId: callbackThreadId != null ? String(callbackMessage.chat.id) : undefined,
+       senderId: senderId || undefined,
+diff --git a/extensions/telegram/src/bot-handlers.callback-router.ts b/extensions/telegram/src/bot-handlers.callback-router.ts
+index 94fcdc4b..a53152f2 100644
+--- a/extensions/telegram/src/bot-handlers.callback-router.ts
++++ b/extensions/telegram/src/bot-handlers.callback-router.ts
+@@ -39,6 +39,7 @@ import {
+   isTelegramSpooledReplayUpdate,
+   recordTelegramMessageProcessingResult,
+ } from "./bot-processing-outcome.js";
++import { resolveTelegramUpdateId } from "./telegram-ingress-spool.js";
+ import {
+   resolveTelegramForumFlag,
+   resolveTelegramBotHasTopicsEnabled,
+@@ -328,6 +329,8 @@ export function createTelegramCallbackRouter({
+           callbackThreadId,
+           senderId,
+           senderUsername,
++          updateId: resolveTelegramUpdateId(ctx.update),
++          messageDate: callbackMessage.date,
+           isGroup,
+           isForum,
+           storeAllowFrom,
+diff --git a/extensions/telegram/src/interactive-dispatch.ts b/extensions/telegram/src/interactive-dispatch.ts
+index ba3e90a6..46526009 100644
+--- a/extensions/telegram/src/interactive-dispatch.ts
++++ b/extensions/telegram/src/interactive-dispatch.ts
+@@ -15,6 +15,20 @@ export type TelegramInteractiveHandlerContext = {
+   channel: "telegram";
+   accountId: string;
+   callbackId: string;
++  /**
++   * Telegram update identity, forwarded verbatim from the authoritative
++   * `ctx.update.update_id` of the incoming update (never synthesized).
++   * `null` for synthetic updates or any update lacking a valid `update_id`
++   * (missing, non-numeric, negative, or unsafe-integer values); valid Bot
++   * API callback_query updates always provide a number. Consumers must
++   * treat `null` fail-closed (no synthesis, no substitute value).
++   */
++  updateId: number | null;
++  /**
++   * Telegram message timestamp (Unix seconds), forwarded verbatim from the
++   * authoritative `callbackQuery.message.date` (never synthesized).
++   */
++  messageDate: number;
+   conversationId: string;
+   parentConversationId?: string;
+   senderId?: string;
+diff --git a/src/plugins/interactive-contract.test-helpers.ts b/src/plugins/interactive-contract.test-helpers.ts
+index 7ff4828d..c6d5930e 100644
+--- a/src/plugins/interactive-contract.test-helpers.ts
++++ b/src/plugins/interactive-contract.test-helpers.ts
+@@ -17,6 +17,8 @@ type BaseInteractiveContext<TChannel extends string> = ConversationBindingHelper
+ 
+ export type TelegramInteractiveHandlerContext = BaseInteractiveContext<"telegram"> & {
+   callbackId: string;
++  updateId: number | null;
++  messageDate: number;
+   senderUsername?: string;
+   threadId?: number;
+   isGroup?: boolean;
+diff --git a/src/plugins/interactive.test.ts b/src/plugins/interactive.test.ts
+index 9e63400f..162e8a04 100644
+--- a/src/plugins/interactive.test.ts
++++ b/src/plugins/interactive.test.ts
+@@ -71,6 +71,8 @@ function createTelegramDispatchParams(params: {
+     ctx: {
+       accountId: "default",
+       callbackId: params.callbackId,
++      updateId: 424242,
++      messageDate: 1710000000,
+       conversationId: "-10099:topic:77",
+       parentConversationId: "-10099",
+       senderId: "user-1",
+@@ -470,6 +472,8 @@ describe("plugin interactive handlers", () => {
+         const telegramCtx = ctx as TelegramInteractiveHandlerContext;
+         expect(telegramCtx.channel).toBe("telegram");
+         expect(telegramCtx.conversationId).toBe("-10099:topic:77");
++        expect(telegramCtx.updateId).toBe(424242);
++        expect(telegramCtx.messageDate).toBe(1710000000);
+         expect(telegramCtx.callback.namespace).toBe("codex");
+         expect(telegramCtx.callback.payload).toBe("resume:thread-1");
+         expect(telegramCtx.callback.chatId).toBe("-10099");

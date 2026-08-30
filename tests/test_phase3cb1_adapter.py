@@ -733,9 +733,11 @@ def test_installed_handler_context_host_boundary_contract():
         "editMessage", "editButtons", "clearButtons", "deleteMessage",
     ):
         assert present in src, present
-    # Absent: the fields the installed handler context does NOT provide. This
-    # locks the F1 host-boundary gap so a future OpenClaw upgrade that adds
-    # them is noticed.
+    # Absent: the fields the installed handler context does NOT provide. The
+    # test reads the checked-in static fixture only (no automatic live
+    # detection): after an OpenClaw upgrade the fixture must be re-extracted
+    # from the installed dist d.ts (manual step) before this assert can fail
+    # for newly added fields. See docs/PHASE3CB2A_STATUS.md.
     for absent in (
         "update_id", "updateId", "message_date", "messageDate",
         "answerCallbackQuery",

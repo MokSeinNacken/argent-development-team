@@ -7,8 +7,10 @@
 // callbackId/senderId/chatId/messageId/payload/data/namespace and
 // respond.editMessage/editButtons/clearButtons/deleteMessage, but does NOT
 // carry the Telegram update identifier or the callback-message date, and
-// exposes no answerCallbackQuery responder. A future OpenClaw upgrade that
-// adds those fields will fail the locking test so the contract is re-reviewed.
+// exposes no answerCallbackQuery responder. This is a static snapshot: after
+// an OpenClaw upgrade the installed dist d.ts must be re-extracted into this
+// fixture (manual step) before the absence assertions can fail for newly
+// added fields.
 type TelegramInteractiveButtons = Array<Array<{
   text: string;
   callback_data: string;
