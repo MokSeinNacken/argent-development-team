@@ -1,0 +1,68 @@
+// Checked-in excerpt of the INSTALLED OpenClaw declaration file
+//   /home/pc/.npm-global/lib/node_modules/openclaw/dist/interactive-dispatch-DmdS-gIW.d.ts
+// OpenClaw version 2026.7.1-2, lines 93-149 (captured read-only, 2026-08-30).
+//
+// Used by tests/test_phase3cb1_adapter.py to lock the host-boundary contract
+// gap (F1/F2): the installed TelegramInteractiveHandlerContext provides
+// callbackId/senderId/chatId/messageId/payload/data/namespace and
+// respond.editMessage/editButtons/clearButtons/deleteMessage, but does NOT
+// carry the Telegram update identifier or the callback-message date, and
+// exposes no answerCallbackQuery responder. A future OpenClaw upgrade that
+// adds those fields will fail the locking test so the contract is re-reviewed.
+type TelegramInteractiveButtons = Array<Array<{
+  text: string;
+  callback_data: string;
+  style?: "danger" | "success" | "primary";
+}>>;
+type TelegramInteractiveHandlerContext = {
+  channel: "telegram";
+  accountId: string;
+  callbackId: string;
+  conversationId: string;
+  parentConversationId?: string;
+  senderId?: string;
+  senderUsername?: string;
+  threadId?: number;
+  isGroup: boolean;
+  isForum: boolean;
+  auth: {
+    isAuthorizedSender: boolean;
+  };
+  callback: {
+    data: string;
+    namespace: string;
+    payload: string;
+    messageId: number;
+    chatId: string;
+    messageText?: string;
+  };
+  respond: {
+    reply: (params: {
+      text: string;
+      buttons?: TelegramInteractiveButtons;
+    }) => Promise<void>;
+    editMessage: (params: {
+      text: string;
+      buttons?: TelegramInteractiveButtons;
+    }) => Promise<void>;
+    editButtons: (params: {
+      buttons: TelegramInteractiveButtons;
+    }) => Promise<void>;
+    clearButtons: () => Promise<void>;
+    deleteMessage: () => Promise<void>;
+  };
+  requestConversationBinding: (params?: PluginConversationBindingRequestParams) => Promise<PluginConversationBindingRequestResult>;
+  detachConversationBinding: () => Promise<{
+    removed: boolean;
+  }>;
+  getCurrentConversationBinding: () => Promise<PluginConversationBinding | null>;
+};
+type TelegramInteractiveHandlerResult = {
+  handled?: boolean;
+  /**
+   * Submit text through Telegram's normal inbound path after the callback handler
+   * returns, so plugin buttons can act like user-authored replies.
+   */
+  submitText?: string;
+} | void;
+type TelegramInteractiveHandlerRegistration = PluginInteractiveRegistration<TelegramInteractiveHandlerContext, "telegram", TelegramInteractiveHandlerResult>;
