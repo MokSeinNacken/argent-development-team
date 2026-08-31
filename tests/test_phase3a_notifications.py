@@ -333,7 +333,7 @@ def test_fresh_db_version5_and_table_indexes(db_path):
         row = core._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "6"
+        assert row["value"] == "7"
         names = {r["name"] for r in core._store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "notification_outbox" in names
@@ -365,7 +365,7 @@ def test_v4_to_v5_preserves_data_and_recreates_table(db_path):
         row = core2._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "6"
+        assert row["value"] == "7"
         names = {r["name"] for r in core2._store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "notification_outbox" in names
@@ -419,7 +419,7 @@ def test_migration_rollback_on_error(db_path, monkeypatch):
         row = core._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "6"
+        assert row["value"] == "7"
         names = {r["name"] for r in core._store._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         assert "notification_outbox" in names

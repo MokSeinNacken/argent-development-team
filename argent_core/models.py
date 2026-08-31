@@ -213,6 +213,24 @@ class DispatchError(ArgentError):
     """An agent dispatch operation failed provenance/state validation."""
 
 
+class LeaseError(ArgentError):
+    """A durable-queue lease claim/renew/release failed its guard (Phase B1).
+
+    Raised when a job is not claimable (wrong primary_state, not yet eligible,
+    terminal/LOST/BLOCKED, or a still-valid foreign lease) or when a
+    renew/release call does not hold the current owner+epoch.
+    """
+
+
+class LeaseFencedError(ArgentError):
+    """A stale lease holder attempted a mutation after lease takeover (Phase B1).
+
+    Fencing token mismatch: the caller's (owner_instance_id, lease_epoch) is not
+    the job's current lease holder, so the mutation was refused and nothing was
+    written.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------

@@ -298,7 +298,7 @@ def test_g3_migration_failure_rolls_back_v2_structure(tmp_path, monkeypatch):
     row2 = c._store._conn.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
-    assert row2["value"] == "6"
+    assert row2["value"] == "7"
     c.close()
 
 

@@ -97,6 +97,15 @@ def _job_row(job_id, task_id, now):
         "last_progress_at": now,
         "terminal": None,
         "facts_version": 0,
+        "primary_state": "OWNER_GATE",
+        "queue_reason": "NEW",
+        "priority": 0,
+        "owner_instance_id": None,
+        "lease_epoch": 0,
+        "lease_expires_at": None,
+        "next_eligible_at": None,
+        "error_class": "NONE",
+        "wait_kind": "NONE",
         "created_at": now,
         "updated_at": now,
     }
@@ -135,15 +144,15 @@ def _column_names(core, table):
 # Schema V6
 # ---------------------------------------------------------------------------
 
-def test_schema_version_is_6():
-    assert SCHEMA_VERSION == "6"
+def test_schema_version_is_7():
+    assert SCHEMA_VERSION == "7"
 
 
 def test_fresh_db_has_v6_tables_and_version(db_path, core):
     row = core._store._conn.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
-    assert row["value"] == "6"
+    assert row["value"] == "7"
     assert V6_TABLES <= _table_names(core)
 
 
@@ -198,7 +207,7 @@ def test_v5_to_v6_preserves_v5_data(db_path):
         row = core2._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "6"
+        assert row["value"] == "7"
         assert V6_TABLES <= _table_names(core2)
         # V5 data intact.
         assert core2.queries.get_task(task.id) is not None
@@ -236,7 +245,7 @@ def test_v6_migration_rollback_on_error(db_path, monkeypatch):
         row = core._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "6"
+        assert row["value"] == "7"
         assert V6_TABLES <= _table_names(core)
     finally:
         core.close()

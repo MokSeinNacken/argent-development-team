@@ -33,7 +33,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
-from . import notifications, outputs, workflow
+from . import job_state, notifications, outputs, workflow
 from .core import ReceiveResult
 from .notifications import NotificationStatus, NotificationType
 from .models import (
@@ -42,6 +42,7 @@ from .models import (
     ArgentError,
     DispatchStatus,
     IdempotencyError,
+    LeaseFencedError,
     NotFound,
     Role,
     TaskState,
@@ -198,6 +199,12 @@ class ReconcileDecision:
     reason: str
     dispatch_id: Optional[str] = None
     wake_at: Optional[str] = None
+    # B1 fencing token (F1): the (owner, epoch) lease under which this decision
+    # was authored.  ``None`` means an unleased legacy job (no fence applied at
+    # action time).  A leased decision may only be executed while that exact
+    # (owner, epoch) is still the current, unexpired holder.
+    owner_instance_id: Optional[str] = None
+    lease_epoch: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -242,6 +249,16 @@ class SupervisorState:
     facts_version: int
     created_at: str
     updated_at: str
+    # B1 durable queue / lease fields (operational projection + lease)
+    primary_state: str
+    queue_reason: str
+    priority: int
+    owner_instance_id: Optional[str]
+    lease_epoch: int
+    lease_expires_at: Optional[str]
+    next_eligible_at: Optional[str]
+    error_class: str
+    wait_kind: str
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +496,7 @@ class SupervisorStore:
             row = {
                 "id": job_id,
                 "task_id": task_id,
-                "status": SupervisorJobStatus.ACTIVE.value,
+                "status": SupervisorJobStatus.WAITING_RUN.value,
                 "workflow_state": task.state.value,
                 "expected_role": None,
                 "expected_dispatch_id": None,
@@ -508,6 +525,15 @@ class SupervisorStore:
                 "last_progress_at": now,
                 "terminal": None,
                 "facts_version": 0,
+                "primary_state": job_state.PrimaryState.QUEUED.value,
+                "queue_reason": job_state.QueueReason.NEW.value,
+                "priority": 0,
+                "owner_instance_id": None,
+                "lease_epoch": 0,
+                "lease_expires_at": None,
+                "next_eligible_at": None,
+                "error_class": job_state.ErrorClass.NONE.value,
+                "wait_kind": job_state.WaitKind.NONE.value,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -516,6 +542,55 @@ class SupervisorStore:
                 idempotency_key, "create_supervisor_job", job_id, args_hash, now,
             )
             return self._build_state(row)
+
+    # -- B1 durable queue / lease facade (delegates to Store primitives) ---
+
+    def claim_job(
+        self, job_id: str, *, owner_instance_id: str, ttl_seconds: int
+    ) -> dict:
+        return self._store.claim_job(
+            job_id, owner_instance_id=owner_instance_id, ttl_seconds=ttl_seconds
+        )
+
+    def claim_next_job(self, *, owner_instance_id: str, ttl_seconds: int):
+        return self._store.claim_next_job(
+            owner_instance_id=owner_instance_id, ttl_seconds=ttl_seconds
+        )
+
+    def renew_lease(
+        self,
+        job_id: str,
+        *,
+        owner_instance_id: str,
+        lease_epoch: int,
+        ttl_seconds: int,
+    ) -> dict:
+        return self._store.renew_lease(
+            job_id,
+            owner_instance_id=owner_instance_id,
+            lease_epoch=lease_epoch,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def release_lease(
+        self, job_id: str, *, owner_instance_id: str, lease_epoch: int
+    ) -> dict:
+        return self._store.release_lease(
+            job_id, owner_instance_id=owner_instance_id, lease_epoch=lease_epoch
+        )
+
+    def enqueue_job(self, job_id: str, **kwargs) -> dict:
+        return self._store.enqueue_job(job_id, **kwargs)
+
+    def lease_is_current(
+        self, job_id: str, owner_instance_id: str, lease_epoch: int
+    ) -> bool:
+        return self._store.lease_is_current(job_id, owner_instance_id, lease_epoch)
+
+    def assert_lease_current(
+        self, job_id: str, owner_instance_id: str, lease_epoch: int
+    ) -> None:
+        self._store.assert_lease_current(job_id, owner_instance_id, lease_epoch)
 
     # -- projection ---------------------------------------------------------
 
@@ -623,6 +698,15 @@ class SupervisorStore:
             facts_version=row["facts_version"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            primary_state=row["primary_state"],
+            queue_reason=row["queue_reason"],
+            priority=row["priority"],
+            owner_instance_id=row["owner_instance_id"],
+            lease_epoch=row["lease_epoch"],
+            lease_expires_at=row["lease_expires_at"],
+            next_eligible_at=row["next_eligible_at"],
+            error_class=row["error_class"],
+            wait_kind=row["wait_kind"],
         )
 
 
@@ -1299,6 +1383,11 @@ class Supervisor:
         )
         self._run_status = run_status_provider
         self._launcher = run_launcher or OpenClawRunLauncher()
+        # B1: optional lease-holder identity used by the fencing check in
+        # ``_commit``.  ``None`` means "no lease held" (legacy single-supervisor
+        # path, where jobs are never leased).
+        self._lease_owner: Optional[str] = None
+        self._lease_epoch: Optional[int] = None
         # F1 (R15): FREEZE the workspace root to a single canonical spelling at
         # initialization, so every lock path, hash scope and broker reference
         # uses the SAME physical path for the lifetime of this Supervisor.
@@ -1322,6 +1411,62 @@ class Supervisor:
 
     def _now_iso(self) -> str:
         return self.core._store.now_iso()
+
+    # -- B1 lease-holder context + fencing --------------------------------
+
+    def set_lease_owner(self, owner_instance_id: str, lease_epoch: int) -> None:
+        """Declare the (owner, epoch) lease this Supervisor currently holds.
+
+        Once a job is leased, ``_commit`` fences any mutation that does not
+        carry the job's current holder, so a stale owner after a takeover can
+        no longer write.
+        """
+        self._lease_owner = owner_instance_id
+        self._lease_epoch = lease_epoch
+
+    def clear_lease_owner(self) -> None:
+        """Clear the lease-holder context (unleased / legacy path)."""
+        self._lease_owner = None
+        self._lease_epoch = None
+
+    def _enforce_lease_fence(self, job: dict) -> None:
+        """Fence a mutating commit to the job's current lease holder (B1).
+
+        No-op when the job is unleased (``owner_instance_id IS NULL``) so the
+        legacy single-supervisor flow is unaffected.  For a leased job the
+        caller MUST hold the exact (owner, epoch) and the lease must not be
+        expired; otherwise :class:`LeaseFencedError` is raised before anything
+        is written.
+
+        F5: a leased job with ``lease_expires_at IS NULL`` is fenced fail-closed
+        (consistent with ``assert_lease_current``).  After F3 there are no NEW
+        unleased RUNNING jobs (``create_job`` starts QUEUED and only ``claim``
+        produces RUNNING), so the unleased no-op here is a legacy path only.
+        """
+        owner = job.get("owner_instance_id")
+        if owner is None:
+            return
+        if self._lease_owner != owner or self._lease_epoch != job["lease_epoch"]:
+            raise LeaseFencedError(
+                f"lease fence: holder ({self._lease_owner!r}, {self._lease_epoch}) "
+                f"is not current for job {job['id']!r} "
+                f"(current {owner!r}, epoch {job['lease_epoch']})"
+            )
+        expires = job.get("lease_expires_at")
+        if expires is None or _parse_iso(expires) <= self._now().timestamp():
+            raise LeaseFencedError(f"lease expired for job {job['id']!r}")
+
+    def _recheck_lease_fence(self, job_id: str) -> None:
+        """F1: re-assert the lease fence IMMEDIATELY before an external effect.
+
+        Action handlers re-read the job and re-run :meth:`_enforce_lease_fence`
+        right before a broker call / dispatch spawn, closing the TOCTOU window
+        between the top-of-action fence check and the external side effect.  For
+        an unleased legacy job this is a no-op (owner NULL).
+        """
+        job = self.core._store.get_supervisor_job(job_id)
+        if job is not None:
+            self._enforce_lease_fence(job)
 
     def _build_lookup(self, d: AgentDispatch) -> RunLookup:
         return RunLookup(
@@ -1553,6 +1698,14 @@ class Supervisor:
             current_job = self.core._store.get_supervisor_job(job_id)
             if current_job is None:
                 raise NotFound(f"supervisor job {job_id!r} not found")
+            # B1 fencing: a leased job may only be mutated by its current lease
+            # holder.  Fails closed BEFORE any write for a stale owner.
+            self._enforce_lease_fence(current_job)
+            # F1: carry the fencing token into the authored decision so the
+            # action executor can re-check it immediately before any external
+            # effect (broker/spawn).
+            fence_owner = current_job.get("owner_instance_id")
+            fence_epoch = current_job["lease_epoch"]
             if current_job["facts_version"] != snap.job["facts_version"]:
                 return _RETRY
             # F6: re-read EVERY decision-relevant fact under BEGIN IMMEDIATE
@@ -1624,6 +1777,8 @@ class Supervisor:
             reason=plan.reason,
             dispatch_id=plan.dispatch_id,
             wake_at=plan.wake_at,
+            owner_instance_id=fence_owner,
+            lease_epoch=fence_epoch if fence_owner is not None else None,
         )
 
     def _backoff_decision(self, job_id) -> ReconcileDecision:
@@ -1632,6 +1787,9 @@ class Supervisor:
             job = self.core._store.get_supervisor_job(job_id)
             if job is None:
                 raise NotFound(f"supervisor job {job_id!r} not found")
+            # F1: a backoff write is still an authoritative write-commit; fence
+            # a leased job to its current holder before mutating.
+            self._enforce_lease_fence(job)
             retry = job["retry_count"]
             wake = _iso(now + timedelta(seconds=backoff_seconds(retry)))
             self.core._store._update_supervisor_job(
@@ -1647,6 +1805,8 @@ class Supervisor:
             job_id=job_id, facts_version=version,
             action=ReconcileAction.WAIT, reason="snapshot_contention",
             wake_at=wake,
+            owner_instance_id=job.get("owner_instance_id"),
+            lease_epoch=job["lease_epoch"] if job.get("owner_instance_id") is not None else None,
         )
 
     # ------------------------------------------------------------ projection
@@ -1802,7 +1962,7 @@ class Supervisor:
         job = snap.job
         if obs is None:
             return _Plan(ReconcileAction.WAIT, "no_observation",
-                         status=SupervisorJobStatus.WAITING_RUN.value,
+                         status=SupervisorJobStatus.ACTIVE.value,
                          wake_at=_iso(self._now() + timedelta(seconds=RUNNING_POLL_SECONDS)))
 
         if obs.status in (RunStatus.RUNNING, RunStatus.SUCCEEDED,
@@ -1813,7 +1973,7 @@ class Supervisor:
                 # tight-loop on BIND_RUN (real-E2E finding).
                 return _Plan(ReconcileAction.WAIT, "run_active_no_binding_values",
                              dispatch_id=ad.id,
-                             status=SupervisorJobStatus.WAITING_RUN.value,
+                             status=SupervisorJobStatus.ACTIVE.value,
                              recovery_state=RecoveryState.DISCOVERING_RUN.value,
                              wake_at=_iso(self._now() + timedelta(seconds=RUNNING_POLL_SECONDS)))
             # NOTE: retry_count is deliberately NOT reset here.  A structural
@@ -1857,7 +2017,7 @@ class Supervisor:
                              recovery_state=RecoveryState.AMBIGUOUS_WRITER.value if _is_implementer(role) else None)
             return _Plan(ReconcileAction.WAIT, "spawn_pending",
                          dispatch_id=ad.id,
-                         status=SupervisorJobStatus.WAITING_RUN.value,
+                         status=SupervisorJobStatus.ACTIVE.value,
                          recovery_state=RecoveryState.DISCOVERING_RUN.value,
                          missing_confirmations=missing,
                          retry_count=retry,
@@ -1870,13 +2030,13 @@ class Supervisor:
         job = snap.job
         if obs is None:
             return _Plan(ReconcileAction.WAIT, "no_observation",
-                         status=SupervisorJobStatus.WAITING_RUN.value,
+                         status=SupervisorJobStatus.ACTIVE.value,
                          wake_at=_iso(self._now() + timedelta(seconds=RUNNING_POLL_SECONDS)))
 
         if obs.status is RunStatus.RUNNING:
             return _Plan(ReconcileAction.WAIT, "run_running",
                          dispatch_id=ad.id,
-                         status=SupervisorJobStatus.WAITING_RUN.value,
+                         status=SupervisorJobStatus.ACTIVE.value,
                          wake_at=_iso(self._now() + timedelta(seconds=RUNNING_POLL_SECONDS)),
                          retry_count=0)
 
@@ -1915,7 +2075,7 @@ class Supervisor:
                              recovery_state=RecoveryState.CORE_RECOVERY_REQUIRED.value)
             return _Plan(ReconcileAction.WAIT, "bound_run_missing",
                          dispatch_id=ad.id,
-                         status=SupervisorJobStatus.WAITING_RUN.value,
+                         status=SupervisorJobStatus.ACTIVE.value,
                          recovery_state=RecoveryState.DISCOVERING_RUN.value,
                          missing_confirmations=missing,
                          retry_count=retry,
@@ -2052,7 +2212,7 @@ class Supervisor:
         retry = job["retry_count"] + 1
         return _Plan(ReconcileAction.WAIT, reason,
                      dispatch_id=ad.id,
-                     status=SupervisorJobStatus.WAITING_RUN.value,
+                     status=SupervisorJobStatus.ACTIVE.value,
                      recovery_state=recovery_state,
                      missing_confirmations=missing,
                      retry_count=retry,
@@ -2219,10 +2379,22 @@ class Supervisor:
         if decision.action in (ReconcileAction.NONE, ReconcileAction.WAIT):
             return ActionOutcome(decision.action.value, "noop")
 
-        # Stale decision guard (§8.1).
         job = self.core._store.get_supervisor_job(decision.job_id)
         if job is None:
             return ActionOutcome(decision.action.value, "skipped", "job_missing")
+
+        # F1: fencing check FIRST — a decision authored under a lease may only
+        # be executed while that exact (owner, epoch) is still the current,
+        # unexpired holder.  A stale owner after a takeover raises
+        # ``LeaseFencedError`` and writes NOTHING.  This runs before the stale
+        # facts_version guard so a fenced decision surfaces as a fence failure
+        # (not a silent skip).  Unleased legacy decisions skip this (owner None).
+        if decision.owner_instance_id is not None:
+            self.store.assert_lease_current(
+                decision.job_id, decision.owner_instance_id, decision.lease_epoch
+            )
+
+        # Stale decision guard (§8.1).
         if job["facts_version"] != decision.facts_version:
             return ActionOutcome(decision.action.value, "skipped", "stale_decision")
 
@@ -2277,6 +2449,9 @@ class Supervisor:
             cur = self.core._store.get_supervisor_job(job_id)
             if cur is None or cur["terminal"] is not None:
                 return
+            # F1: a sticky-ERROR write is an authoritative commit; fence a
+            # leased job to its current holder before mutating.
+            self._enforce_lease_fence(cur)
             self.core._store._update_supervisor_job(
                 job_id,
                 status=SupervisorJobStatus.ERROR.value,
@@ -2309,6 +2484,8 @@ class Supervisor:
             job = self.core._store.get_supervisor_job(job_id)
             if job is None:
                 raise NotFound(f"supervisor job {job_id!r} not found")
+            # F1: fence a leased job to its current holder before mutating.
+            self._enforce_lease_fence(job)
             retry = job["retry_count"] + 1
             if retry >= MAX_RUNTIME_UNKNOWN:
                 self.core._store._update_supervisor_job(
@@ -2361,6 +2538,8 @@ class Supervisor:
             job = self.core._store.get_supervisor_job(job_id)
             if job is None:
                 return
+            # F1: fence a leased job to its current holder before mutating.
+            self._enforce_lease_fence(job)
             retry = job["retry_count"] + 1
             if retry >= MAX_RUNTIME_UNKNOWN:
                 self.core._store._update_supervisor_job(
@@ -2751,6 +2930,9 @@ class Supervisor:
         # Build the prompt message file (task contract + context).
         try:
             message_file = self._build_message_file(d)
+            # F1: re-assert the lease fence IMMEDIATELY before the external
+            # spawn effect (a stale holder must never launch an agent).
+            self._recheck_lease_fence(job["id"])
             self._launcher.spawn(
                 agent_id=AGENT_IDS[d.role], dispatch_id=dispatch_id,
                 message_file=message_file, timeout_seconds=AGENT_TIMEOUT_SECONDS,
@@ -3030,6 +3212,10 @@ class Supervisor:
                                  "workspace_identity_mismatch",
                                  dispatch_id=dispatch_id)
         broker = self._broker_factory()
+        # F1: re-assert the lease fence IMMEDIATELY before the external
+        # workspace/broker effect (a stale holder must never write the
+        # workspace).
+        self._recheck_lease_fence(job["id"])
         res = broker.apply_patch_set(
             self._workspace_root, patch_set, d.role, self.controller_source)
         if res.errors:
@@ -3589,6 +3775,12 @@ class SupervisorLoop:
     def __init__(
         self, supervisor: Supervisor, waiter: Optional[Waiter] = None,
         stop_event=None, notification_delivery=None,
+        # B1 (F3): optional durable-queue lease identity.  When set, the loop
+        # CLAIMS a claimable job before reconciling it, so RUNNING is only ever
+        # entered with a valid lease.  ``None`` preserves the legacy unleased
+        # single-supervisor path.
+        owner_instance_id: Optional[str] = None,
+        lease_ttl_seconds: int = 60,
     ):
         self.supervisor = supervisor
         self.waiter = waiter or Waiter(clock=supervisor._clock)
@@ -3596,6 +3788,36 @@ class SupervisorLoop:
         # Optional non-blocking delivery kick target (SPEC V3A §3.5).  None
         # (default) makes kick a no-op so existing callers are unaffected.
         self._notification_delivery = notification_delivery
+        self._owner_instance_id = owner_instance_id
+        self._lease_ttl_seconds = lease_ttl_seconds
+
+    def _acquire_loop_lease(self, job_id: str) -> None:
+        """F3: claim a claimable job before working it (durable queue).
+
+        Only active when ``owner_instance_id`` was configured.  A QUEUED job is
+        claimed (QUEUED→RUNNING + lease); a RUNNING job we already hold merely
+        re-establishes the in-memory lease context (restart-safe).  A foreign
+        active lease or a terminal job is left untouched (the reconcile fence
+        fails closed for a non-holder).
+        """
+        if self._owner_instance_id is None:
+            return
+        job = self.supervisor.store._job_row(job_id)
+        if job is None:
+            return
+        ps = job.get("primary_state")
+        owner = job.get("owner_instance_id")
+        if ps == job_state.PrimaryState.QUEUED.value:
+            row = self.supervisor.store.claim_job(
+                job_id, owner_instance_id=self._owner_instance_id,
+                ttl_seconds=self._lease_ttl_seconds,
+            )
+            self.supervisor.set_lease_owner(self._owner_instance_id, row["lease_epoch"])
+        elif ps == job_state.PrimaryState.RUNNING.value and \
+                owner == self._owner_instance_id:
+            self.supervisor.set_lease_owner(
+                self._owner_instance_id, job["lease_epoch"]
+            )
 
     def _kick_delivery(self) -> None:
         # Amendment 4: the kick is internally catch-all and must never
@@ -3608,6 +3830,9 @@ class SupervisorLoop:
             pass
 
     def run_once(self, job_id: str) -> ReconcileDecision:
+        # F3: when this loop owns leases, claim the job before reconciling it
+        # (RUNNING is only ever entered with a valid lease).
+        self._acquire_loop_lease(job_id)
         # F3: loop-level containment — a structural adapter exception escaping
         # reconcile()/perform_next_safe_action_if_required() must never kill
         # the loop.  Convert it to a structured decision and let the existing

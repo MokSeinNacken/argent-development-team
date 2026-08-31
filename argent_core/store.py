@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator, Optional
 
 from . import events as events_mod
+from . import job_state
 from .gates import binding_hash
 from .models import (
     ActionExecution,
@@ -39,6 +40,9 @@ from .models import (
     Finding,
     FindingStatus,
     Handoff,
+    LeaseError,
+    LeaseFencedError,
+    NotFound,
     OwnerApproval,
     Project,
     RiskClass,
@@ -55,7 +59,8 @@ from .models import (
     TestRun,
 )
 
-SCHEMA_VERSION = "6"
+# B1 (Phase B): durable queue / lease schema version bump.
+SCHEMA_VERSION = "7"
 
 _TASK_STATES = "', '".join(s.value for s in TaskState)
 _TASK_RUN_STATUSES = "', '".join(s.value for s in TaskRunStatus)
@@ -68,6 +73,36 @@ _RISK_CLASSES = "', '".join(r.value for r in RiskClass)
 _EXT_ACTION_POLICIES = "', '".join(p.value for p in ExternalActionsPolicy)
 _DISPATCH_STATUSES = "', '".join(s.value for s in DispatchStatus)
 _SEQUENCE_KINDS = "', '".join(k.value for k in SequenceKind)
+_PRIMARY_STATES = "', '".join(job_state.PRIMARY_STATE_VALUES)
+
+# B1 (F7): upper policy bound for any lease TTL (caller-supplied local policy).
+# Values above this are rejected fail-closed so a misconfigured controller can
+# never mint a near-infinite lease.
+MAX_LEASE_TTL_SECONDS = 86400  # 24h
+
+# B1 (F6): the orthogonal enum columns that must be value-validated on every
+# write path (enqueue/claim/update).  ``None`` values (nullable paths) skip.
+_ENUM_FIELDS: dict[str, type] = {
+    "queue_reason": job_state.QueueReason,
+    "wait_kind": job_state.WaitKind,
+    "error_class": job_state.ErrorClass,
+}
+
+
+def _validate_enum_fields(fields: dict) -> None:
+    """Reject invalid values for the orthogonal B1 enum columns (F6).
+
+    Raises :class:`ValueError` on any value not present in the matching enum;
+    ``None`` values are skipped (nullable call sites).
+    """
+    for key, enum_cls in _ENUM_FIELDS.items():
+        if key in fields and fields[key] is not None:
+            valid = {m.value for m in enum_cls}
+            if fields[key] not in valid:
+                raise ValueError(
+                    f"invalid {key} {fields[key]!r}; expected one of "
+                    f"{sorted(valid)}"
+                )
 
 _SCHEMA: tuple[str, ...] = (
     """
@@ -305,7 +340,7 @@ _SCHEMA: tuple[str, ...] = (
         created_at         TEXT NOT NULL
     )
     """,
-    """
+    f"""
     CREATE TABLE IF NOT EXISTS supervisor_jobs (
         id                    TEXT PRIMARY KEY,
         task_id               TEXT NOT NULL
@@ -344,6 +379,16 @@ _SCHEMA: tuple[str, ...] = (
         terminal              TEXT CHECK (terminal IS NULL OR terminal IN
                               ('DONE','FAILED','BLOCKED')),
         facts_version         INTEGER NOT NULL DEFAULT 0 CHECK (facts_version >= 0),
+        primary_state         TEXT NOT NULL DEFAULT 'QUEUED' CHECK (primary_state IN
+                              ('{_PRIMARY_STATES}')),
+        queue_reason          TEXT NOT NULL DEFAULT 'NEW',
+        priority              INTEGER NOT NULL DEFAULT 0,
+        owner_instance_id     TEXT,
+        lease_epoch           INTEGER NOT NULL DEFAULT 0 CHECK (lease_epoch >= 0),
+        lease_expires_at      TEXT,
+        next_eligible_at      TEXT,
+        error_class           TEXT NOT NULL DEFAULT 'NONE',
+        wait_kind             TEXT NOT NULL DEFAULT 'NONE',
         created_at            TEXT NOT NULL,
         updated_at            TEXT NOT NULL,
         CHECK ((terminal IS NULL) OR (status = 'TERMINAL' AND next_action = 'NONE'))
@@ -760,6 +805,81 @@ class Store:
             self._conn.execute(
                 "ALTER TABLE supervisor_actions ADD COLUMN patch_set_json TEXT"
             )
+
+        # --- B1 (Phase B): durable queue + job lease (additive) ------------
+        # Lease fields live DIRECTLY on the job (§6/§19): no ``job_leases``
+        # table.  ``primary_state`` is the 8-state operational projection; the
+        # V2C ``status`` column is kept as a backwards-compatible projection.
+        # Additive columns only; fresh CREATE TABLE already carries them.
+        sjcols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(supervisor_jobs)")
+        }
+        _sj_b1_add = (
+            ("primary_state",
+             f"ALTER TABLE supervisor_jobs ADD COLUMN primary_state TEXT NOT NULL "
+             f"DEFAULT 'QUEUED' CHECK (primary_state IN ('{_PRIMARY_STATES}'))"),
+            ("queue_reason",
+             "ALTER TABLE supervisor_jobs ADD COLUMN queue_reason TEXT NOT NULL "
+             "DEFAULT 'NEW'"),
+            ("priority",
+             "ALTER TABLE supervisor_jobs ADD COLUMN priority INTEGER NOT NULL "
+             "DEFAULT 0"),
+            ("owner_instance_id",
+             "ALTER TABLE supervisor_jobs ADD COLUMN owner_instance_id TEXT"),
+            ("lease_epoch",
+             "ALTER TABLE supervisor_jobs ADD COLUMN lease_epoch INTEGER NOT NULL "
+             "DEFAULT 0 CHECK (lease_epoch >= 0)"),
+            ("lease_expires_at",
+             "ALTER TABLE supervisor_jobs ADD COLUMN lease_expires_at TEXT"),
+            ("next_eligible_at",
+             "ALTER TABLE supervisor_jobs ADD COLUMN next_eligible_at TEXT"),
+            ("error_class",
+             "ALTER TABLE supervisor_jobs ADD COLUMN error_class TEXT NOT NULL "
+             "DEFAULT 'NONE'"),
+            ("wait_kind",
+             "ALTER TABLE supervisor_jobs ADD COLUMN wait_kind TEXT NOT NULL "
+             "DEFAULT 'NONE'"),
+        )
+        b1_added = False
+        for col, ddl in _sj_b1_add:
+            if col not in sjcols:
+                self._conn.execute(ddl)
+                b1_added = True
+
+        # Backfill ``primary_state`` for pre-existing rows from the projection
+        # fields (terminal is the sticky-terminal authority).  This runs ONLY
+        # during the actual B1 migration (``b1_added``), never on every open, so
+        # it cannot clobber the runtime primary_state that claim/release/enqueue
+        # set (idempotent-reopen safety).
+        # F3: a legacy ``ACTIVE`` row (pre-B1) has NO lease, so it must NOT be
+        # projected to ``RUNNING`` (which would be a lease-less RUNNING that is
+        # un-claimable under the fail-closed takeover rule).  Bootstrap it as
+        # ``QUEUED``/``WAITING_RUN`` so it re-enters the queue and is claimed
+        # normally.
+        if b1_added:
+            sjrows = self._conn.execute(
+                "SELECT id, status, terminal, recovery_state, wait_kind, "
+                "queue_reason FROM supervisor_jobs"
+            ).fetchall()
+            for r in sjrows:
+                if r["status"] == "ACTIVE" and r["terminal"] is None:
+                    self._conn.execute(
+                        "UPDATE supervisor_jobs SET primary_state = ?, "
+                        "status = ? WHERE id = ?",
+                        (job_state.PrimaryState.QUEUED.value, "WAITING_RUN", r["id"]),
+                    )
+                else:
+                    ps = job_state.derive_primary_state(
+                        r["status"],
+                        terminal=r["terminal"],
+                        recovery_state=r["recovery_state"],
+                        wait_kind=r["wait_kind"],
+                        queue_reason=r["queue_reason"],
+                    ).value
+                    self._conn.execute(
+                        "UPDATE supervisor_jobs SET primary_state = ? WHERE id = ?",
+                        (ps, r["id"]),
+                    )
 
         # UPSERT the schema version after successful DDL + migration.
         self._conn.execute(
@@ -1914,6 +2034,9 @@ class Store:
             "retry_count", "missing_confirmations", "last_error_code",
             "last_progress_at", "terminal", "facts_version", "created_at",
             "updated_at",
+            "primary_state", "queue_reason", "priority",
+            "owner_instance_id", "lease_epoch", "lease_expires_at",
+            "next_eligible_at", "error_class", "wait_kind",
         }
     )
 
@@ -1966,12 +2089,578 @@ class Store:
             raise ValueError(f"unknown supervisor_jobs columns: {sorted(unknown)}")
         if not fields:
             return 0
+        # F6: validate the orthogonal B1 enum columns on every write path.
+        _validate_enum_fields(fields)
+        # B1: keep ``primary_state`` in sync with the projection fields it is
+        # derived from, unless the caller sets it explicitly (the queue/lease
+        # primitives set it directly and skip this derivation).
+        if "primary_state" not in fields:
+            derived = self._derive_primary_state_for_update(job_id, fields)
+            if derived is not None:
+                fields = dict(fields)
+                fields["primary_state"] = derived
+        # F6: terminal stickiness — a sticky DONE/FAILED/BLOCKED row may not be
+        # reopened by clearing its terminal or moving primary_state off the
+        # terminal set.  Metadata-only updates that keep the terminal value
+        # (and therefore the terminal primary_state) are still allowed.
+        cur = self.get_supervisor_job(job_id)
+        if cur is not None and cur.get("terminal") in ("DONE", "FAILED", "BLOCKED"):
+            new_terminal = fields.get("terminal", cur["terminal"])
+            new_ps = fields.get("primary_state", cur["primary_state"])
+            if new_terminal is None or new_ps not in ("DONE", "FAILED", "BLOCKED"):
+                raise LeaseError(
+                    f"terminal job {job_id!r} is sticky and cannot be reopened"
+                )
         assignments = ", ".join(f"{c} = ?" for c in fields)
         cur = self._conn.execute(
             f"UPDATE supervisor_jobs SET {assignments} WHERE id = ?",
             list(fields.values()) + [job_id],
         )
         return cur.rowcount
+
+    def _derive_primary_state_for_update(
+        self, job_id: str, fields: dict
+    ) -> Optional[str]:
+        """Derive ``primary_state`` when a projection field is being changed.
+
+        Returns ``None`` when none of the projection inputs (status, terminal,
+        recovery_state, wait_kind, queue_reason) is present in ``fields``, so
+        the update proceeds unchanged.
+        """
+        proj = ("status", "terminal", "recovery_state", "wait_kind", "queue_reason")
+        if not any(k in fields for k in proj):
+            return None
+        cur = self.get_supervisor_job(job_id)
+        if cur is None:
+            return None
+        status = fields.get("status", cur["status"])
+        terminal = fields.get("terminal", cur.get("terminal"))
+        recovery_state = fields.get("recovery_state", cur.get("recovery_state"))
+        wait_kind = fields.get("wait_kind", cur.get("wait_kind", "NONE"))
+        queue_reason = fields.get("queue_reason", cur.get("queue_reason", "NEW"))
+        return job_state.derive_primary_state(
+            status,
+            terminal=terminal,
+            recovery_state=recovery_state,
+            wait_kind=wait_kind,
+            queue_reason=queue_reason,
+        ).value
+
+    # -- B1 durable queue / lease primitives (central, atomic, CAS) --------
+    #
+    # All lease operations run inside a single ``BEGIN IMMEDIATE`` transaction
+    # so exactly one writer wins any claim.  ``lease_epoch`` is a monotonic
+    # fencing token; ``lease_expires_at`` is the ONLY authority for expiry.
+    # TTL is always caller-supplied local policy -- never agent output.
+
+    @staticmethod
+    def _validate_lease_owner(owner_instance_id: str) -> None:
+        """F7: ``owner_instance_id`` must be a non-empty string."""
+        if owner_instance_id is None or not str(owner_instance_id).strip():
+            raise ValueError("owner_instance_id must be a non-empty string")
+
+    @staticmethod
+    def _validate_ttl(ttl_seconds: int) -> None:
+        """F7: ``ttl_seconds`` must be > 0 and policy-bounded."""
+        if ttl_seconds is None or not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be a positive integer")
+        if ttl_seconds > MAX_LEASE_TTL_SECONDS:
+            raise ValueError(
+                f"ttl_seconds {ttl_seconds} exceeds MAX_LEASE_TTL_SECONDS "
+                f"({MAX_LEASE_TTL_SECONDS})"
+            )
+
+    #: status projections that are legal for each primary state (F6
+    #: cross-consistency).  ``BACKOFF`` and ``WAITING_RUN`` both project to
+    #: ``QUEUED`` (RETRY_BACKOFF keeps the V2C ``BACKOFF`` spelling).
+    _PRIMARY_STATE_STATUSES: dict[str, frozenset] = {
+        job_state.PrimaryState.QUEUED.value: frozenset({"WAITING_RUN", "BACKOFF"}),
+        job_state.PrimaryState.RUNNING.value: frozenset({"ACTIVE"}),
+        job_state.PrimaryState.WAITING_EXTERNAL.value: frozenset({"WAITING_RUN"}),
+        job_state.PrimaryState.OWNER_GATE.value: frozenset({"WAITING_GATE"}),
+        job_state.PrimaryState.LOST.value: frozenset({"RECOVERING"}),
+        job_state.PrimaryState.BLOCKED.value: frozenset({"TERMINAL"}),
+        job_state.PrimaryState.FAILED.value: frozenset({"TERMINAL"}),
+        job_state.PrimaryState.DONE.value: frozenset({"TERMINAL"}),
+    }
+
+    def _transition_job(
+        self,
+        job_id: str,
+        *,
+        to_primary_state: str,
+        to_status: str,
+        fields: Optional[dict] = None,
+        owner_authorized: bool = False,
+        bump_facts_version: bool = False,
+        cas_primary_state: Optional[str] = None,
+        cas_owner_instance_id: Optional[str] = None,
+        cas_lease_epoch: Optional[int] = None,
+        cas_lease_unexpired: bool = False,
+        now_iso: Optional[str] = None,
+    ) -> dict:
+        """Central primary-state transition primitive (F6).
+
+        The single place where the queue/lease layer changes ``primary_state``
+        + its V2C ``status`` projection.  Runs inside the caller's transaction
+        and enforces, in order:
+
+        1. enum validation of ``queue_reason``/``wait_kind``/``error_class``;
+        2. terminal stickiness (DONE/FAILED never reopen; BLOCKED only with
+           ``owner_authorized=True``);
+        3. optional CAS preconditions (primary_state / owner / epoch / lease);
+        4. cross-consistency: ``to_status`` must project back to
+           ``to_primary_state`` (no drift);
+        5. atomic write with a rowcount==1 check (F7).
+
+        Returns the updated row.
+        """
+        now_iso = now_iso or self.now_iso()
+        fields = dict(fields or {})
+        _validate_enum_fields(fields)
+
+        row = self._conn.execute(
+            "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"supervisor job {job_id!r} not found")
+        job = dict(row)
+
+        # -- terminal stickiness (F6) -------------------------------------
+        terminal = job.get("terminal")
+        cur_ps = job.get("primary_state")
+        if terminal in ("DONE", "FAILED"):
+            raise LeaseError(
+                f"terminal job {job_id!r} is sticky ({terminal}) and cannot "
+                f"transition"
+            )
+        if terminal == "BLOCKED" or cur_ps == job_state.PrimaryState.BLOCKED.value:
+            if not owner_authorized:
+                raise LeaseError(
+                    f"blocked job {job_id!r} requires owner authorization to reopen"
+                )
+
+        # -- CAS preconditions (F7) ---------------------------------------
+        if cas_primary_state is not None and cur_ps != cas_primary_state:
+            raise LeaseError(
+                f"primary_state CAS mismatch for job {job_id!r} "
+                f"(expected {cas_primary_state!r}, got {cur_ps!r})"
+            )
+        if cas_owner_instance_id is not None and \
+                job.get("owner_instance_id") != cas_owner_instance_id:
+            raise LeaseError(f"owner CAS mismatch for job {job_id!r}")
+        if cas_lease_epoch is not None and job.get("lease_epoch") != cas_lease_epoch:
+            raise LeaseError(f"lease_epoch CAS mismatch for job {job_id!r}")
+        if cas_lease_unexpired:
+            expires = job.get("lease_expires_at")
+            if expires is None or expires <= now_iso:
+                raise LeaseError(f"lease expired for job {job_id!r}")
+
+        # -- cross-consistency (F6) ---------------------------------------
+        allowed = self._PRIMARY_STATE_STATUSES.get(to_primary_state)
+        if allowed is None:
+            raise ValueError(f"unknown primary_state {to_primary_state!r}")
+        if to_status not in allowed:
+            raise ValueError(
+                f"status {to_status!r} does not project to primary_state "
+                f"{to_primary_state!r}"
+            )
+
+        # -- write --------------------------------------------------------
+        updates = dict(fields)
+        updates["primary_state"] = to_primary_state
+        updates["status"] = to_status
+        if bump_facts_version:
+            updates["facts_version"] = job["facts_version"] + 1
+        updates["updated_at"] = now_iso
+        assignments = ", ".join(f"{c} = ?" for c in updates)
+        cur = self._conn.execute(
+            f"UPDATE supervisor_jobs SET {assignments} WHERE id = ?",
+            list(updates.values()) + [job_id],
+        )
+        if cur.rowcount != 1:
+            raise LeaseError(f"transition CAS lost for job {job_id!r}")
+        updated = self._conn.execute(
+            "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        return dict(updated)
+
+    @staticmethod
+    def _job_is_claimable(job: dict, now_iso: str) -> tuple[bool, Optional[str]]:
+        """Predicate deciding whether a job can be claimed (or taken over).
+
+        Returns ``(claimable, reason)``.  Rules (Phase B1):
+
+        * ``QUEUED``: claimable iff ``next_eligible_at`` is NULL or in the past
+          AND no still-valid foreign lease is held.
+        * ``RUNNING``: claimable ONLY as safe takeover when its lease has a
+          CONCRETE, expired ``lease_expires_at`` (F3: a NULL expiry is never
+          treated as "safely expired" — fail-closed, no takeover).
+        * ``DONE``/``FAILED``: never (sticky terminal).
+        * ``BLOCKED``: never via normal claim (only an explicit owner/policy
+          requeue may reopen it -- no automatic path in B1).
+        * ``LOST``: never treated like QUEUED (recovery path only).
+        * ``WAITING_EXTERNAL``/``OWNER_GATE``: never via normal claim.
+        """
+        ps = job.get("primary_state")
+        expires = job.get("lease_expires_at")
+        if ps == job_state.PrimaryState.QUEUED.value:
+            eligible = job.get("next_eligible_at")
+            if eligible is not None and eligible > now_iso:
+                return False, "not_eligible_yet"
+            if (
+                job.get("owner_instance_id") is not None
+                and expires is not None
+                and expires > now_iso
+            ):
+                return False, "foreign_lease"
+            return True, None
+        if ps == job_state.PrimaryState.RUNNING.value:
+            # F3: takeover is only safe when there is a concrete expiry that
+            # has actually lapsed.  A RUNNING row with ``lease_expires_at IS
+            # NULL`` is a legacy/unleased row and must NEVER be claimed as a
+            # "safe takeover" (no expiry evidence -> fail-closed).
+            if expires is None:
+                return False, "running_no_lease"
+            if expires > now_iso:
+                return False, "lease_active"
+            return True, None
+        return False, f"not_claimable:{ps}"
+
+    def _do_claim_locked(
+        self,
+        job_id: str,
+        *,
+        owner_instance_id: str,
+        ttl_seconds: int,
+        now: datetime,
+    ) -> dict:
+        """Claim a job, assuming the caller already holds ``BEGIN IMMEDIATE``.
+
+        Shared by :meth:`claim_job` and :meth:`claim_next_job` (which iterates
+        candidates inside a single transaction).  Returns the updated row or
+        raises :class:`LeaseError` / :class:`NotFound`.
+        """
+        now_iso = _format_dt(now)
+        self._validate_lease_owner(owner_instance_id)
+        self._validate_ttl(ttl_seconds)
+        row = self._conn.execute(
+            "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"supervisor job {job_id!r} not found")
+        job = dict(row)
+        claimable, reason = self._job_is_claimable(job, now_iso)
+        if not claimable:
+            raise LeaseError(f"job {job_id!r} is not claimable: {reason}")
+        new_epoch = job["lease_epoch"] + 1
+        new_expires = _format_dt(now + timedelta(seconds=ttl_seconds))
+        # F1: a claim invalidates any previously-authored decisions/contexts by
+        # bumping ``facts_version``; F6/F7: the transition runs through the
+        # central primitive with a primary_state + lease_epoch CAS.
+        return self._transition_job(
+            job_id,
+            to_primary_state=job_state.PrimaryState.RUNNING.value,
+            to_status="ACTIVE",
+            fields={
+                "owner_instance_id": owner_instance_id,
+                "lease_epoch": new_epoch,
+                "lease_expires_at": new_expires,
+            },
+            bump_facts_version=True,
+            cas_primary_state=job["primary_state"],
+            cas_lease_epoch=job["lease_epoch"],
+            now_iso=now_iso,
+        )
+
+    def claim_job(
+        self, job_id: str, *, owner_instance_id: str, ttl_seconds: int
+    ) -> dict:
+        """Atomically claim a claimable job for ``owner_instance_id``.
+
+        Sets ``primary_state=RUNNING`` / ``status=ACTIVE``, bumps
+        ``lease_epoch`` monotonically and sets ``lease_expires_at = now + ttl``.
+        Raises :class:`LeaseError` when not claimable; returns the updated row.
+        """
+        now = self._clock()
+        with self._transaction():
+            return self._do_claim_locked(
+                job_id,
+                owner_instance_id=owner_instance_id,
+                ttl_seconds=ttl_seconds,
+                now=now,
+            )
+
+    def claim_next_job(
+        self, *, owner_instance_id: str, ttl_seconds: int
+    ) -> Optional[dict]:
+        """Claim the next eligible job: highest ``priority`` first, then FIFO
+        (``rowid``).  Returns the claimed row or ``None`` if nothing is
+        claimable.  Exactly one caller wins any given job.
+        """
+        now = self._clock()
+        now_iso = _format_dt(now)
+        with self._transaction():
+            rows = self._conn.execute(
+                "SELECT * FROM supervisor_jobs ORDER BY priority DESC, rowid"
+            ).fetchall()
+            for row in rows:
+                job = dict(row)
+                claimable, _reason = self._job_is_claimable(job, now_iso)
+                if not claimable:
+                    continue
+                return self._do_claim_locked(
+                    job["id"],
+                    owner_instance_id=owner_instance_id,
+                    ttl_seconds=ttl_seconds,
+                    now=now,
+                )
+            return None
+
+    def renew_lease(
+        self,
+        job_id: str,
+        *,
+        owner_instance_id: str,
+        lease_epoch: int,
+        ttl_seconds: int,
+    ) -> dict:
+        """Atomically renew a still-valid lease held by (owner, epoch).
+
+        Raises :class:`LeaseError` on owner/epoch mismatch or expiry (an
+        expired lease cannot be silently extended by a stale holder).
+        """
+        now = self._clock()
+        now_iso = _format_dt(now)
+        self._validate_lease_owner(owner_instance_id)
+        self._validate_ttl(ttl_seconds)
+        new_expires = _format_dt(now + timedelta(seconds=ttl_seconds))
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            job = dict(row)
+            if job["owner_instance_id"] != owner_instance_id:
+                raise LeaseError(f"renew owner mismatch for job {job_id!r}")
+            if job["lease_epoch"] != lease_epoch:
+                raise LeaseError(f"renew epoch mismatch for job {job_id!r}")
+            if job["lease_expires_at"] is None or job["lease_expires_at"] <= now_iso:
+                raise LeaseError(f"lease expired for job {job_id!r}")
+            # F7: CAS rowcount must be exactly 1 (no silent drift on a lost
+            # race); the WHERE clause also re-checks the unexpired lease.
+            cur = self._conn.execute(
+                "UPDATE supervisor_jobs SET lease_expires_at = ?, updated_at = ? "
+                "WHERE id = ? AND owner_instance_id = ? AND lease_epoch = ? "
+                "AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
+                (new_expires, now_iso, job_id, owner_instance_id, lease_epoch,
+                 now_iso),
+            )
+            if cur.rowcount != 1:
+                raise LeaseError(f"renew CAS lost for job {job_id!r}")
+            updated = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            return dict(updated)
+
+    def release_lease(
+        self, job_id: str, *, owner_instance_id: str, lease_epoch: int
+    ) -> dict:
+        """Release the lease back to the queue (``primary_state=QUEUED``).
+
+        Verifies ownership + epoch; clears ``owner_instance_id`` and
+        ``lease_expires_at`` (``lease_epoch`` stays monotonic).  Raises
+        :class:`LeaseError` on mismatch.
+        """
+        now = self._clock()
+        now_iso = _format_dt(now)
+        self._validate_lease_owner(owner_instance_id)
+        with self._transaction():
+            # F5: an expired lease may not be mutated by its (stale) holder.
+            # F6/F7: route through the central transition primitive with an
+            # owner+epoch+unexpired-lease CAS and a facts_version bump (F1).
+            return self._transition_job(
+                job_id,
+                to_primary_state=job_state.PrimaryState.QUEUED.value,
+                to_status="WAITING_RUN",
+                fields={
+                    "owner_instance_id": None,
+                    "lease_expires_at": None,
+                },
+                bump_facts_version=True,
+                cas_owner_instance_id=owner_instance_id,
+                cas_lease_epoch=lease_epoch,
+                cas_lease_unexpired=True,
+                now_iso=now_iso,
+            )
+
+    def lease_is_current(
+        self, job_id: str, owner_instance_id: str, lease_epoch: int
+    ) -> bool:
+        """True iff (owner, epoch) is the current, unexpired lease holder."""
+        now = self._clock()
+        now_iso = _format_dt(now)
+        row = self._conn.execute(
+            "SELECT owner_instance_id, lease_epoch, lease_expires_at "
+            "FROM supervisor_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["owner_instance_id"] != owner_instance_id:
+            return False
+        if row["lease_epoch"] != lease_epoch:
+            return False
+        expires = row["lease_expires_at"]
+        return expires is not None and expires > now_iso
+
+    def assert_lease_current(
+        self, job_id: str, owner_instance_id: str, lease_epoch: int
+    ) -> None:
+        """Central reusable fencing check (Phase B1).
+
+        Verifies ``job_id`` + ``owner_instance_id`` + ``lease_epoch`` +
+        ``lease_expires_at > now``.  Raises :class:`LeaseFencedError` on any
+        mismatch (stale owner after takeover, wrong epoch, or expired lease).
+        """
+        now = self._clock()
+        now_iso = _format_dt(now)
+        row = self._conn.execute(
+            "SELECT owner_instance_id, lease_epoch, lease_expires_at "
+            "FROM supervisor_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise LeaseFencedError(f"job {job_id!r} not found")
+        if row["owner_instance_id"] != owner_instance_id:
+            raise LeaseFencedError(
+                f"lease fence: {owner_instance_id!r} is not the current owner "
+                f"of job {job_id!r}"
+            )
+        if row["lease_epoch"] != lease_epoch:
+            raise LeaseFencedError(
+                f"lease fence: epoch {lease_epoch} is stale for job {job_id!r} "
+                f"(current {row['lease_epoch']})"
+            )
+        expires = row["lease_expires_at"]
+        if expires is None or expires <= now_iso:
+            raise LeaseFencedError(f"lease expired for job {job_id!r}")
+
+    def enqueue_job(
+        self,
+        job_id: str,
+        *,
+        queue_reason: str = "NEW",
+        priority: int = 0,
+        next_eligible_at: Optional[str] = None,
+        wait_kind: str = "NONE",
+        error_class: str = "NONE",
+        error_code: Optional[str] = None,
+        bump_attempt: bool = False,
+        # F2: authorization for holder-requeue / BLOCKED-reopen.
+        owner_instance_id: Optional[str] = None,
+        lease_epoch: Optional[int] = None,
+        owner_authorized: bool = False,
+        policy_ref: Optional[str] = None,
+    ) -> dict:
+        """(Re-)enqueue a job as ``QUEUED`` with queue/retry metadata (F2).
+
+        Three disjoint authorization paths (a foreign valid lease is NEVER
+        silently removed):
+
+        a) *Initial enqueue / lease-free QUEUED* — the job holds no lease and
+           is already QUEUED (new-creation bootstrap).  No ownership CAS.
+        b) *Holder retry / requeue from RUNNING* — requires the current,
+           unexpired ``(owner_instance_id, lease_epoch)`` as a CAS; a foreign or
+           expired lease is refused (:class:`LeaseError`).
+        c) *Authorized BLOCKED→QUEUED requeue* — requires ``owner_authorized=True``
+           AND a ``policy_ref`` (no automatic reopen).
+
+        DONE/FAILED (sticky terminal) are always refused as a domain error.
+        ``queue_reason=RETRY_BACKOFF`` projects to ``BACKOFF``; other reasons
+        to ``WAITING_RUN``.  ``error_code`` lands on ``last_error_code``.
+        """
+        now = self._clock()
+        now_iso = _format_dt(now)
+        status = job_state.status_for_enqueue(queue_reason)
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            job = dict(row)
+            ps = job.get("primary_state")
+            terminal = job.get("terminal")
+            # F2: DONE/FAILED are sticky domain errors (never requeue).
+            if terminal in ("DONE", "FAILED"):
+                raise LeaseError(
+                    f"terminal job {job_id!r} ({terminal}) cannot be requeued"
+                )
+            attempt_no = job["attempt_no"] + 1 if bump_attempt else job["attempt_no"]
+            common_fields = {
+                "queue_reason": queue_reason,
+                "priority": priority,
+                "next_eligible_at": next_eligible_at,
+                "wait_kind": wait_kind,
+                "error_class": error_class,
+                "last_error_code": error_code,
+                "attempt_no": attempt_no,
+                "owner_instance_id": None,
+                "lease_expires_at": None,
+            }
+            if owner_authorized:
+                # (c) authorized BLOCKED→QUEUED requeue.
+                if policy_ref is None:
+                    raise LeaseError(
+                        "owner_authorized requeue requires a policy_ref"
+                    )
+                # A reopened BLOCKED job must also clear its terminal marker so
+                # the supervisor no longer short-circuits on it.
+                reopen_fields = dict(common_fields, terminal=None)
+                return self._transition_job(
+                    job_id,
+                    to_primary_state=job_state.PrimaryState.QUEUED.value,
+                    to_status=status,
+                    fields=reopen_fields,
+                    owner_authorized=True,
+                    bump_facts_version=True,
+                    now_iso=now_iso,
+                )
+            if owner_instance_id is not None or lease_epoch is not None:
+                # (b) holder retry / requeue from RUNNING (CAS on owner+epoch).
+                self._validate_lease_owner(owner_instance_id)
+                return self._transition_job(
+                    job_id,
+                    to_primary_state=job_state.PrimaryState.QUEUED.value,
+                    to_status=status,
+                    fields=common_fields,
+                    bump_facts_version=True,
+                    cas_owner_instance_id=owner_instance_id,
+                    cas_lease_epoch=lease_epoch,
+                    cas_lease_unexpired=True,
+                    now_iso=now_iso,
+                )
+            # (a) initial enqueue / lease-free QUEUED job.
+            if job.get("owner_instance_id") is not None:
+                raise LeaseError(
+                    f"job {job_id!r} holds a lease; requeue requires the "
+                    f"holder (owner_instance_id, lease_epoch) CAS"
+                )
+            if ps != job_state.PrimaryState.QUEUED.value:
+                raise LeaseError(
+                    f"job {job_id!r} is {ps!r}; initial enqueue requires a "
+                    f"lease-free QUEUED job"
+                )
+            return self._transition_job(
+                job_id,
+                to_primary_state=job_state.PrimaryState.QUEUED.value,
+                to_status=status,
+                fields=common_fields,
+                bump_facts_version=True,
+                now_iso=now_iso,
+            )
 
     def get_supervisor_action(self, action_id: str) -> Optional[dict]:
         row = self._conn.execute(

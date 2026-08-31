@@ -520,7 +520,7 @@ def test_f8_realistic_v2_to_v3_migration(tmp_path):
     row = c._store._conn.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
-    assert row is not None and row["value"] == "6"
+    assert row is not None and row["value"] == "7"
     # Existing data intact.
     t = c.queries.get_task("t1")
     assert t.title == "x" and t.state is TaskState.NEW
