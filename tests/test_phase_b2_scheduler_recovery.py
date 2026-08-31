@@ -234,11 +234,14 @@ def test_expired_lease_is_taken_over_not_resurrected(db_path):
     jid = add_queued_job(env)
     env.sup.store.claim_job(jid, owner_instance_id="A", ttl_seconds=30)
     env.clock.advance(31)  # expired
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
-    r = sched.run_pass(jid)
-    assert r.outcome != OUTCOME_NO_WORK
-    row = job_row(env.core, jid)
-    assert row["lease_epoch"] == 2  # takeover -> new epoch, not the old lease
+    # F1: a RUNNING job is never re-claimed directly; the expired lease is
+    # taken over via the evidence-bound recovery path (epoch+1, never the old
+    # lease silently resurrected).
+    taken = env.sup.store.recover_takeover_job(
+        jid, expected=job_row(env.core, jid), owner_instance_id="A",
+        ttl_seconds=60, process_alive=False, worktree_verdict=None,
+    )
+    assert taken["lease_epoch"] == 2  # takeover -> new epoch, not the old lease
     # The stale epoch-1 holder is fenced.
     env.sup.set_lease_owner("A", 1)
     with pytest.raises(LeaseFencedError):
@@ -262,13 +265,15 @@ def test_takeover_a_then_b_then_stale_a_fenced(db_path):
 
     core2 = Core(db_path, clock=clock)
     sup2 = Supervisor(core2, FakeRunStatusProvider(), FakeRunLauncher(), clock=clock)
-    sched_b = Scheduler(sup2, owner_instance_id="B", lease_ttl_seconds=60)
     try:
-        rb = sched_b.run_pass(jid)
-        assert rb.outcome != OUTCOME_NO_WORK
-        row = job_row(env.core, jid)
-        assert row["owner_instance_id"] == "B"
-        assert row["lease_epoch"] == 2
+        # F1: RUNNING takeover goes through the recovery path (never claim_job).
+        taken = core2._store.recover_takeover_job(
+            jid, expected=core2._store.get_supervisor_job(jid),
+            owner_instance_id="B", ttl_seconds=60,
+            process_alive=False, worktree_verdict=None,
+        )
+        assert taken["owner_instance_id"] == "B"
+        assert taken["lease_epoch"] == 2
     finally:
         core2.close()
 
@@ -460,7 +465,11 @@ def test_recovery_fencing_stale_epoch_cannot_execute(db_path):
     decision = env.sup.reconcile(jid)
     assert decision is not None and decision.owner_instance_id == "A"
     clock.advance(31)  # expire A
-    env.sup.store.claim_job(jid, owner_instance_id="B", ttl_seconds=60)
+    # F1: RUNNING takeover goes through the recovery path (never claim_job).
+    env.sup.store.recover_takeover_job(
+        jid, expected=job_row(env.core, jid), owner_instance_id="B",
+        ttl_seconds=60, process_alive=False, worktree_verdict=None,
+    )
     # A (stale epoch 1) executes its old decision -> fenced, nothing written.
     with pytest.raises(LeaseFencedError):
         env.sup.perform_next_safe_action_if_required(decision)

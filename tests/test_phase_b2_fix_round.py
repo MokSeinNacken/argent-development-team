@@ -69,9 +69,17 @@ def make_dual_env(db_path):
 
 
 def takeover(clock, sup2, jid):
-    """B takes over after A's short lease expires (epoch bumps to 2)."""
+    """B takes over after A's short lease expires (epoch bumps to 2).
+
+    F1: a RUNNING job is never claimed directly — the takeover goes through the
+    evidence-bound recovery path (no process evidence, no worktree binding).
+    """
     clock.advance(31)  # A claimed with ttl=30
-    sup2.store.claim_job(jid, owner_instance_id="B", ttl_seconds=60)
+    sup2.store.recover_takeover_job(
+        jid, expected=sup2.store._job_row(jid),
+        owner_instance_id="B", ttl_seconds=60,
+        process_alive=False, worktree_verdict=None,
+    )
 
 
 def start_role_rows(core, jid):

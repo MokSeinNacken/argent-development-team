@@ -26,6 +26,13 @@ from typing import Callable, Iterator, Optional
 from . import events as events_mod
 from . import job_state
 from .gates import binding_hash
+from .worktree import (
+    V_AMBIGUOUS_WRITER,
+    V_BLOCKED_DIVERGED,
+    V_CLEANUP_PENDING,
+    V_KEEP_DIRTY,
+    V_LOST,
+)
 from .models import (
     ActionExecution,
     ActionExecutionStatus,
@@ -80,6 +87,11 @@ _PRIMARY_STATES = "', '".join(job_state.PRIMARY_STATE_VALUES)
 # Values above this are rejected fail-closed so a misconfigured controller can
 # never mint a near-infinite lease.
 MAX_LEASE_TTL_SECONDS = 86400  # 24h
+
+# B1 (F4): upper bound for an owner-authorized reopen ``policy_ref``.  The
+# value is a non-empty, bounded opaque reference (e.g. an approval id); a
+# misconfigured controller can never mint an unbounded policy_ref.
+MAX_POLICY_REF_LEN = 256
 
 # B1 (F6): the orthogonal enum columns that must be value-validated on every
 # write path (enqueue/claim/update).  ``None`` values (nullable paths) skip.
@@ -2257,18 +2269,43 @@ class Store:
             if derived is not None:
                 fields = dict(fields)
                 fields["primary_state"] = derived
-        # F6: terminal stickiness — a sticky DONE/FAILED/BLOCKED row may not be
-        # reopened by clearing its terminal or moving primary_state off the
-        # terminal set.  Metadata-only updates that keep the terminal value
-        # (and therefore the terminal primary_state) are still allowed.
+        # F6 + F5: terminal immutability — DONE/FAILED are IMMUTABLE (a change
+        # to a DIFFERENT terminal value is refused; only an idempotent repeat of
+        # the SAME terminal value and metadata-only updates are allowed).
+        # BLOCKED may not be switched directly to DONE/FAILED, and its only
+        # legal reopen (terminal→NULL) runs exclusively through the
+        # ``enqueue_job`` owner_authorized CAS path (F4), never here.
         cur = self.get_supervisor_job(job_id)
-        if cur is not None and cur.get("terminal") in ("DONE", "FAILED", "BLOCKED"):
-            new_terminal = fields.get("terminal", cur["terminal"])
+        if cur is not None and cur.get("terminal") is not None:
+            cur_terminal = cur["terminal"]
+            new_terminal = fields.get("terminal", cur_terminal)
             new_ps = fields.get("primary_state", cur["primary_state"])
-            if new_terminal is None or new_ps not in ("DONE", "FAILED", "BLOCKED"):
-                raise LeaseError(
-                    f"terminal job {job_id!r} is sticky and cannot be reopened"
-                )
+            if cur_terminal in ("DONE", "FAILED"):
+                if new_terminal != cur_terminal:
+                    raise LeaseError(
+                        f"terminal job {job_id!r} is immutable ({cur_terminal}) "
+                        f"and cannot transition to {new_terminal!r}"
+                    )
+                if new_ps != cur_terminal:
+                    raise LeaseError(
+                        f"terminal job {job_id!r} primary_state must stay "
+                        f"{cur_terminal!r}"
+                    )
+            elif cur_terminal == "BLOCKED":
+                if new_terminal in ("DONE", "FAILED"):
+                    raise LeaseError(
+                        f"blocked job {job_id!r} may not switch to "
+                        f"{new_terminal!r} directly"
+                    )
+                if new_terminal is None:
+                    raise LeaseError(
+                        f"blocked job {job_id!r} reopen requires the "
+                        f"owner_authorized requeue path"
+                    )
+                if new_ps != "BLOCKED":
+                    raise LeaseError(
+                        f"blocked job {job_id!r} primary_state must stay BLOCKED"
+                    )
         assignments = ", ".join(f"{c} = ?" for c in fields)
         cur = self._conn.execute(
             f"UPDATE supervisor_jobs SET {assignments} WHERE id = ?",
@@ -2451,9 +2488,9 @@ class Store:
 
         * ``QUEUED``: claimable iff ``next_eligible_at`` is NULL or in the past
           AND no still-valid foreign lease is held.
-        * ``RUNNING``: claimable ONLY as safe takeover when its lease has a
-          CONCRETE, expired ``lease_expires_at`` (F3: a NULL expiry is never
-          treated as "safely expired" — fail-closed, no takeover).
+        * ``RUNNING``: NEVER claimable here (F1: even an expired concrete lease
+          is not a normal claim; RUNNING takeover goes ONLY through the
+          evidence-bound :meth:`recover_takeover_job` recovery path).
         * ``DONE``/``FAILED``: never (sticky terminal).
         * ``BLOCKED``: never via normal claim (only an explicit owner/policy
           requeue may reopen it -- no automatic path in B1).
@@ -2474,15 +2511,13 @@ class Store:
                 return False, "foreign_lease"
             return True, None
         if ps == job_state.PrimaryState.RUNNING.value:
-            # F3: takeover is only safe when there is a concrete expiry that
-            # has actually lapsed.  A RUNNING row with ``lease_expires_at IS
-            # NULL`` is a legacy/unleased row and must NEVER be claimed as a
-            # "safe takeover" (no expiry evidence -> fail-closed).
-            if expires is None:
-                return False, "running_no_lease"
-            if expires > now_iso:
-                return False, "lease_active"
-            return True, None
+            # F1 (Phase B4): a RUNNING job is NEVER claimable through the
+            # normal claim pool -- not even with an expired concrete lease.
+            # Takeover of a RUNNING job goes ONLY through the atomic
+            # evidence-bound recovery path (:meth:`recover_takeover_job`),
+            # which verifies process/worktree/in-flight evidence before an
+            # epoch+1 re-claim.  This closes the process-based-recovery bypass.
+            return False, "running_not_claimable"
         return False, f"not_claimable:{ps}"
 
     def _do_claim_locked(
@@ -2765,6 +2800,203 @@ class Store:
                 now_iso=now_iso,
             )
 
+    def quarantine_blocked(
+        self,
+        job_id: str,
+        *,
+        error_code: str = "WORKTREE_DIVERGED",
+        expected: Optional[dict] = None,
+    ) -> Optional[dict]:
+        """Fail-closed transition of a nonterminal job to ``BLOCKED`` quarantine
+        (Phase B4 worktree divergence).
+
+        Mirrors :meth:`quarantine_lost` but lands the job in ``BLOCKED``
+        (``primary_state=BLOCKED`` / ``status=TERMINAL`` / ``terminal=BLOCKED``)
+        instead of LOST.  A divergent worktree is never overwritten; the job
+        stays BLOCKED until an owner/policy requeue (``enqueue_job``
+        ``owner_authorized``).  When ``expected`` is provided it is a
+        stale-scan snapshot fence (CAS) — drift writes nothing and returns
+        ``None``.
+        """
+        now = self._clock()
+        now_iso = _format_dt(now)
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            job = dict(row)
+            cas_ps = cas_owner = cas_epoch = None
+            if expected is not None:
+                for field in ("primary_state", "owner_instance_id",
+                              "lease_epoch", "lease_expires_at",
+                              "facts_version"):
+                    if job.get(field) != expected.get(field):
+                        return None
+                cas_ps = expected.get("primary_state")
+                cas_owner = expected.get("owner_instance_id")
+                cas_epoch = expected.get("lease_epoch")
+            return self._transition_job(
+                job_id,
+                to_primary_state=job_state.PrimaryState.BLOCKED.value,
+                to_status="TERMINAL",
+                fields={
+                    "terminal": "BLOCKED",
+                    "owner_instance_id": None,
+                    "lease_expires_at": None,
+                    "error_class": job_state.ErrorClass.OWNER_REQUIRED.value,
+                    "last_error_code": error_code,
+                    "next_action": "NONE",
+                    "next_wake_at": None,
+                },
+                bump_facts_version=True,
+                cas_primary_state=cas_ps,
+                cas_owner_instance_id=cas_owner,
+                cas_lease_epoch=cas_epoch,
+                now_iso=now_iso,
+            )
+
+    def recover_takeover_job(
+        self,
+        job_id: str,
+        *,
+        expected: dict,
+        owner_instance_id: str,
+        ttl_seconds: int,
+        process_alive: bool = False,
+        worktree_verdict: Optional[str] = None,
+    ) -> dict:
+        """Atomic evidence-bound RUNNING takeover (F1, Phase B4).
+
+        The ONLY path that may re-claim a RUNNING job (``claim_job`` /
+        ``claim_next_job`` exclude RUNNING).  Runs in ONE ``BEGIN IMMEDIATE``
+        transaction and, in order:
+
+        (a) fresh read + snapshot-CAS (primary_state / owner / epoch / expiry /
+            facts_version) so a concurrent transition aborts the takeover;
+        (b) the job must be RUNNING, non-terminal, with a CONCRETE, EXPIRED
+            ``lease_expires_at``;
+        (c) process evidence: a live registered process refuses the takeover
+            (``process_alive=True``);
+        (d) worktree evidence: a divergent worktree transitions the job to
+            BLOCKED, a foreign/ambiguous worktree to LOST (no takeover);
+        (e) no in-flight (RUNNING/UNCERTAIN) journal action may exist;
+        (f) only then epoch+1 + new owner + facts_version bump.
+
+        Returns the updated row on takeover.  On a worktree refusal the job is
+        atomically transitioned to BLOCKED/LOST and that row is returned (the
+        caller inspects ``primary_state``).  Raises :class:`LeaseError` on any
+        other refusal (CAS lost, not RUNNING, terminal, lease not expired,
+        live process, in-flight action).
+
+        ``worktree_verdict`` is one of the :mod:`argent_core.worktree` recovery
+        verdicts, or ``None`` for "no worktree binding" (nothing to protect —
+        the takeover proceeds without a worktree check).
+        """
+        self._validate_lease_owner(owner_instance_id)
+        self._validate_ttl(ttl_seconds)
+        now = self._clock()
+        now_iso = _format_dt(now)
+        new_expires = _format_dt(now + timedelta(seconds=ttl_seconds))
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            job = dict(row)
+            # (a) snapshot CAS.
+            for field in ("primary_state", "owner_instance_id", "lease_epoch",
+                          "lease_expires_at", "facts_version"):
+                if job.get(field) != expected.get(field):
+                    raise LeaseError(
+                        f"recover_takeover CAS lost for job {job_id!r} ({field})"
+                    )
+            # (b) RUNNING + non-terminal + concrete expired lease.
+            if job["primary_state"] != job_state.PrimaryState.RUNNING.value:
+                raise LeaseError(
+                    f"recover_takeover: job {job_id!r} is not RUNNING"
+                )
+            if job.get("terminal") is not None:
+                raise LeaseError(f"recover_takeover: job {job_id!r} is terminal")
+            expires = job.get("lease_expires_at")
+            if expires is None or expires > now_iso:
+                raise LeaseError(
+                    f"recover_takeover: lease for job {job_id!r} is not expired"
+                )
+            # (c) process evidence.
+            if process_alive:
+                raise LeaseError(
+                    f"recover_takeover: live process for job {job_id!r}"
+                )
+            # (e) in-flight Apply/Broker-action admission block (F1(d)/F2): a
+            # RUNNING/UNCERTAIN broker (APPLY_PATCH_SET) effect is considered
+            # open until its journal finalization; no takeover may interleave.
+            for a in self.list_supervisor_actions(job_id):
+                if a["action_type"] == "APPLY_PATCH_SET" \
+                        and a["status"] in ("RUNNING", "UNCERTAIN"):
+                    raise LeaseError(
+                        f"recover_takeover: in-flight broker action for "
+                        f"job {job_id!r}"
+                    )
+            # (d) worktree evidence.
+            if worktree_verdict == V_BLOCKED_DIVERGED:
+                self._transition_job(
+                    job_id,
+                    to_primary_state=job_state.PrimaryState.BLOCKED.value,
+                    to_status="TERMINAL",
+                    fields={
+                        "terminal": "BLOCKED",
+                        "owner_instance_id": None,
+                        "lease_expires_at": None,
+                        "error_class": job_state.ErrorClass.OWNER_REQUIRED.value,
+                        "last_error_code": "WORKTREE_DIVERGED",
+                        "next_action": "NONE",
+                        "next_wake_at": None,
+                    },
+                    bump_facts_version=True,
+                    cas_primary_state=job["primary_state"],
+                    cas_lease_epoch=job["lease_epoch"],
+                    now_iso=now_iso,
+                )
+                return self.get_supervisor_job(job_id)
+            if worktree_verdict not in (V_CLEANUP_PENDING, None):
+                self._transition_job(
+                    job_id,
+                    to_primary_state=job_state.PrimaryState.LOST.value,
+                    to_status="RECOVERING",
+                    fields={
+                        "owner_instance_id": None,
+                        "lease_expires_at": None,
+                        "error_class": job_state.ErrorClass.OWNER_REQUIRED.value,
+                        "last_error_code": "AMBIGUOUS_WRITER",
+                        "next_action": "NONE",
+                        "next_wake_at": None,
+                    },
+                    bump_facts_version=True,
+                    cas_primary_state=job["primary_state"],
+                    cas_lease_epoch=job["lease_epoch"],
+                    now_iso=now_iso,
+                )
+                return self.get_supervisor_job(job_id)
+            # (f) takeover: epoch+1 + new owner.
+            new_epoch = job["lease_epoch"] + 1
+            return self._transition_job(
+                job_id,
+                to_primary_state=job_state.PrimaryState.RUNNING.value,
+                to_status="ACTIVE",
+                fields={
+                    "owner_instance_id": owner_instance_id,
+                    "lease_epoch": new_epoch,
+                    "lease_expires_at": new_expires,
+                },
+                bump_facts_version=True,
+                cas_primary_state=job_state.PrimaryState.RUNNING.value,
+                cas_lease_epoch=job["lease_epoch"],
+                now_iso=now_iso,
+            )
+
     def lease_is_current(
         self, job_id: str, owner_instance_id: str, lease_epoch: int
     ) -> bool:
@@ -2830,15 +3062,18 @@ class Store:
         base_commit: Optional[str],
         branch_identity: Optional[str],
         canonical_worktree_path: str,
+        expected_head: Optional[str] = None,
+        current_head: Optional[str] = None,
     ) -> dict:
         """Atomically persist the writer/worktree binding (supervisor-authorized).
 
         Fences: the job MUST currently be held by ``(owner_instance_id,
         lease_epoch)`` with an unexpired lease.  Persists the writer dispatch,
         the current owner/epoch, the canonical path, the repo/base/branch
-        identity and sets ``writer_binding_mode=BOUND`` in ONE transaction.  A
-        stale epoch / wrong owner / expired lease raises :class:`LeaseFencedError`
-        (rollback — no partial binding).
+        identity, the expected/current HEAD (real git provenance) and sets
+        ``writer_binding_mode=BOUND`` in ONE transaction.  A stale epoch /
+        wrong owner / expired lease raises :class:`LeaseFencedError` (rollback
+        — no partial binding).
         """
         self._validate_lease_owner(owner_instance_id)
         if not isinstance(lease_epoch, int) or lease_epoch < 1:
@@ -2876,6 +3111,8 @@ class Store:
                 base_commit=base_commit,
                 branch_identity=branch_identity,
                 canonical_worktree_path=canonical_worktree_path,
+                expected_head=expected_head,
+                current_head=current_head,
                 writer_binding_mode="BOUND",
             )
             return self.get_supervisor_job(job_id)
@@ -3024,10 +3261,39 @@ class Store:
                 "lease_expires_at": None,
             }
             if owner_authorized:
-                # (c) authorized BLOCKED→QUEUED requeue.
-                if policy_ref is None:
+                # (c) authorized BLOCKED→QUEUED requeue (F4: EXACT CAS).
+                if policy_ref is None or not isinstance(policy_ref, str) \
+                        or not policy_ref.strip():
                     raise LeaseError(
-                        "owner_authorized requeue requires a policy_ref"
+                        "owner_authorized requeue requires a non-empty policy_ref"
+                    )
+                if len(policy_ref) > MAX_POLICY_REF_LEN:
+                    raise LeaseError(
+                        f"owner_authorized policy_ref exceeds "
+                        f"MAX_POLICY_REF_LEN ({MAX_POLICY_REF_LEN})"
+                    )
+                # F4: the reopen is only legal for an EXACT BLOCKED job —
+                # primary_state=BLOCKED AND terminal=BLOCKED AND no owner AND no
+                # lease.  Any other source state (RUNNING, LOST, WAITING_EXTERNAL,
+                # a BLOCKED job that still holds a lease, ...) is refused so no
+                # ghost-writer path can force a RUNNING job back to QUEUED.
+                if ps != job_state.PrimaryState.BLOCKED.value:
+                    raise LeaseError(
+                        f"owner_authorized requeue requires primary_state=BLOCKED; "
+                        f"got {ps!r}"
+                    )
+                if terminal != "BLOCKED":
+                    raise LeaseError(
+                        f"owner_authorized requeue requires terminal=BLOCKED; "
+                        f"got {terminal!r}"
+                    )
+                if job.get("owner_instance_id") is not None:
+                    raise LeaseError(
+                        "owner_authorized requeue: job still holds a lease owner"
+                    )
+                if job.get("lease_expires_at") is not None:
+                    raise LeaseError(
+                        "owner_authorized requeue: job still holds a lease expiry"
                     )
                 # A reopened BLOCKED job must also clear its terminal marker so
                 # the supervisor no longer short-circuits on it.

@@ -54,6 +54,17 @@ from .process_registry import (
 )
 from .store import MAX_LEASE_TTL_SECONDS
 from .supervisor import ActionOutcome, ReconcileDecision, Supervisor
+from .worktree import (
+    V_AMBIGUOUS_WRITER,
+    V_BLOCKED_DIVERGED,
+    V_CLEANUP_PENDING,
+    V_KEEP_DIRTY,
+    V_LOST,
+    GitProvenanceProvider,
+    WorktreeBinding,
+    WorktreeEvidence,
+    classify_worktree_recovery,
+)
 
 #: Default lease TTL (seconds) used by a Scheduler when the caller does not
 #: override it.  Local policy; bounded by ``store.MAX_LEASE_TTL_SECONDS``.
@@ -87,6 +98,7 @@ class RestartReconcileSummary:
     rebound: int = 0
     quarantined_lost: int = 0
     takeover_candidates: int = 0
+    blocked_worktree: int = 0
     foreign_lease_kept: int = 0
     process_alive: int = 0
     left: int = 0
@@ -148,9 +160,10 @@ class Scheduler:
 
         Returns ``(job_id, lease_epoch, held)`` where ``held`` is True when the
         lease was already ours (no new claim), or None when there is nothing
-        claimable/continuable.  All claimability checks are delegated to the B1
-        ``claim_job``/``claim_next_job`` predicates (QUEUED eligible, no valid
-        foreign lease, expired-lease takeover, terminal never).
+        claimable/continuable.  QUEUED jobs are claimed via the B1
+        ``claim_job``/``claim_next_job`` predicates; a RUNNING job is NEVER
+        directly claimed (F1) — an expired RUNNING job is taken over ONLY via
+        the evidence-bound :meth:`_try_recover_takeover` recovery path.
         """
         if job_id is None:
             claimed = self._supervisor.store.claim_next_job(
@@ -176,7 +189,17 @@ class Scheduler:
             eligible = row.get("next_eligible_at")
             if eligible is None or eligible <= self._supervisor._now_iso():
                 return (job_id, row["lease_epoch"], True)
-        # Otherwise attempt a claim (QUEUED, or expired-lease takeover).
+        # F1: a RUNNING job with an EXPIRED concrete lease is a takeover
+        # candidate — route it through the evidence-bound recovery path ONLY.
+        # (A still-valid foreign lease is never touched here.)
+        if row.get("primary_state") == job_state.PrimaryState.RUNNING.value \
+                and row.get("lease_expires_at") is not None \
+                and row.get("lease_expires_at") <= self._supervisor._now_iso():
+            taken = self._try_recover_takeover(job_id, row)
+            if taken is not None:
+                return (job_id, taken["lease_epoch"], False)
+            return None
+        # Otherwise attempt a normal claim (QUEUED only; RUNNING is excluded).
         try:
             claimed = self._supervisor.store.claim_job(
                 job_id,
@@ -186,6 +209,80 @@ class Scheduler:
         except LeaseError:
             return None
         return (claimed["id"], claimed["lease_epoch"], False)
+
+    def _worktree_recovery_verdict(self, job_id: str) -> Optional[str]:
+        """Worktree recovery verdict for a RUNNING job (F1/F3).
+
+        Returns ``None`` when the job has no worktree binding (nothing to
+        protect — the takeover proceeds without a worktree check), otherwise one
+        of the :mod:`argent_core.worktree` recovery verdicts computed from REAL
+        git facts (repo identity / HEAD / dirty) against the persisted binding.
+        """
+        ev = self.worktree_evidence(job_id)
+        if ev.get("writer_binding_mode") != "BOUND":
+            return None
+        # A BOUND job must carry complete real provenance, else fail-closed.
+        if not ev.get("canonical_worktree_path") or ev.get("repo_identity") is None:
+            return V_AMBIGUOUS_WRITER
+        binding = WorktreeBinding(
+            job_id=job_id,
+            canonical_worktree_path=ev.get("canonical_worktree_path") or "",
+            repo_identity=ev.get("repo_identity"),
+            base_commit=ev.get("base_commit"),
+            branch_identity=ev.get("branch_identity"),
+            writer_dispatch_id=ev.get("writer_dispatch_id"),
+            writer_owner_instance_id=ev.get("writer_owner_instance_id"),
+            writer_lease_epoch=ev.get("writer_lease_epoch") or 0,
+            expected_head=ev.get("expected_head"),
+            current_head=ev.get("current_head"),
+        )
+        provider = self._supervisor._git_provenance_provider \
+            or GitProvenanceProvider()
+        path = ev.get("canonical_worktree_path")
+        evidence = WorktreeEvidence(
+            repo_identity=provider.repo_identity(path),
+            head=provider.head(path),
+            dirty=provider.dirty(path),
+        )
+        return classify_worktree_recovery(
+            binding, evidence, writer_terminal=True,
+        ).verdict
+
+    def _try_recover_takeover(self, job_id: str, row: dict) -> Optional[dict]:
+        """Attempt the evidence-bound RUNNING takeover (F1).
+
+        Process evidence decides first: a live registered process refuses the
+        takeover (returns None — the holder keeps the job); an unreadable
+        identity fail-closes to LOST quarantine.  A provably terminal process
+        then goes through :meth:`argent_core.store.Store.recover_takeover_job`
+        with the real worktree verdict.  Returns the taken-over row, or None.
+        """
+        verdict = self._process_identity_verdict(job_id)
+        if verdict == "alive":
+            return None
+        if verdict == "unknown":
+            self._supervisor.store.quarantine_lost(
+                job_id, error_code="AMBIGUOUS_WRITER", expected=row,
+            )
+            return None
+        worktree_verdict = self._worktree_recovery_verdict(job_id)
+        try:
+            taken = self._supervisor.store.recover_takeover_job(
+                job_id,
+                expected=row,
+                owner_instance_id=self.owner_instance_id,
+                ttl_seconds=self._lease_ttl_seconds,
+                process_alive=False,
+                worktree_verdict=worktree_verdict,
+            )
+        except LeaseError:
+            return None
+        # A worktree refusal transitions the job to BLOCKED/LOST (not RUNNING);
+        # only a real RUNNING takeover under our owner is a claimable target.
+        if taken.get("primary_state") != job_state.PrimaryState.RUNNING.value \
+                or taken.get("owner_instance_id") != self.owner_instance_id:
+            return None
+        return taken
 
     def _should_renew(self, job: dict) -> bool:
         """Renew iff the job is still RUNNING and we still hold the lease."""
@@ -304,14 +401,16 @@ class Scheduler:
         * WAITING_EXTERNAL→ left in place (handled in Phase B3).
         * RUNNING, ``lease_expires_at IS NULL`` (legacy/inconsistent) →
           fail-closed ``LOST`` quarantine (no takeover, no respawn, no second
-          writer).  This is the ONLY write this method performs.
+          writer).
         * RUNNING, valid lease, held by this instance  → ``rebound`` (the lease
           context is re-established per-pass in ``run_pass``).
         * RUNNING, valid lease, held by another owner → left alone (belongs to
           the holder; no takeover while the lease is valid).
-        * RUNNING, expired concrete lease → ``takeover_candidate`` (expiry is
-          the technical evidence; the scheduler claims it via epoch+1 on a
-          later pass; the old holder is fenced by the epoch bump).
+        * RUNNING, expired concrete lease → decided by live process evidence:
+          alive → ``process_alive`` (no claim); provably terminal → worktree
+          evidence decides ``takeover_candidate`` (clean / no binding),
+          ``blocked_worktree`` (divergent) or ``quarantined_lost``
+          (foreign/ambiguous); unreadable → ``quarantined_lost``.
 
         Idempotent: running it twice is a no-op.
         """
@@ -320,6 +419,7 @@ class Scheduler:
         details: list = []
         scanned = rebound = quarantined = takeover = foreign = left = 0
         process_alive = 0
+        blocked_worktree = 0
 
         for row in rows:
             scanned += 1
@@ -340,6 +440,8 @@ class Scheduler:
                 foreign += 1
             elif kind == "takeover_candidate":
                 takeover += 1
+            elif kind == "blocked_worktree":
+                blocked_worktree += 1
             elif kind == "quarantined_lost":
                 quarantined += 1
             elif kind == "process_alive":
@@ -352,7 +454,8 @@ class Scheduler:
 
         return RestartReconcileSummary(
             scanned=scanned, rebound=rebound, quarantined_lost=quarantined,
-            takeover_candidates=takeover, foreign_lease_kept=foreign,
+            takeover_candidates=takeover, blocked_worktree=blocked_worktree,
+            foreign_lease_kept=foreign,
             process_alive=process_alive, left=left, details=tuple(details),
         )
 
@@ -360,8 +463,8 @@ class Scheduler:
         """Classify a RUNNING nonterminal row under the D-rules (F3/F4).
 
         Returns ``(kind, detail)`` where kind is one of ``rebound``,
-        ``foreign_lease_kept``, ``takeover_candidate``, ``quarantined_lost``,
-        ``left`` or ``skip_terminal``.
+        ``foreign_lease_kept``, ``takeover_candidate``, ``blocked_worktree``,
+        ``quarantined_lost``, ``left`` or ``skip_terminal``.
 
         F4: a RUNNING lease tuple is only valid when the owner is non-empty,
         the epoch is plausible (>= 1) AND the expiry is concrete.  An
@@ -419,7 +522,35 @@ class Scheduler:
             if verdict == "alive":
                 return ("process_alive", detail + ":live_process")
             if verdict == "terminal":
-                return ("takeover_candidate", detail + ":process_terminal")
+                # B4 (F1/F3): a provably terminal process is only a takeover
+                # pre-decision once the REAL worktree evidence is consistent.
+                # Divergent -> BLOCKED; foreign/ambiguous -> LOST; clean /
+                # no binding -> takeover_eligible (``takeover_candidate``).
+                wv = self._worktree_recovery_verdict(jid)
+                if wv == V_BLOCKED_DIVERGED:
+                    result = self._supervisor.store.quarantine_blocked(
+                        jid, error_code="WORKTREE_DIVERGED", expected=current,
+                    )
+                    if result is not None:
+                        return ("blocked_worktree", detail + ":worktree_diverged")
+                elif wv not in (V_CLEANUP_PENDING, None):
+                    result = self._supervisor.store.quarantine_lost(
+                        jid, error_code="AMBIGUOUS_WRITER", expected=current,
+                    )
+                    if result is not None:
+                        return ("quarantined_lost",
+                                detail + ":worktree_ambiguous")
+                else:
+                    return ("takeover_candidate", detail + ":process_terminal")
+                # CAS lost on a quarantine -> re-read and re-classify (bounded).
+                current = self._supervisor.store._job_row(jid)
+                if current is None:
+                    return ("left", "gone")
+                if current.get("terminal") is not None:
+                    return ("skip_terminal", current.get("terminal"))
+                if current.get("primary_state") != job_state.PrimaryState.RUNNING.value:
+                    return ("left", current.get("primary_state"))
+                continue
             result = self._supervisor.store.quarantine_lost(
                 jid, error_code="AMBIGUOUS_WRITER", expected=current,
             )
@@ -479,5 +610,6 @@ class Scheduler:
             "canonical_worktree_path", "repo_identity", "base_commit",
             "branch_identity", "writer_dispatch_id", "writer_owner_instance_id",
             "writer_lease_epoch", "expected_head", "current_head",
+            "writer_binding_mode",
         )
         return {k: row.get(k) for k in keys}

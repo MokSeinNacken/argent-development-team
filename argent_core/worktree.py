@@ -20,6 +20,7 @@ worktrees are NEVER auto-deleted.
 from __future__ import annotations
 
 import os
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -81,6 +82,71 @@ class WorktreeBinding:
             "expected_head": self.expected_head,
             "current_head": self.current_head,
         }
+
+
+def _git(args: list, cwd: str) -> Optional[str]:
+    """Run a read-only ``git -C cwd ...`` command; ``None`` on any failure."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", errors="replace").strip() or None
+
+
+class GitProvenanceProvider:
+    """Read-only git provenance for a worktree (injectable for tests).
+
+    Reads the canonical repo identity (``git rev-parse --show-toplevel``),
+    the current HEAD (``git rev-parse HEAD``), the branch identity
+    (``git rev-parse --abbrev-ref HEAD``) and the dirty flag
+    (``git status --porcelain``) — never mutating anything.  Every read is
+    fail-closed: an unreadable fact is ``None``/dirty so recovery can never
+    treat missing evidence as "clean".
+    """
+
+    def __init__(self, worktree_root: Optional[str] = None):
+        self._worktree_root = worktree_root
+
+    def _root(self, path: Optional[str] = None) -> Optional[str]:
+        return path or self._worktree_root
+
+    def repo_identity(self, path: Optional[str] = None) -> Optional[str]:
+        root = self._root(path)
+        if root is None:
+            return None
+        top = _git(["rev-parse", "--show-toplevel"], root)
+        if not top:
+            return None
+        return os.path.realpath(top)
+
+    def head(self, path: Optional[str] = None) -> Optional[str]:
+        root = self._root(path)
+        if root is None:
+            return None
+        return _git(["rev-parse", "HEAD"], root)
+
+    def branch(self, path: Optional[str] = None) -> Optional[str]:
+        root = self._root(path)
+        if root is None:
+            return None
+        return _git(["rev-parse", "--abbrev-ref", "HEAD"], root)
+
+    def dirty(self, path: Optional[str] = None) -> bool:
+        root = self._root(path)
+        if root is None:
+            return True  # unknown -> fail-closed (never "clean")
+        out = _git(["status", "--porcelain"], root)
+        if out is None:
+            return True  # unreadable -> fail-closed (never "clean")
+        return bool(out)
 
 
 def is_sha_like(value: str) -> bool:

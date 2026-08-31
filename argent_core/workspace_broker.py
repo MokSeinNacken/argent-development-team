@@ -112,6 +112,12 @@ class WorkspaceBroker:
         # Test seam: called with the target path immediately before the final
         # re-canonicalisation/os.replace (TOCTOU simulation, SPEC V2B §2.8).
         self._before_replace_hook: Optional[Callable[[str], None]] = None
+        # B4 (F2): the guard call context captured at the top of
+        # ``apply_patch_set`` so the writer fence can be re-asserted immediately
+        # before EVERY OS effect (not just once before the loop).
+        self._guard_scope_root: Optional[str] = None
+        self._guard_role: Optional[Role] = None
+        self._guard_source: Optional[str] = None
 
         home = os.path.realpath(os.path.expanduser("~"))
         deny: list[str] = [os.path.join(home, s) for s in _HOME_DENY_SUFFIXES]
@@ -126,6 +132,20 @@ class WorkspaceBroker:
     def _emit(self, event_type: str, **payload) -> None:
         if self._emit_event is not None:
             self._emit_event(event_type, payload)
+
+    def _recheck_writer_guard(self) -> None:
+        """F2: re-assert the writer-binding guard immediately before an OS
+        effect (staging write, os.replace, unlink) and again after it.
+
+        Uses a FRESH job read (the guard's provider re-reads the store), so a
+        takeover between the top-of-patch guard and the actual write raises
+        :class:`PermissionDenied` before/after the mutation instead of silently
+        accepting a stale writer.
+        """
+        if self._writer_guard is not None and self._guard_scope_root is not None:
+            self._writer_guard(
+                self._guard_scope_root, self._guard_role, self._guard_source,
+            )
 
     @staticmethod
     def _coerce_role(role) -> Role:
@@ -303,6 +323,9 @@ class WorkspaceBroker:
         if not _within(allowed_root, parent_real):
             raise BrokerError("scope_denied")
 
+        # F2: writer fence re-check BEFORE any OS effect.
+        self._recheck_writer_guard()
+
         staging = os.path.join(parent, ".argent-staging-" + uuid4().hex)
         fd: Optional[int] = None
         try:
@@ -327,6 +350,10 @@ class WorkspaceBroker:
             if self._before_replace_hook is not None:
                 self._before_replace_hook(target)
 
+            # F2: re-check the fence immediately before os.replace (closes the
+            # TOCTOU between the top-of-patch guard and the final replace).
+            self._recheck_writer_guard()
+
             # §2.8: re-canonicalise immediately before os.replace.
             re_real = os.path.realpath(target)
             if not _within(allowed_root, re_real):
@@ -337,6 +364,10 @@ class WorkspaceBroker:
 
             os.replace(staging, target)
             staging = None
+
+            # F2: post-effect confirmation check (a takeover DURING the write
+            # must be surfaced, never silently accepted).
+            self._recheck_writer_guard()
 
             # §2.4 + §2.5: post-replace lstat verification.
             st = os.lstat(target)
@@ -368,7 +399,11 @@ class WorkspaceBroker:
         st = os.lstat(target)
         if stat_module.S_ISLNK(st.st_mode) or not stat_module.S_ISREG(st.st_mode):
             raise BrokerError("not_regular_file")
+        # F2: writer fence re-check before the unlink effect.
+        self._recheck_writer_guard()
         os.unlink(target)
+        # F2: post-effect confirmation check.
+        self._recheck_writer_guard()
 
     # ---------------------------------------------------------------- public
 
@@ -388,6 +423,12 @@ class WorkspaceBroker:
         role = self._coerce_role(role)
         scope_root = os.fspath(scope_root)
         allowed_root = self._allowed_root(scope_root, role)
+
+        # B4 (F2): capture the guard context so every per-effect re-check uses
+        # the SAME (scope_root, role, source) the top-of-patch guard verified.
+        self._guard_scope_root = scope_root
+        self._guard_role = role
+        self._guard_source = source
 
         # B3: writer-binding guard before any mutating write (no-op when no
         # guard is installed).  Raises PermissionDenied on any violation.

@@ -49,6 +49,7 @@ from .models import (
 )
 from .store import Store, utcnow
 from .workspace_broker import WorkspaceBroker
+from .worktree import GitProvenanceProvider
 from .process_registry import ProcessIdentity, ProcessIdentityProvider, ProcessRegistry
 
 # ---------------------------------------------------------------------------
@@ -603,6 +604,33 @@ class SupervisorStore:
     ) -> Optional[dict]:
         return self._store.quarantine_lost(
             job_id, error_code=error_code, expected=expected,
+        )
+
+    def quarantine_blocked(
+        self, job_id: str, *, error_code: str = "WORKTREE_DIVERGED",
+        expected: Optional[dict] = None,
+    ) -> Optional[dict]:
+        return self._store.quarantine_blocked(
+            job_id, error_code=error_code, expected=expected,
+        )
+
+    def recover_takeover_job(
+        self,
+        job_id: str,
+        *,
+        expected: dict,
+        owner_instance_id: str,
+        ttl_seconds: int,
+        process_alive: bool = False,
+        worktree_verdict: Optional[str] = None,
+    ) -> dict:
+        return self._store.recover_takeover_job(
+            job_id,
+            expected=expected,
+            owner_instance_id=owner_instance_id,
+            ttl_seconds=ttl_seconds,
+            process_alive=process_alive,
+            worktree_verdict=worktree_verdict,
         )
 
     def enqueue_job(self, job_id: str, **kwargs) -> dict:
@@ -1405,6 +1433,7 @@ class Supervisor:
         clock: Optional[Callable[[], datetime]] = None,
         process_registry: Optional["ProcessRegistry"] = None,
         process_identity_provider: Optional["ProcessIdentityProvider"] = None,
+        git_provenance_provider: Optional["GitProvenanceProvider"] = None,
     ):
         self.core = core
         self.controller_source = controller_source
@@ -1444,6 +1473,12 @@ class Supervisor:
             self.core._store
         )
         self._process_identity_provider = process_identity_provider
+        # B4 (F3): read-only git provenance provider for the real writer/worktree
+        # binding (repo identity, HEAD, branch, dirty).  Injectable for tests;
+        # a default instance reads the workspace root via ``git`` (fail-closed).
+        self._git_provenance_provider = git_provenance_provider or GitProvenanceProvider(
+            self._workspace_root
+        )
 
     # ---------------------------------------------------------------- utils
 
@@ -3365,6 +3400,8 @@ class Supervisor:
         branch_identity: Optional[str] = None,
         canonical_path: Optional[str] = None,
         worktree_root: Optional[str] = None,
+        expected_head: Optional[str] = None,
+        current_head: Optional[str] = None,
     ) -> dict:
         """Supervisor-authorized writer/worktree binding primitive (F3).
 
@@ -3375,6 +3412,7 @@ class Supervisor:
         * the canonical worktree path (realpath, no symlink escape, within the
           fixed ``worktree_root`` when given);
         * ``repo_identity``/``base_commit``/``branch_identity`` (validated);
+        * ``expected_head``/``current_head`` (real git provenance);
         * ``writer_binding_mode=BOUND``.
 
         A stale epoch / wrong owner / expired lease raises (fail-closed).
@@ -3399,7 +3437,20 @@ class Supervisor:
             base_commit=base_commit,
             branch_identity=branch,
             canonical_worktree_path=canonical,
+            expected_head=expected_head,
+            current_head=current_head,
         )
+
+    def _git_provenance(self) -> dict:
+        """Real git provenance for the canonical workspace (F3, read-only)."""
+        prov = self._git_provenance_provider
+        root = self._workspace_root
+        return {
+            "repo_identity": prov.repo_identity(root),
+            "base_commit": prov.head(root),
+            "branch_identity": prov.branch(root),
+            "expected_head": prov.head(root),
+        }
 
     def _invoke_broker_locked(self, job, dispatch_id, d, row):
         """Invoke the broker for a persisted APPLY intent exactly once (locked).
@@ -3442,11 +3493,18 @@ class Supervisor:
         if fresh_job is not None \
                 and fresh_job.get("writer_binding_mode") != "BOUND" \
                 and fresh_job.get("owner_instance_id") is not None:
+            # F3: persist REAL git provenance (repo identity, base commit,
+            # branch, expected HEAD) instead of a NULL-provenance BOUND row.
+            prov = self._git_provenance()
             self.bind_writer_worktree(
                 job["id"],
                 dispatch_id=dispatch_id,
                 owner_instance_id=fresh_job["owner_instance_id"],
                 lease_epoch=fresh_job["lease_epoch"],
+                repo_identity=prov["repo_identity"],
+                base_commit=prov["base_commit"],
+                branch_identity=prov["branch_identity"],
+                expected_head=prov["expected_head"],
             )
         # F1: install a writer-binding guard (fresh job read at guard time, so
         # a stale writer binding fails closed after any takeover).  Guard
@@ -3480,6 +3538,13 @@ class Supervisor:
             self._finish_action(row["id"], "UNCERTAIN", "workspace_diverged")
             return ActionOutcome("APPLY_PATCH_SET", "failed", "workspace_diverged",
                                  dispatch_id=dispatch_id)
+        # F3: advance the persisted ``current_head`` to the real HEAD after the
+        # broker effect (fenced via the action fence inside the transaction).
+        current_head = self._git_provenance()["expected_head"]
+        with self.core._store._transaction():
+            self.core._store._update_supervisor_job(
+                job["id"], current_head=current_head,
+            )
         self._finish_action(row["id"], "SUCCEEDED")
         return ActionOutcome("APPLY_PATCH_SET", "executed", "reconciled",
                              dispatch_id=dispatch_id)

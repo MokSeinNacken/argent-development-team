@@ -233,7 +233,13 @@ def test_epoch_and_safe_takeover(db_path):
         env.core._store.claim_job(jid, owner_instance_id="B", ttl_seconds=30)
     # Expire the lease.
     env.clock.advance(31)
-    second = env.core._store.claim_job(jid, owner_instance_id="B", ttl_seconds=30)
+    # F1: a RUNNING job is NEVER claimed directly; takeover goes through the
+    # evidence-bound recovery path (no process evidence + no worktree binding
+    # -> the takeover proceeds, epoch+1).
+    second = env.core._store.recover_takeover_job(
+        jid, expected=job_row(env.core, jid), owner_instance_id="B",
+        ttl_seconds=30, process_alive=False, worktree_verdict=None,
+    )
     assert second["lease_epoch"] == 2
     assert second["owner_instance_id"] == "B"
     # The old (owner, epoch) is fenced.
@@ -287,8 +293,13 @@ def test_fencing_stale_owner_cannot_commit(db_path):
     jid = add_queued_job(env, "job")
     env.core._store.claim_job(jid, owner_instance_id="instance-A", ttl_seconds=30)
     env.clock.advance(31)
-    # Safe takeover by a new owner.
-    env.core._store.claim_job(jid, owner_instance_id="instance-B", ttl_seconds=30)
+    # Expire the lease.
+    env.clock.advance(31)
+    # F1: takeover of RUNNING goes through the recovery path (never claim_job).
+    env.core._store.recover_takeover_job(
+        jid, expected=job_row(env.core, jid), owner_instance_id="instance-B",
+        ttl_seconds=30, process_alive=False, worktree_verdict=None,
+    )
     assert job_row(env.core, jid)["lease_epoch"] == 2
 
     # The stale owner A (epoch 1) attempts to commit through the reconcile path.
@@ -593,7 +604,10 @@ def test_f1_race_takeover_fences_stale_action(db_path):
     assert decision.lease_epoch == 1
     # Lease expires; B takes over (epoch 2, facts_version bumped by the claim).
     env.clock.advance(31)
-    env.core._store.claim_job(jid, owner_instance_id="B", ttl_seconds=30)
+    env.core._store.recover_takeover_job(
+        jid, expected=job_row(env.core, jid), owner_instance_id="B",
+        ttl_seconds=30, process_alive=False, worktree_verdict=None,
+    )
     assert job_row(env.core, jid)["lease_epoch"] == 2
     facts_after_takeover = job_row(env.core, jid)["facts_version"]
     # A (stale holder, epoch 1) tries to execute its decision -> fenced.
@@ -708,7 +722,7 @@ def test_f3_null_expiry_run_is_not_takeoverable(db_path):
     # Fail-closed: no concrete expiry -> NO takeover.
     with pytest.raises(LeaseError) as exc:
         env.core._store.claim_job(jid, owner_instance_id="B", ttl_seconds=30)
-    assert "running_no_lease" in str(exc.value)
+    assert "running_not_claimable" in str(exc.value)
     env.core.close()
 
 
