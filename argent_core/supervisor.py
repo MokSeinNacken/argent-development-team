@@ -579,6 +579,21 @@ class SupervisorStore:
             job_id, owner_instance_id=owner_instance_id, lease_epoch=lease_epoch
         )
 
+    def clear_lease(
+        self, job_id: str, *, owner_instance_id: str, lease_epoch: int
+    ) -> dict:
+        return self._store.clear_lease(
+            job_id, owner_instance_id=owner_instance_id, lease_epoch=lease_epoch
+        )
+
+    def quarantine_lost(
+        self, job_id: str, *, error_code: str = "AMBIGUOUS_WRITER",
+        expected: Optional[dict] = None,
+    ) -> Optional[dict]:
+        return self._store.quarantine_lost(
+            job_id, error_code=error_code, expected=expected,
+        )
+
     def enqueue_job(self, job_id: str, **kwargs) -> dict:
         return self._store.enqueue_job(job_id, **kwargs)
 
@@ -1468,6 +1483,26 @@ class Supervisor:
         if job is not None:
             self._enforce_lease_fence(job)
 
+    def _fence_action_locked(
+        self,
+        job_id: str,
+        owner_instance_id: Optional[str],
+        lease_epoch: Optional[int],
+        expected_facts_version: int,
+    ) -> None:
+        """Central in-transaction lease fence (F1, Phase B2).
+
+        Re-reads the job on the store connection and raises
+        :class:`LeaseFencedError` unless the job's current (owner, epoch,
+        expiry, facts_version) exactly matches the decision token.  This is the
+        single check bound to the journal begin, every transactional core
+        effect, and the journal finalize.  Delegates to
+        :meth:`argent_core.store.Store._fence_action`.
+        """
+        self.core._store._fence_action(
+            job_id, owner_instance_id, lease_epoch, expected_facts_version,
+        )
+
     def _build_lookup(self, d: AgentDispatch) -> RunLookup:
         return RunLookup(
             dispatch_id=d.id,
@@ -1738,6 +1773,19 @@ class Supervisor:
                 fields["next_wake_at"] = None
             if plan.status is not None:
                 fields["status"] = plan.status
+            # F2 (Phase B2): a persisted BACKOFF is an admission-delayed
+            # requeue, not an immediate-run.  Persist it as
+            # QUEUED + RETRY_BACKOFF + next_eligible_at and release the lease
+            # (holder-fenced above), so the scheduler can never run it before
+            # the wake deadline.  ``next_wake_at`` is kept for loop
+            # compatibility, but ``next_eligible_at`` is the admission
+            # authority checked by ``claim_next_job``/``_job_is_claimable``.
+            if plan.status == SupervisorJobStatus.BACKOFF.value:
+                fields["queue_reason"] = job_state.QueueReason.RETRY_BACKOFF.value
+                if plan.wake_at is not None:
+                    fields["next_eligible_at"] = plan.wake_at
+                fields["owner_instance_id"] = None
+                fields["lease_expires_at"] = None
             if plan.recovery_state is not None:
                 fields["recovery_state"] = plan.recovery_state
             if plan.retry_count is not None:
@@ -1792,21 +1840,47 @@ class Supervisor:
             self._enforce_lease_fence(job)
             retry = job["retry_count"]
             wake = _iso(now + timedelta(seconds=backoff_seconds(retry)))
-            self.core._store._update_supervisor_job(
-                job_id,
-                status=SupervisorJobStatus.BACKOFF.value,
-                next_action=ReconcileAction.WAIT.value,
-                next_wake_at=wake,
-                updated_at=self._now_iso(),
-                facts_version=job["facts_version"] + 1,
-            )
-            version = job["facts_version"] + 1
+            owner = job.get("owner_instance_id")
+            epoch = job["lease_epoch"]
+            # F2 (Phase B2): persist the backoff atomically as
+            # QUEUED + RETRY_BACKOFF + next_eligible_at and release the lease
+            # (holder-fenced via the B1 CAS below) so the scheduler cannot run
+            # the job before the wake deadline.  ``next_wake_at`` stays for
+            # loop compatibility; ``next_eligible_at`` is the admission
+            # authority.
+            fields = {
+                "queue_reason": job_state.QueueReason.RETRY_BACKOFF.value,
+                "next_action": ReconcileAction.WAIT.value,
+                "next_wake_at": wake,
+                "next_eligible_at": wake,
+            }
+            if owner is not None:
+                updated = self.core._store._transition_job(
+                    job_id,
+                    to_primary_state=job_state.PrimaryState.QUEUED.value,
+                    to_status=SupervisorJobStatus.BACKOFF.value,
+                    fields={**fields, "owner_instance_id": None,
+                            "lease_expires_at": None},
+                    bump_facts_version=True,
+                    cas_owner_instance_id=owner,
+                    cas_lease_epoch=epoch,
+                    cas_lease_unexpired=True,
+                )
+            else:
+                updated = self.core._store._transition_job(
+                    job_id,
+                    to_primary_state=job_state.PrimaryState.QUEUED.value,
+                    to_status=SupervisorJobStatus.BACKOFF.value,
+                    fields=fields,
+                    bump_facts_version=True,
+                )
+            version = updated["facts_version"]
         return ReconcileDecision(
             job_id=job_id, facts_version=version,
             action=ReconcileAction.WAIT, reason="snapshot_contention",
             wake_at=wake,
-            owner_instance_id=job.get("owner_instance_id"),
-            lease_epoch=job["lease_epoch"] if job.get("owner_instance_id") is not None else None,
+            owner_instance_id=None,
+            lease_epoch=None,
         )
 
     # ------------------------------------------------------------ projection
@@ -2401,8 +2475,19 @@ class Supervisor:
         handler = getattr(self, f"_perform_{decision.action.value.lower()}", None)
         if handler is None:
             return ActionOutcome(decision.action.value, "skipped", "no_handler")
+        # F1 (Phase B2): arm the in-transaction action fence for the handler's
+        # duration.  Every journal begin / core effect / finalize write opens a
+        # ``BEGIN IMMEDIATE`` transaction which re-asserts the decision token
+        # atomically with the write lock; a stale holder after a takeover
+        # raises ``LeaseFencedError`` and writes NOTHING (rollback).
+        self.core._store._set_action_fence(
+            decision.job_id, decision.owner_instance_id, decision.lease_epoch,
+            decision.facts_version,
+        )
         try:
             result = handler(decision, job)
+        except LeaseFencedError:
+            raise
         except IdempotencyError as exc:
             # F2: an args-hash-mismatch is an invalid journal action and must
             # never livelock the job in ACTIVE re-planning.  Persist a sticky
@@ -2419,6 +2504,8 @@ class Supervisor:
                 decision.action.value, "failed", f"{type(exc).__name__}:{exc}",
                 dispatch_id=decision.dispatch_id,
             )
+        finally:
+            self.core._store._clear_action_fence()
         if result.status == "exhausted":
             # F2: an exhausted journal action (attempt_count >= MAX) must
             # atomically persist an error state instead of returning the same
@@ -2509,6 +2596,10 @@ class Supervisor:
                 job_id,
                 status=SupervisorJobStatus.BACKOFF.value,
                 recovery_state=RecoveryState.RUNTIME_UNKNOWN.value,
+                queue_reason=job_state.QueueReason.RETRY_BACKOFF.value,
+                next_eligible_at=wake,
+                owner_instance_id=None,
+                lease_expires_at=None,
                 last_error_code=error_code,
                 next_action=ReconcileAction.WAIT.value,
                 next_wake_at=wake,
@@ -2560,6 +2651,10 @@ class Supervisor:
                 job_id,
                 status=SupervisorJobStatus.BACKOFF.value,
                 recovery_state=RecoveryState.RUNTIME_UNKNOWN.value,
+                queue_reason=job_state.QueueReason.RETRY_BACKOFF.value,
+                next_eligible_at=wake,
+                owner_instance_id=None,
+                lease_expires_at=None,
                 last_error_code=error_code,
                 next_action=ReconcileAction.WAIT.value,
                 next_wake_at=wake,

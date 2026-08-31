@@ -643,6 +643,9 @@ class Store:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._clock = clock or utcnow
+        # F1: in-transaction action fence token (set by the Supervisor while it
+        # executes a leased action).  None means no active action fence.
+        self._action_fence = None
         self._create_schema()
 
     # -- lifecycle -----------------------------------------------------------
@@ -890,9 +893,18 @@ class Store:
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
-        """Run a block inside a single ``BEGIN IMMEDIATE`` transaction."""
+        """Run a block inside a single ``BEGIN IMMEDIATE`` transaction.
+
+        F1 (Phase B2): when an action fence is armed (the Supervisor is
+        executing a leased action), the fence is re-asserted IMMEDIATELY after
+        ``BEGIN IMMEDIATE`` (i.e. atomically with the write lock), so a stale
+        holder can no longer commit any journal/core/finalize write after a
+        takeover.  ``BEGIN IMMEDIATE`` already holds the write lock, so a
+        takeover cannot interleave between the fence check and the write.
+        """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            self._check_action_fence()
             yield
         except BaseException:
             self._conn.execute("ROLLBACK")
@@ -927,6 +939,7 @@ class Store:
         view._db_path = self._db_path
         view._conn = conn
         view._clock = self._clock
+        view._action_fence = None
         return view
 
     @contextmanager
@@ -2495,6 +2508,118 @@ class Store:
                 now_iso=now_iso,
             )
 
+    def clear_lease(
+        self, job_id: str, *, owner_instance_id: str, lease_epoch: int
+    ) -> dict:
+        """Clear the lease (owner + expiry) held by (owner, epoch) without
+        changing ``primary_state``/``status`` (Phase B2).
+
+        Unlike :meth:`release_lease` (which requeues to QUEUED), this removes
+        only the stale lease fields.  Used by the scheduler when a job has
+        already left RUNNING through another path (e.g. a BACKOFF requeue that
+        projected ``status=BACKOFF``) and only its lingering lease must be
+        dropped so the job can be re-admitted.  Verifies the same owner+epoch
+        +unexpired-lease CAS as :meth:`release_lease` and keeps ``lease_epoch``
+        monotonic; an expired lease is never silently cleared by a stale holder
+        (:class:`LeaseError`).
+        """
+        now = self._clock()
+        now_iso = _format_dt(now)
+        self._validate_lease_owner(owner_instance_id)
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            job = dict(row)
+            if job["owner_instance_id"] != owner_instance_id:
+                raise LeaseError(f"clear owner mismatch for job {job_id!r}")
+            if job["lease_epoch"] != lease_epoch:
+                raise LeaseError(f"clear epoch mismatch for job {job_id!r}")
+            if job["lease_expires_at"] is None or \
+                    job["lease_expires_at"] <= now_iso:
+                raise LeaseError(f"lease expired for job {job_id!r}")
+            cur = self._conn.execute(
+                "UPDATE supervisor_jobs SET owner_instance_id = NULL, "
+                "lease_expires_at = NULL, updated_at = ?, "
+                "facts_version = facts_version + 1 "
+                "WHERE id = ? AND owner_instance_id = ? AND lease_epoch = ? "
+                "AND lease_expires_at IS NOT NULL AND lease_expires_at > ?",
+                (now_iso, job_id, owner_instance_id, lease_epoch, now_iso),
+            )
+            if cur.rowcount != 1:
+                raise LeaseError(f"clear CAS lost for job {job_id!r}")
+            updated = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            return dict(updated)
+
+    def quarantine_lost(
+        self,
+        job_id: str,
+        *,
+        error_code: str = "AMBIGUOUS_WRITER",
+        expected: Optional[dict] = None,
+    ) -> Optional[dict]:
+        """Fail-closed transition of a nonterminal job to ``LOST`` quarantine
+        (Phase B2 restart reconciliation).
+
+        Used when a RUNNING job's ownership cannot be safely resolved with the
+        persisted facts alone (e.g. ``lease_expires_at IS NULL`` — no concrete
+        expiry evidence).  No takeover, no respawn, no second writer: the job
+        is quarantined (``primary_state=LOST`` / ``status=RECOVERING``) and is
+        never claimable again until an owner/policy authorization reopens it.
+        Terminal jobs are refused (sticky); BLOCKED reopen is refused here too
+        (it is not the recovery path).
+
+        F3 (Phase B2): when ``expected`` is provided it is a stale-scan
+        snapshot fence.  The transition runs ONLY if the job still matches the
+        snapshot exactly (primary_state / owner / epoch / lease_expires_at /
+        facts_version) inside the same ``BEGIN IMMEDIATE``; on drift it writes
+        NOTHING and returns ``None`` ("cas_lost") so the caller can re-read
+        and re-classify instead of blindly overwriting a newer state.
+        """
+        now = self._clock()
+        now_iso = _format_dt(now)
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            job = dict(row)
+            cas_ps = cas_owner = cas_epoch = None
+            if expected is not None:
+                # F3: stale-scan snapshot fence (CAS).  Compare the fields the
+                # quarantine decision was based on; any drift -> cas_lost.
+                for field in ("primary_state", "owner_instance_id",
+                              "lease_epoch", "lease_expires_at",
+                              "facts_version"):
+                    if job.get(field) != expected.get(field):
+                        return None
+                cas_ps = expected.get("primary_state")
+                cas_owner = expected.get("owner_instance_id")
+                cas_epoch = expected.get("lease_epoch")
+            return self._transition_job(
+                job_id,
+                to_primary_state=job_state.PrimaryState.LOST.value,
+                to_status="RECOVERING",
+                fields={
+                    "owner_instance_id": None,
+                    "lease_expires_at": None,
+                    "error_class": job_state.ErrorClass.OWNER_REQUIRED.value,
+                    "last_error_code": error_code,
+                    "next_action": "NONE",
+                    "next_wake_at": None,
+                },
+                bump_facts_version=True,
+                cas_primary_state=cas_ps,
+                cas_owner_instance_id=cas_owner,
+                cas_lease_epoch=cas_epoch,
+                now_iso=now_iso,
+            )
+
     def lease_is_current(
         self, job_id: str, owner_instance_id: str, lease_epoch: int
     ) -> bool:
@@ -2546,6 +2671,86 @@ class Store:
         expires = row["lease_expires_at"]
         if expires is None or expires <= now_iso:
             raise LeaseFencedError(f"lease expired for job {job_id!r}")
+
+    # -- F1 (Phase B2): in-transaction action fence ---------------------------
+    #
+    # A lease decision is authored under an exact (owner, epoch, facts_version)
+    # token.  Once the action executor starts mutating (journal begin, core
+    # effect, journal finalize), a takeover between the initial fence check and
+    # the write would let a stale holder commit.  The Supervisor arms an
+    # *action fence* for the duration of the action; ``_transaction`` then
+    # re-asserts it right after ``BEGIN IMMEDIATE`` (atomically with the write
+    # lock), so no write of the stale holder can commit after a takeover.
+
+    def _fence_action(
+        self,
+        job_id: str,
+        owner_instance_id: Optional[str],
+        lease_epoch: Optional[int],
+        expected_facts_version: int,
+    ) -> None:
+        """Central in-transaction lease fence (F1).
+
+        Reads the job fresh on THIS connection and raises
+        :class:`LeaseFencedError` unless the job's current
+        (owner_instance_id, lease_epoch, lease_expires_at, facts_version)
+        exactly matches the decision token.  A leased job with
+        ``lease_expires_at IS NULL`` is fenced fail-closed (consistent with
+        :meth:`assert_lease_current`).  An unleased legacy decision
+        (``owner_instance_id is None``) is a no-op for the legacy path only.
+        """
+        if owner_instance_id is None:
+            # Legacy unleased decision: no lease to fence (legacy path only).
+            return
+        row = self._conn.execute(
+            "SELECT owner_instance_id, lease_epoch, lease_expires_at, "
+            "facts_version FROM supervisor_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise LeaseFencedError(f"job {job_id!r} not found")
+        if row["owner_instance_id"] != owner_instance_id:
+            raise LeaseFencedError(
+                f"lease fence: {owner_instance_id!r} is not the current owner "
+                f"of job {job_id!r}"
+            )
+        if row["lease_epoch"] != lease_epoch:
+            raise LeaseFencedError(
+                f"lease fence: epoch {lease_epoch} is stale for job {job_id!r} "
+                f"(current {row['lease_epoch']})"
+            )
+        expires = row["lease_expires_at"]
+        if expires is None or expires <= self.now_iso():
+            raise LeaseFencedError(f"lease expired for job {job_id!r}")
+        if row["facts_version"] != expected_facts_version:
+            raise LeaseFencedError(
+                f"lease fence: facts_version drift for job {job_id!r} "
+                f"(expected {expected_facts_version}, got {row['facts_version']})"
+            )
+
+    def _set_action_fence(
+        self,
+        job_id: str,
+        owner_instance_id: Optional[str],
+        lease_epoch: Optional[int],
+        expected_facts_version: int,
+    ) -> None:
+        """Arm the in-transaction action fence (F1) for one action."""
+        self._action_fence = (
+            job_id, owner_instance_id, lease_epoch, expected_facts_version,
+        )
+
+    def _clear_action_fence(self) -> None:
+        """Disarm the in-transaction action fence (F1)."""
+        self._action_fence = None
+
+    def _check_action_fence(self) -> None:
+        """Re-assert the armed action fence (no-op when none is armed)."""
+        fence = getattr(self, "_action_fence", None)
+        if fence is None:
+            return
+        job_id, owner, epoch, facts_version = fence
+        self._fence_action(job_id, owner, epoch, facts_version)
 
     def enqueue_job(
         self,
