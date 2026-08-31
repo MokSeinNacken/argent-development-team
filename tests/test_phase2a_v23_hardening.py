@@ -20,7 +20,7 @@ from argent_core import (
     OWNER_SOURCE,
 )
 from argent_core.outputs import validate_role_output
-from argent_core.store import Store
+from argent_core.store import Store, SCHEMA_VERSION
 
 from conftest import LEAD
 from mock_runtime import MockRuntime, build_output, lead_output, reviewer_output
@@ -298,7 +298,7 @@ def test_g3_migration_failure_rolls_back_v2_structure(tmp_path, monkeypatch):
     row2 = c._store._conn.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
-    assert row2["value"] == "7"
+    assert row2["value"] == SCHEMA_VERSION
     c.close()
 
 

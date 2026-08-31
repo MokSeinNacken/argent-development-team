@@ -144,15 +144,15 @@ def _column_names(core, table):
 # Schema V6
 # ---------------------------------------------------------------------------
 
-def test_schema_version_is_7():
-    assert SCHEMA_VERSION == "7"
+def test_schema_version_is_8():
+    assert SCHEMA_VERSION == "8"
 
 
 def test_fresh_db_has_v6_tables_and_version(db_path, core):
     row = core._store._conn.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
-    assert row["value"] == "7"
+    assert row["value"] == SCHEMA_VERSION
     assert V6_TABLES <= _table_names(core)
 
 
@@ -207,7 +207,7 @@ def test_v5_to_v6_preserves_v5_data(db_path):
         row = core2._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "7"
+        assert row["value"] == SCHEMA_VERSION
         assert V6_TABLES <= _table_names(core2)
         # V5 data intact.
         assert core2.queries.get_task(task.id) is not None
@@ -245,7 +245,7 @@ def test_v6_migration_rollback_on_error(db_path, monkeypatch):
         row = core._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "7"
+        assert row["value"] == SCHEMA_VERSION
         assert V6_TABLES <= _table_names(core)
     finally:
         core.close()

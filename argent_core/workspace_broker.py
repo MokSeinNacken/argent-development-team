@@ -103,8 +103,12 @@ def _content_hit(content: bytes) -> Optional[str]:
 class WorkspaceBroker:
     """Applies validated patch sets to the task workspace (SPEC V2B §2)."""
 
-    def __init__(self, emit_event: Optional[Callable[[str, dict], None]] = None):
+    def __init__(self, emit_event: Optional[Callable[[str, dict], None]] = None,
+                 writer_guard: Optional[Callable[[str, object, str], None]] = None):
         self._emit_event = emit_event
+        # B3: optional writer-binding guard invoked immediately before any
+        # mutating write (the broker remains the only write path).
+        self._writer_guard = writer_guard
         # Test seam: called with the target path immediately before the final
         # re-canonicalisation/os.replace (TOCTOU simulation, SPEC V2B §2.8).
         self._before_replace_hook: Optional[Callable[[str], None]] = None
@@ -384,6 +388,11 @@ class WorkspaceBroker:
         role = self._coerce_role(role)
         scope_root = os.fspath(scope_root)
         allowed_root = self._allowed_root(scope_root, role)
+
+        # B3: writer-binding guard before any mutating write (no-op when no
+        # guard is installed).  Raises PermissionDenied on any violation.
+        if self._writer_guard is not None:
+            self._writer_guard(scope_root, role, source)
 
         result = BrokerResult()
         plans: list = []

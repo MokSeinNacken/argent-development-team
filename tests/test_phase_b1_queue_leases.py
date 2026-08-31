@@ -24,7 +24,7 @@ from argent_core import Core, OWNER_SOURCE, Role, role_source
 from argent_core.job_state import PrimaryState
 from argent_core.models import LeaseError, LeaseFencedError
 from argent_core.supervisor import Supervisor
-from argent_core.store import MAX_LEASE_TTL_SECONDS, _format_dt
+from argent_core.store import MAX_LEASE_TTL_SECONDS, SCHEMA_VERSION, _format_dt
 from mock_supervisor_runtime import FakeClock, FakeRunStatusProvider
 
 OWNER = OWNER_SOURCE
@@ -509,7 +509,7 @@ def test_migration_adds_columns_backfills_and_preserves_rows(tmp_path):
         row = core._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "7"
+        assert row["value"] == SCHEMA_VERSION
     finally:
         core.close()
 
@@ -527,7 +527,7 @@ def test_migration_reopen_is_idempotent(tmp_path):
         row = c2._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()
-        assert row["value"] == "7"
+        assert row["value"] == SCHEMA_VERSION
     finally:
         c2.close()
 

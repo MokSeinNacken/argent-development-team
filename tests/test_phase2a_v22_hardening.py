@@ -26,6 +26,7 @@ from argent_core import (
     role_source,
 )
 from argent_core.outputs import validate_role_output
+from argent_core.store import SCHEMA_VERSION
 
 from conftest import LEAD, events_of
 from mock_runtime import (
@@ -520,7 +521,7 @@ def test_f8_realistic_v2_to_v3_migration(tmp_path):
     row = c._store._conn.execute(
         "SELECT value FROM schema_meta WHERE key='schema_version'"
     ).fetchone()
-    assert row is not None and row["value"] == "7"
+    assert row is not None and row["value"] == SCHEMA_VERSION
     # Existing data intact.
     t = c.queries.get_task("t1")
     assert t.title == "x" and t.state is TaskState.NEW

@@ -31,6 +31,7 @@ from argent_core.models import (  # noqa: E402
     TaskState,
 )
 from argent_core.sandbox_runner import SandboxResult  # noqa: E402
+from argent_core.store import SCHEMA_VERSION  # noqa: E402
 from argent_core.supervisor import (  # noqa: E402
     AGENT_IDS,
     MAX_DISPATCH_ATTEMPTS_PER_STEP,
@@ -1727,7 +1728,7 @@ def test_r13_dispatch_write_intents_migration_existing_v4(tmp_path):
         assert "dispatch_write_intents" in names
         row = c2._store._conn.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
-        assert row["value"] == "7"
+        assert row["value"] == SCHEMA_VERSION
     finally:
         c2.close()
 

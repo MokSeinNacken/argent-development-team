@@ -47,6 +47,11 @@ from typing import Optional, Tuple
 
 from . import job_state
 from .models import LeaseError, LeaseFencedError, NotFound
+from .process_registry import (
+    IDENTITY_SAME,
+    ProcessIdentityProvider,
+    ProcessRegistry,
+)
 from .store import MAX_LEASE_TTL_SECONDS
 from .supervisor import ActionOutcome, ReconcileDecision, Supervisor
 
@@ -83,6 +88,7 @@ class RestartReconcileSummary:
     quarantined_lost: int = 0
     takeover_candidates: int = 0
     foreign_lease_kept: int = 0
+    process_alive: int = 0
     left: int = 0
     details: Tuple[tuple, ...] = ()
 
@@ -313,6 +319,7 @@ class Scheduler:
         now_iso = self._supervisor._now_iso()
         details: list = []
         scanned = rebound = quarantined = takeover = foreign = left = 0
+        process_alive = 0
 
         for row in rows:
             scanned += 1
@@ -335,6 +342,8 @@ class Scheduler:
                 takeover += 1
             elif kind == "quarantined_lost":
                 quarantined += 1
+            elif kind == "process_alive":
+                process_alive += 1
             elif kind == "skip_terminal":
                 pass  # a terminal appeared concurrently; counted in scanned only
             else:  # "left" (re-classified to a non-RUNNING state)
@@ -343,8 +352,8 @@ class Scheduler:
 
         return RestartReconcileSummary(
             scanned=scanned, rebound=rebound, quarantined_lost=quarantined,
-            takeover_candidates=takeover, foreign_lease_kept=foreign, left=left,
-            details=tuple(details),
+            takeover_candidates=takeover, foreign_lease_kept=foreign,
+            process_alive=process_alive, left=left, details=tuple(details),
         )
 
     def _classify_running(self, row: dict, now_iso: str) -> tuple:
@@ -397,6 +406,78 @@ class Scheduler:
                 if owner == self.owner_instance_id:
                     return ("rebound", f"epoch={epoch}")
                 return ("foreign_lease_kept", owner)
-            return ("takeover_candidate", f"epoch={epoch}")
+            # B3/F2: an expired concrete lease is no longer sufficient evidence
+            # to authorise a takeover.  Live process evidence decides:
+            #   * persisted identity == live identity -> process still alive,
+            #     keep the holder (no takeover, no second writer);
+            #   * boot change / PID reuse / authoritatively terminal -> old
+            #     process surely gone -> takeover candidate (with evidence);
+            #   * unknown/unreadable evidence -> fail-closed LOST quarantine
+            #     (no takeover without proof).
+            detail = f"epoch={epoch}"
+            verdict = self._process_identity_verdict(jid)
+            if verdict == "alive":
+                return ("process_alive", detail + ":live_process")
+            if verdict == "terminal":
+                return ("takeover_candidate", detail + ":process_terminal")
+            result = self._supervisor.store.quarantine_lost(
+                jid, error_code="AMBIGUOUS_WRITER", expected=current,
+            )
+            if result is not None:
+                return ("quarantined_lost", detail + ":unknown_process")
+            # CAS lost — re-read and re-classify (bounded).
+            current = self._supervisor.store._job_row(jid)
+            if current is None:
+                return ("left", "gone")
+            if current.get("terminal") is not None:
+                return ("skip_terminal", current.get("terminal"))
+            if current.get("primary_state") != job_state.PrimaryState.RUNNING.value:
+                return ("left", current.get("primary_state"))
+            continue
         # Exhausted the re-classification budget: leave as-is (never blind LOST).
         return ("left", current.get("primary_state"))
+
+    # -- B3 process/worktree evidence (read-only, authority order preserved) -
+
+    def process_evidence(self, job_id: str):
+        """Latest process-registry evidence for a job (None if unregistered)."""
+        rows = self._supervisor.core._store.list_process_registrations(job_id)
+        return rows[-1] if rows else None
+
+    def _process_identity_verdict(self, job_id: str) -> str:
+        """Live process-identity verdict for a RUNNING job (F2).
+
+        Returns ``alive`` (persisted identity == live identity), ``terminal``
+        (boot change / PID reuse / authoritatively terminal registration), or
+        ``unknown`` (no registration or unreadable live identity).
+        """
+        reg = self.process_evidence(job_id)
+        if reg is None:
+            return "unknown"
+        if ProcessRegistry.is_terminally_dead(reg):
+            return "terminal"
+        pid = reg.get("pid")
+        if not isinstance(pid, int) or pid <= 0:
+            return "unknown"
+        provider = self._supervisor._process_identity_provider \
+            or ProcessIdentityProvider()
+        try:
+            live = provider.current(pid)
+        except Exception:
+            return "unknown"
+        if not live.is_known:
+            return "unknown"
+        verdict = ProcessRegistry.classify_identity(reg, live)
+        return "alive" if verdict == IDENTITY_SAME else "terminal"
+
+    def worktree_evidence(self, job_id: str) -> dict:
+        """Read-only minimal worktree/writer ownership evidence for a job."""
+        row = self._supervisor.core._store.get_supervisor_job(job_id)
+        if row is None:
+            return {}
+        keys = (
+            "canonical_worktree_path", "repo_identity", "base_commit",
+            "branch_identity", "writer_dispatch_id", "writer_owner_instance_id",
+            "writer_lease_epoch", "expected_head", "current_head",
+        )
+        return {k: row.get(k) for k in keys}

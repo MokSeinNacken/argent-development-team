@@ -49,6 +49,7 @@ from .models import (
 )
 from .store import Store, utcnow
 from .workspace_broker import WorkspaceBroker
+from .process_registry import ProcessIdentity, ProcessIdentityProvider, ProcessRegistry
 
 # ---------------------------------------------------------------------------
 # Constants (SPEC V2C §9)
@@ -273,7 +274,7 @@ class RunLauncher(Protocol):
     def spawn(
         self, *, agent_id: str, dispatch_id: str,
         message_file: Path, timeout_seconds: int,
-    ) -> None: ...
+    ) -> Optional[int]: ...
 
 
 class WorkspaceStateProvider(Protocol):
@@ -534,6 +535,16 @@ class SupervisorStore:
                 "next_eligible_at": None,
                 "error_class": job_state.ErrorClass.NONE.value,
                 "wait_kind": job_state.WaitKind.NONE.value,
+                "canonical_worktree_path": None,
+                "repo_identity": None,
+                "base_commit": None,
+                "branch_identity": None,
+                "writer_dispatch_id": None,
+                "writer_owner_instance_id": None,
+                "writer_lease_epoch": 0,
+                "writer_binding_mode": None,
+                "expected_head": None,
+                "current_head": None,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -1252,7 +1263,7 @@ class OpenClawRunLauncher:
     def spawn(
         self, *, agent_id: str, dispatch_id: str,
         message_file: Path, timeout_seconds: int,
-    ) -> None:
+    ) -> Optional[int]:
         # F8: increment the persistent launch counter BEFORE the detached spawn
         # so the count is durable even if the supervisor is SIGKILLed right
         # after the launcher returns (the independent no-double-spawn proof).
@@ -1268,7 +1279,7 @@ class OpenClawRunLauncher:
             "--json",
             "--timeout", str(timeout_seconds),
         ]
-        subprocess.Popen(
+        popen = subprocess.Popen(
             cmd,
             start_new_session=True,
             stdin=subprocess.DEVNULL,
@@ -1276,6 +1287,10 @@ class OpenClawRunLauncher:
             stderr=subprocess.DEVNULL,
             close_fds=True,
         )
+        # B3: the trusted spawn path returns the child PID so the supervisor
+        # can register process evidence (boot_id + pid + start_ticks).  A
+        # None/placeholder Popen (test seam) yields None.
+        return popen.pid if popen is not None else None
 
 
 def read_launch_counter(counter_path) -> dict:
@@ -1388,6 +1403,8 @@ class Supervisor:
         run_tests_fn: Optional[Callable] = None,
         broker_factory: Optional[Callable[[], WorkspaceBroker]] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        process_registry: Optional["ProcessRegistry"] = None,
+        process_identity_provider: Optional["ProcessIdentityProvider"] = None,
     ):
         self.core = core
         self.controller_source = controller_source
@@ -1418,6 +1435,15 @@ class Supervisor:
         self._run_tests_fn = run_tests_fn
         self._broker_factory = broker_factory or (lambda: WorkspaceBroker())
         self._clock = clock or utcnow
+        # B3: process-registry + identity provider (registered ONLY at the
+        # trusted local spawn path in ``_perform_spawn_run``).  F2: wired
+        # MANDATORY by default (a default instance is created here, never
+        # ``None``), so a restart reconciliation always has registry evidence
+        # to reason about; the identity provider is created lazily.
+        self._process_registry = process_registry or ProcessRegistry(
+            self.core._store
+        )
+        self._process_identity_provider = process_identity_provider
 
     # ---------------------------------------------------------------- utils
 
@@ -3028,16 +3054,50 @@ class Supervisor:
             # F1: re-assert the lease fence IMMEDIATELY before the external
             # spawn effect (a stale holder must never launch an agent).
             self._recheck_lease_fence(job["id"])
-            self._launcher.spawn(
+            pid = self._launcher.spawn(
                 agent_id=AGENT_IDS[d.role], dispatch_id=dispatch_id,
                 message_file=message_file, timeout_seconds=AGENT_TIMEOUT_SECONDS,
             )
+            # B3/F2: register process evidence at the trusted spawn path.  The
+            # registry values (boot_id + pid + start_ticks) come from the
+            # LOCAL identity provider, never from agent output.  An unreadable
+            # identity is persisted as UNKNOWN (never a concrete tuple); a
+            # registration failure leaves NO registration, which recovery
+            # treats as unknown -> LOST (fail-closed, never "surely dead").
+            self._register_process_evidence(job["id"], dispatch_id, pid)
         except Exception as exc:
             self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
             return ActionOutcome("SPAWN_RUN", "failed", str(exc),
                                  dispatch_id=dispatch_id)
         self._finish_action(row["id"], "SUCCEEDED")
         return ActionOutcome("SPAWN_RUN", "executed", dispatch_id=dispatch_id)
+
+    def _register_process_evidence(self, job_id: str, dispatch_id, pid) -> None:
+        """Register process evidence at the trusted spawn path (F2, fail-closed).
+
+        The identity comes from the LOCAL provider, never agent output.  An
+        unreadable identity is persisted as UNKNOWN (never a concrete tuple); a
+        registration failure leaves NO registration, which restart recovery
+        treats as unknown -> LOST (never "surely dead"/takeover).  This must
+        never flip the (already detached) spawn to FAILED.
+        """
+        if pid is None or self._process_registry is None:
+            return
+        identity_provider = self._process_identity_provider \
+            or ProcessIdentityProvider()
+        try:
+            identity = identity_provider.current(pid)
+        except Exception:
+            identity = ProcessIdentity(boot_id=None, pid=pid,
+                                       process_start_ticks=None)
+        try:
+            self._process_registry.register(
+                job_id=job_id, dispatch_id=dispatch_id, identity=identity,
+            )
+        except Exception:
+            # A store failure leaves NO registration; recovery treats a missing
+            # registration as unknown evidence -> LOST (fail-closed).
+            pass
 
     def _build_message_file(self, d: AgentDispatch) -> Path:
         """Write a minimal, privacy-safe prompt to a temp file for the agent."""
@@ -3276,6 +3336,71 @@ class Supervisor:
         return ActionOutcome("APPLY_PATCH_SET", "failed", "workspace_diverged",
                              dispatch_id=dispatch_id)
 
+    def _writer_guard_for(self, job, dispatch_id):
+        """Build a broker writer-binding guard bound to the full fencing token
+        ``(job_id, dispatch_id, owner_instance_id, lease_epoch, facts_version)``
+        captured from a FRESH job read at install time (F1).
+        """
+        from .worktree import writer_guard_for
+        fresh = self.core._store.get_supervisor_job(job["id"])
+        return writer_guard_for(
+            lambda: self.core._store.get_supervisor_job(job["id"]),
+            job_id=job["id"],
+            dispatch_id=dispatch_id,
+            owner_instance_id=(fresh["owner_instance_id"] if fresh else None),
+            lease_epoch=(fresh["lease_epoch"] if fresh else None),
+            facts_version=(fresh["facts_version"] if fresh else None),
+            now_iso=self._now_iso,
+        )
+
+    def bind_writer_worktree(
+        self,
+        job_id: str,
+        *,
+        dispatch_id: str,
+        owner_instance_id: str,
+        lease_epoch: int,
+        repo_identity: Optional[str] = None,
+        base_commit: Optional[str] = None,
+        branch_identity: Optional[str] = None,
+        canonical_path: Optional[str] = None,
+        worktree_root: Optional[str] = None,
+    ) -> dict:
+        """Supervisor-authorized writer/worktree binding primitive (F3).
+
+        Validates and persists, atomically with a lease CAS:
+
+        * the writer dispatch (``dispatch_id``);
+        * the current owner/epoch (``owner_instance_id``/``lease_epoch``);
+        * the canonical worktree path (realpath, no symlink escape, within the
+          fixed ``worktree_root`` when given);
+        * ``repo_identity``/``base_commit``/``branch_identity`` (validated);
+        * ``writer_binding_mode=BOUND``.
+
+        A stale epoch / wrong owner / expired lease raises (fail-closed).
+        """
+        from .worktree import (
+            validate_branch_identity,
+            validate_repo_identity,
+            validate_worktree_binding_path,
+        )
+        path = canonical_path if canonical_path is not None else self._workspace_root
+        if path is None:
+            raise ValueError("no canonical worktree path available to bind")
+        canonical = validate_worktree_binding_path(path, base_root=worktree_root)
+        repo = validate_repo_identity(repo_identity)
+        branch = validate_branch_identity(branch_identity)
+        return self.core._store.bind_writer_worktree(
+            job_id,
+            dispatch_id=dispatch_id,
+            owner_instance_id=owner_instance_id,
+            lease_epoch=lease_epoch,
+            repo_identity=repo,
+            base_commit=base_commit,
+            branch_identity=branch,
+            canonical_worktree_path=canonical,
+        )
+
     def _invoke_broker_locked(self, job, dispatch_id, d, row):
         """Invoke the broker for a persisted APPLY intent exactly once (locked).
 
@@ -3307,6 +3432,35 @@ class Supervisor:
                                  "workspace_identity_mismatch",
                                  dispatch_id=dispatch_id)
         broker = self._broker_factory()
+        # F3: establish the writer/worktree binding (atomic, supervisor-
+        # authorized) so a BOUND job cannot reach the broker with a NULL
+        # binding.  Binding is CAS-fenced against the current lease holder; a
+        # stale epoch raises LeaseFencedError and the broker is never invoked.
+        # An UNLEASED legacy job (owner NULL, the phase2c single-supervisor
+        # path) stays explicitly unbound: no writer binding to enforce.
+        fresh_job = self.core._store.get_supervisor_job(job["id"])
+        if fresh_job is not None \
+                and fresh_job.get("writer_binding_mode") != "BOUND" \
+                and fresh_job.get("owner_instance_id") is not None:
+            self.bind_writer_worktree(
+                job["id"],
+                dispatch_id=dispatch_id,
+                owner_instance_id=fresh_job["owner_instance_id"],
+                lease_epoch=fresh_job["lease_epoch"],
+            )
+        # F1: install a writer-binding guard (fresh job read at guard time, so
+        # a stale writer binding fails closed after any takeover).  Guard
+        # installation is fail-closed: no broker write without an installed
+        # guard (a swallowed ``except Exception: pass`` would open a write path
+        # that bypasses the binding check).
+        try:
+            broker._writer_guard = self._writer_guard_for(job, dispatch_id)
+        except Exception:
+            self._apply_job_backoff(job["id"], "writer_guard_install_failed")
+            return ActionOutcome(
+                "APPLY_PATCH_SET", "failed", "writer_guard_install_failed",
+                dispatch_id=dispatch_id,
+            )
         # F1: re-assert the lease fence IMMEDIATELY before the external
         # workspace/broker effect (a stale holder must never write the
         # workspace).

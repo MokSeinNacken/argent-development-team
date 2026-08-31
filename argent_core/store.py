@@ -59,8 +59,9 @@ from .models import (
     TestRun,
 )
 
-# B1 (Phase B): durable queue / lease schema version bump.
-SCHEMA_VERSION = "7"
+# B3 (Phase B): external waits + minimal process registry + minimal
+# worktree/writer binding (additive).
+SCHEMA_VERSION = "8"
 
 _TASK_STATES = "', '".join(s.value for s in TaskState)
 _TASK_RUN_STATUSES = "', '".join(s.value for s in TaskRunStatus)
@@ -389,6 +390,17 @@ _SCHEMA: tuple[str, ...] = (
         next_eligible_at      TEXT,
         error_class           TEXT NOT NULL DEFAULT 'NONE',
         wait_kind             TEXT NOT NULL DEFAULT 'NONE',
+        canonical_worktree_path TEXT,
+        repo_identity         TEXT,
+        base_commit           TEXT,
+        branch_identity       TEXT,
+        writer_dispatch_id    TEXT,
+        writer_owner_instance_id TEXT,
+        writer_lease_epoch    INTEGER NOT NULL DEFAULT 0 CHECK (writer_lease_epoch >= 0),
+        writer_binding_mode   TEXT CHECK (writer_binding_mode IS NULL OR
+                              writer_binding_mode IN ('BOUND')),
+        expected_head         TEXT,
+        current_head          TEXT,
         created_at            TEXT NOT NULL,
         updated_at            TEXT NOT NULL,
         CHECK ((terminal IS NULL) OR (status = 'TERMINAL' AND next_action = 'NONE'))
@@ -397,6 +409,68 @@ _SCHEMA: tuple[str, ...] = (
     """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_supervisor_jobs_active_task
         ON supervisor_jobs(task_id) WHERE terminal IS NULL
+    """,
+    # V8 (Phase B3): external waits (ARCHITECTURE V1 FINAL §8/§19).
+    # No secrets, no free shell/command/poll fields, no agent prompts.
+    # provider/ref/subject are strictly bounded and allowlist-validated at the
+    # manager layer; kind is a closed CHECK set.
+    """
+    CREATE TABLE IF NOT EXISTS external_waits (
+        wait_id              TEXT PRIMARY KEY,
+        job_id               TEXT NOT NULL
+                             REFERENCES supervisor_jobs(id) ON DELETE CASCADE,
+        kind                 TEXT NOT NULL CHECK (kind IN
+                             ('CI','UPSTREAM','RATE_LIMIT','NETWORK','TIMER')),
+        provider             TEXT NOT NULL,
+        ref                  TEXT NOT NULL,
+        expected_subject     TEXT,
+        last_observed_state  TEXT,
+        next_check_at        TEXT NOT NULL,
+        deadline_at          TEXT,
+        check_attempt        INTEGER NOT NULL DEFAULT 0 CHECK (check_attempt >= 0),
+        event_version        INTEGER NOT NULL DEFAULT 0 CHECK (event_version >= 0),
+        terminal_observed_at TEXT,
+        created_at           TEXT NOT NULL,
+        updated_at           TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_external_waits_job
+        ON external_waits(job_id, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_external_waits_due
+        ON external_waits(terminal_observed_at, next_check_at)
+    """,
+    # V8 (Phase B3): minimal process registry (ARCHITECTURE V1 FINAL §6/§19).
+    # Identity = (boot_id, pid, process_start_ticks).  Registered ONLY at the
+    # trusted local spawn path; no agent sets these values.  cgroup_ref is a
+    # forward-looking placeholder (resource policy is Phase C).
+    """
+    CREATE TABLE IF NOT EXISTS process_registry (
+        process_id           TEXT PRIMARY KEY,
+        job_id               TEXT NOT NULL
+                             REFERENCES supervisor_jobs(id) ON DELETE CASCADE,
+        dispatch_id          TEXT REFERENCES agent_dispatches(id) ON DELETE SET NULL,
+        pid                  INTEGER NOT NULL CHECK (pid > 0),
+        boot_id              TEXT,
+        process_start_ticks  INTEGER,
+        cgroup_ref           TEXT,
+        status               TEXT NOT NULL DEFAULT 'RUNNING' CHECK (status IN
+                             ('RUNNING','TERMINAL','UNKNOWN')),
+        created_at           TEXT NOT NULL,
+        last_observed_at     TEXT,
+        terminal_at          TEXT,
+        exit_code            INTEGER
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_process_registry_job
+        ON process_registry(job_id, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_process_registry_identity
+        ON process_registry(boot_id, pid, process_start_ticks)
     """,
     """
     CREATE TABLE IF NOT EXISTS supervisor_actions (
@@ -883,6 +957,41 @@ class Store:
                         "UPDATE supervisor_jobs SET primary_state = ? WHERE id = ?",
                         (ps, r["id"]),
                     )
+
+        # --- B3 (Phase B): minimal worktree/writer binding (additive) ------
+        # Fresh CREATE TABLE already carries these columns; an existing table
+        # (earlier build) gains them idempotently here.  ``writer_lease_epoch``
+        # defaults to 0 (no writer).  No full Worktree Registry (Phase I).
+        sjcols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(supervisor_jobs)")
+        }
+        for col, ddl in (
+            ("canonical_worktree_path",
+             "ALTER TABLE supervisor_jobs ADD COLUMN canonical_worktree_path TEXT"),
+            ("repo_identity",
+             "ALTER TABLE supervisor_jobs ADD COLUMN repo_identity TEXT"),
+            ("base_commit",
+             "ALTER TABLE supervisor_jobs ADD COLUMN base_commit TEXT"),
+            ("branch_identity",
+             "ALTER TABLE supervisor_jobs ADD COLUMN branch_identity TEXT"),
+            ("writer_dispatch_id",
+             "ALTER TABLE supervisor_jobs ADD COLUMN writer_dispatch_id TEXT"),
+            ("writer_owner_instance_id",
+             "ALTER TABLE supervisor_jobs ADD COLUMN writer_owner_instance_id TEXT"),
+            ("writer_lease_epoch",
+             "ALTER TABLE supervisor_jobs ADD COLUMN writer_lease_epoch INTEGER "
+             "NOT NULL DEFAULT 0 CHECK (writer_lease_epoch >= 0)"),
+            ("writer_binding_mode",
+             "ALTER TABLE supervisor_jobs ADD COLUMN writer_binding_mode TEXT "
+             "CHECK (writer_binding_mode IS NULL OR writer_binding_mode IN "
+             "('BOUND'))"),
+            ("expected_head",
+             "ALTER TABLE supervisor_jobs ADD COLUMN expected_head TEXT"),
+            ("current_head",
+             "ALTER TABLE supervisor_jobs ADD COLUMN current_head TEXT"),
+        ):
+            if col not in sjcols:
+                self._conn.execute(ddl)
 
         # UPSERT the schema version after successful DDL + migration.
         self._conn.execute(
@@ -2050,6 +2159,10 @@ class Store:
             "primary_state", "queue_reason", "priority",
             "owner_instance_id", "lease_epoch", "lease_expires_at",
             "next_eligible_at", "error_class", "wait_kind",
+            "canonical_worktree_path", "repo_identity", "base_commit",
+            "branch_identity", "writer_dispatch_id",
+            "writer_owner_instance_id", "writer_lease_epoch",
+            "expected_head", "current_head", "writer_binding_mode",
         }
     )
 
@@ -2060,6 +2173,23 @@ class Store:
             "patch_set_json",
             "status", "attempt_count", "next_attempt_at", "started_at",
             "finished_at", "last_error_code", "created_at", "updated_at",
+        }
+    )
+
+    _EXTERNAL_WAIT_COLUMNS: frozenset[str] = frozenset(
+        {
+            "wait_id", "job_id", "kind", "provider", "ref", "expected_subject",
+            "last_observed_state", "next_check_at", "deadline_at",
+            "check_attempt", "event_version", "terminal_observed_at",
+            "created_at", "updated_at",
+        }
+    )
+
+    _PROCESS_REGISTRY_COLUMNS: frozenset[str] = frozenset(
+        {
+            "process_id", "job_id", "dispatch_id", "pid", "boot_id",
+            "process_start_ticks", "cgroup_ref", "status", "created_at",
+            "last_observed_at", "terminal_at", "exit_code",
         }
     )
 
@@ -2086,6 +2216,21 @@ class Store:
         return [dict(r) for r in rows]
 
     def _insert_supervisor_job(self, row: dict) -> None:
+        row = dict(row)
+        # B3: the minimal worktree/writer columns are newly added nullable
+        # columns; older callers/tests that build a partial job row may omit
+        # them, so default them here (mirrors the ``patch_set_json`` defaulting
+        # on supervisor_actions).
+        for col in (
+            "canonical_worktree_path", "repo_identity", "base_commit",
+            "branch_identity", "writer_dispatch_id",
+            "writer_owner_instance_id", "expected_head", "current_head",
+            "writer_binding_mode",
+        ):
+            if col not in row:
+                row[col] = None
+        if "writer_lease_epoch" not in row:
+            row["writer_lease_epoch"] = 0
         missing = [c for c in self._SUPERVISOR_JOB_COLUMNS if c not in row]
         if missing:
             raise ValueError(f"missing supervisor_jobs columns: {missing}")
@@ -2672,6 +2817,69 @@ class Store:
         if expires is None or expires <= now_iso:
             raise LeaseFencedError(f"lease expired for job {job_id!r}")
 
+    # -- B3 writer/worktree binding primitive (F3) --------------------------
+
+    def bind_writer_worktree(
+        self,
+        job_id: str,
+        *,
+        dispatch_id: str,
+        owner_instance_id: str,
+        lease_epoch: int,
+        repo_identity: Optional[str],
+        base_commit: Optional[str],
+        branch_identity: Optional[str],
+        canonical_worktree_path: str,
+    ) -> dict:
+        """Atomically persist the writer/worktree binding (supervisor-authorized).
+
+        Fences: the job MUST currently be held by ``(owner_instance_id,
+        lease_epoch)`` with an unexpired lease.  Persists the writer dispatch,
+        the current owner/epoch, the canonical path, the repo/base/branch
+        identity and sets ``writer_binding_mode=BOUND`` in ONE transaction.  A
+        stale epoch / wrong owner / expired lease raises :class:`LeaseFencedError`
+        (rollback — no partial binding).
+        """
+        self._validate_lease_owner(owner_instance_id)
+        if not isinstance(lease_epoch, int) or lease_epoch < 1:
+            raise ValueError("lease_epoch must be a positive integer")
+        if not isinstance(dispatch_id, str) or not dispatch_id.strip():
+            raise ValueError("dispatch_id must be a non-empty string")
+        if not isinstance(canonical_worktree_path, str) or not canonical_worktree_path:
+            raise ValueError("canonical_worktree_path must be a non-empty string")
+        now_iso = self.now_iso()
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            job = dict(row)
+            if job["owner_instance_id"] != owner_instance_id:
+                raise LeaseFencedError(
+                    f"bind writer: owner mismatch for job {job_id!r}"
+                )
+            if job["lease_epoch"] != lease_epoch:
+                raise LeaseFencedError(
+                    f"bind writer: epoch mismatch for job {job_id!r}"
+                )
+            if job["lease_expires_at"] is None or job["lease_expires_at"] <= now_iso:
+                raise LeaseFencedError(
+                    f"bind writer: lease expired for job {job_id!r}"
+                )
+            self._update_supervisor_job(
+                job_id,
+                writer_dispatch_id=dispatch_id,
+                writer_owner_instance_id=owner_instance_id,
+                writer_lease_epoch=lease_epoch,
+                repo_identity=repo_identity,
+                base_commit=base_commit,
+                branch_identity=branch_identity,
+                canonical_worktree_path=canonical_worktree_path,
+                writer_binding_mode="BOUND",
+            )
+            return self.get_supervisor_job(job_id)
+
     # -- F1 (Phase B2): in-transaction action fence ---------------------------
     #
     # A lease decision is authored under an exact (owner, epoch, facts_version)
@@ -2866,6 +3074,250 @@ class Store:
                 bump_facts_version=True,
                 now_iso=now_iso,
             )
+
+    # -- B3 external waits (atomic transition + bounded requeue) -----------
+    #
+    # ``transition_to_waiting_external`` is the SINGLE trusted path that moves a
+    # leased RUNNING job to WAITING_EXTERNAL.  The wait row and the job
+    # transition (including lease release) commit in ONE ``BEGIN IMMEDIATE`` so
+    # there is no intermediate state: never a WAITING_EXTERNAL job without its
+    # wait row, never a wait row while the job is still RUNNING.
+
+    def _insert_external_wait(self, row: dict) -> None:
+        missing = [c for c in self._EXTERNAL_WAIT_COLUMNS if c not in row]
+        if missing:
+            raise ValueError(f"missing external_waits columns: {missing}")
+        cols = sorted(row.keys())
+        ph = ", ".join("?" for _ in cols)
+        self._conn.execute(
+            f"INSERT INTO external_waits ({', '.join(cols)}) VALUES ({ph})",
+            tuple(row[c] for c in cols),
+        )
+
+    def get_external_wait(self, wait_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM external_waits WHERE wait_id = ?", (wait_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_external_waits(self, job_id: Optional[str] = None) -> list[dict]:
+        q = "SELECT * FROM external_waits"
+        params: list = []
+        if job_id is not None:
+            q += " WHERE job_id = ?"
+            params.append(job_id)
+        q += " ORDER BY rowid"
+        rows = self._conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_due_external_waits(self, now_iso: str, limit: int) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM external_waits WHERE terminal_observed_at IS NULL "
+            "AND (next_check_at <= ? OR deadline_at <= ?) "
+            "ORDER BY next_check_at LIMIT ?",
+            (now_iso, now_iso, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _update_external_wait(self, wait_id: str, **fields) -> int:
+        unknown = set(fields) - (self._EXTERNAL_WAIT_COLUMNS - {"wait_id", "created_at"})
+        if unknown:
+            raise ValueError(f"unknown external_waits columns: {sorted(unknown)}")
+        if not fields:
+            return 0
+        assignments = ", ".join(f"{c} = ?" for c in fields)
+        cur = self._conn.execute(
+            f"UPDATE external_waits SET {assignments} WHERE wait_id = ?",
+            list(fields.values()) + [wait_id],
+        )
+        return cur.rowcount
+
+    def transition_to_waiting_external(
+        self,
+        job_id: str,
+        *,
+        wait_row: dict,
+        owner_instance_id: str,
+        lease_epoch: int,
+    ) -> dict:
+        """Atomically persist a validated wait row and move a leased RUNNING
+        job to WAITING_EXTERNAL (releasing the lease).
+
+        Fencing: the job MUST currently be RUNNING and held by
+        ``(owner_instance_id, lease_epoch)`` with an unexpired lease.  Any
+        mismatch raises and the whole transaction (including the wait insert)
+        rolls back — no half-wait state.
+        """
+        self._validate_lease_owner(owner_instance_id)
+        _validate_enum_fields({"wait_kind": wait_row["kind"]})
+        now_iso = self.now_iso()
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            job = dict(row)
+            if job["primary_state"] != job_state.PrimaryState.RUNNING.value:
+                raise LeaseError(
+                    f"job {job_id!r} is {job['primary_state']!r}; "
+                    f"wait entry requires RUNNING"
+                )
+            if job["owner_instance_id"] != owner_instance_id:
+                raise LeaseError(f"wait entry owner mismatch for job {job_id!r}")
+            if job["lease_epoch"] != lease_epoch:
+                raise LeaseError(f"wait entry epoch mismatch for job {job_id!r}")
+            if job["lease_expires_at"] is None or job["lease_expires_at"] <= now_iso:
+                raise LeaseError(f"lease expired for job {job_id!r}")
+            self._insert_external_wait(wait_row)
+            updated = self._transition_job(
+                job_id,
+                to_primary_state=job_state.PrimaryState.WAITING_EXTERNAL.value,
+                to_status="WAITING_RUN",
+                fields={
+                    "owner_instance_id": None,
+                    "lease_expires_at": None,
+                    "wait_kind": wait_row["kind"],
+                    "next_wake_at": wait_row["next_check_at"],
+                    "next_eligible_at": wait_row["next_check_at"],
+                    "next_action": "WAIT",
+                },
+                bump_facts_version=True,
+                cas_primary_state=job_state.PrimaryState.RUNNING.value,
+                cas_owner_instance_id=owner_instance_id,
+                cas_lease_epoch=lease_epoch,
+                cas_lease_unexpired=True,
+                now_iso=now_iso,
+            )
+        return updated
+
+    def complete_wait_and_requeue(
+        self,
+        wait_id: str,
+        *,
+        queue_reason: str,
+        error_class: str = "NONE",
+        observed_state: Optional[str] = None,
+        event_version: Optional[int] = None,
+        now_iso: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Atomically mark a wait terminal and requeue its job to QUEUED.
+
+        Idempotent/dedup-safe: returns ``None`` (and writes nothing) when the
+        wait is already terminal or the job has already left WAITING_EXTERNAL.
+        The job is NEVER set to DONE/FAILED here — only QUEUED, so a later
+        scheduler admission/claim decides what happens next.
+        """
+        now_iso = now_iso or self.now_iso()
+        with self._transaction():
+            wrow = self._conn.execute(
+                "SELECT * FROM external_waits WHERE wait_id = ?", (wait_id,)
+            ).fetchone()
+            if wrow is None:
+                return None
+            wait = dict(wrow)
+            if wait["terminal_observed_at"] is not None:
+                return None
+            job = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (wait["job_id"],)
+            ).fetchone()
+            if job is None:
+                raise NotFound(f"supervisor job {wait['job_id']!r} not found")
+            j = dict(job)
+            if j["primary_state"] != job_state.PrimaryState.WAITING_EXTERNAL.value:
+                return None
+            updates = {"terminal_observed_at": now_iso, "updated_at": now_iso}
+            if observed_state is not None:
+                updates["last_observed_state"] = observed_state
+            if event_version is not None:
+                updates["event_version"] = event_version
+            self._update_external_wait(wait_id, **updates)
+            updated = self._transition_job(
+                wait["job_id"],
+                to_primary_state=job_state.PrimaryState.QUEUED.value,
+                to_status="WAITING_RUN",
+                fields={
+                    "queue_reason": queue_reason,
+                    "error_class": error_class,
+                    "wait_kind": job_state.WaitKind.NONE.value,
+                    "owner_instance_id": None,
+                    "lease_expires_at": None,
+                    "next_eligible_at": now_iso,
+                    "next_wake_at": None,
+                    "next_action": "NONE",
+                },
+                bump_facts_version=True,
+                cas_primary_state=job_state.PrimaryState.WAITING_EXTERNAL.value,
+                now_iso=now_iso,
+            )
+        return updated
+
+    # -- B3 minimal process registry ---------------------------------------
+
+    def _insert_process_registration(self, row: dict) -> None:
+        missing = [c for c in self._PROCESS_REGISTRY_COLUMNS if c not in row]
+        if missing:
+            raise ValueError(f"missing process_registry columns: {missing}")
+        cols = sorted(row.keys())
+        ph = ", ".join("?" for _ in cols)
+        self._conn.execute(
+            f"INSERT INTO process_registry ({', '.join(cols)}) VALUES ({ph})",
+            tuple(row[c] for c in cols),
+        )
+
+    def get_process_registration(self, process_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM process_registry WHERE process_id = ?", (process_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_process_registration_for_dispatch(
+        self, dispatch_id: str
+    ) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM process_registry WHERE dispatch_id = ? "
+            "ORDER BY rowid DESC LIMIT 1",
+            (dispatch_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_process_registrations(
+        self, job_id: Optional[str] = None
+    ) -> list[dict]:
+        q = "SELECT * FROM process_registry"
+        params: list = []
+        if job_id is not None:
+            q += " WHERE job_id = ?"
+            params.append(job_id)
+        q += " ORDER BY rowid"
+        rows = self._conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def _update_process_registration(self, process_id: str, **fields) -> int:
+        unknown = set(fields) - (
+            self._PROCESS_REGISTRY_COLUMNS - {"process_id", "created_at"}
+        )
+        if unknown:
+            raise ValueError(f"unknown process_registry columns: {sorted(unknown)}")
+        if not fields:
+            return 0
+        assignments = ", ".join(f"{c} = ?" for c in fields)
+        cur = self._conn.execute(
+            f"UPDATE process_registry SET {assignments} WHERE process_id = ?",
+            list(fields.values()) + [process_id],
+        )
+        return cur.rowcount
+
+    def _mark_process_terminal(
+        self, process_id: str, *, exit_code: Optional[int], terminal_at: str
+    ) -> int:
+        return self._update_process_registration(
+            process_id,
+            status="TERMINAL",
+            exit_code=exit_code,
+            terminal_at=terminal_at,
+            last_observed_at=terminal_at,
+        )
 
     def get_supervisor_action(self, action_id: str) -> Optional[dict]:
         row = self._conn.execute(
