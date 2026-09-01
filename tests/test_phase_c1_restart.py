@@ -1,8 +1,11 @@
 """Phase C1 — migration / reopen / restart acceptance (deterministic).
 
-Proves the additive V8→V9 migration, backfill of ``resource_class='LIGHT'``,
-idempotent reopen, and that a persisted ``last_resource_*`` decision NEVER
-authorises an automatic admission (a new claim always re-runs preflight).
+Proves the additive migration to the CURRENT schema version (C1 added the
+resource-class + ``last_resource_*`` audit columns; C2 later bumps
+``SCHEMA_VERSION`` and adds execution-scope columns), backfill of
+``resource_class='LIGHT'``, idempotent reopen, and that a persisted
+``last_resource_*`` decision NEVER authorises an automatic admission (a new
+claim always re-runs preflight).
 """
 
 from __future__ import annotations
@@ -127,11 +130,11 @@ def _job_cols(core) -> set:
         "PRAGMA table_info(supervisor_jobs)")}
 
 
-def test_fresh_db_lands_on_v9_with_resource_columns(tmp_path):
+def test_fresh_db_lands_on_current_version_with_resource_columns(tmp_path):
     db = str(tmp_path / "fresh.db")
     core = Core(db)
     try:
-        assert _schema_version(core) == SCHEMA_VERSION == "9"
+        assert _schema_version(core) == SCHEMA_VERSION
         cols = _job_cols(core)
         for c in ("resource_class", "last_resource_decision",
                   "last_resource_reason_code", "last_resource_snapshot_hash",
@@ -141,12 +144,12 @@ def test_fresh_db_lands_on_v9_with_resource_columns(tmp_path):
         core.close()
 
 
-def test_migrate_v8_to_v9_adds_resource_columns_and_backfills_light(tmp_path):
+def test_migrate_v8_to_current_adds_resource_columns_and_backfills_light(tmp_path):
     db = str(tmp_path / "v8.db")
     _build_v8_db(db)
     core = Core(db)
     try:
-        assert _schema_version(core) == "9"
+        assert _schema_version(core) == SCHEMA_VERSION
         cols = _job_cols(core)
         for c in ("resource_class", "last_resource_decision",
                   "last_resource_reason_code", "last_resource_snapshot_hash",
@@ -171,7 +174,7 @@ def test_reopen_is_idempotent(tmp_path):
 
     c2 = Core(db)
     try:
-        assert _schema_version(c2) == v1 == "9"
+        assert _schema_version(c2) == v1 == SCHEMA_VERSION
         assert c2._store.get_supervisor_job("j1") == j1
         assert c2._store.get_supervisor_job("j1")["resource_class"] == "LIGHT"
     finally:

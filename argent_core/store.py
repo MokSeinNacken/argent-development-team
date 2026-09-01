@@ -27,6 +27,7 @@ from . import events as events_mod
 from . import job_state
 from .gates import binding_hash
 from .resource_policy import RESOURCE_CLASS_VALUES, ResourceClass
+from .resource_failure import TERMINATION_CLASS_VALUES
 from .worktree import (
     V_AMBIGUOUS_WRITER,
     V_BLOCKED_DIVERGED,
@@ -71,7 +72,8 @@ from .models import (
 # worktree/writer binding (additive).
 # C1 (Phase C): resource class + bounded last-resource-decision audit columns
 # (additive).  Enforcement (cgroup/systemd-run/prlimit) is Phase C2.
-SCHEMA_VERSION = "9"
+# C2 (Phase C): bounded execution-scope evidence on process_registry (additive).
+SCHEMA_VERSION = "10"
 
 _TASK_STATES = "', '".join(s.value for s in TaskState)
 _TASK_RUN_STATUSES = "', '".join(s.value for s in TaskRunStatus)
@@ -85,6 +87,8 @@ _EXT_ACTION_POLICIES = "', '".join(p.value for p in ExternalActionsPolicy)
 _DISPATCH_STATUSES = "', '".join(s.value for s in DispatchStatus)
 _SEQUENCE_KINDS = "', '".join(k.value for k in SequenceKind)
 _PRIMARY_STATES = "', '".join(job_state.PRIMARY_STATE_VALUES)
+_TERMINATION_CLASSES = "', '".join(TERMINATION_CLASS_VALUES)
+_RESOURCE_CLASSES = "', '".join(RESOURCE_CLASS_VALUES)
 
 # B1 (F7): upper policy bound for any lease TTL (caller-supplied local policy).
 # Values above this are rejected fail-closed so a misconfigured controller can
@@ -468,7 +472,7 @@ _SCHEMA: tuple[str, ...] = (
     # Identity = (boot_id, pid, process_start_ticks).  Registered ONLY at the
     # trusted local spawn path; no agent sets these values.  cgroup_ref is a
     # forward-looking placeholder (resource policy is Phase C).
-    """
+    f"""
     CREATE TABLE IF NOT EXISTS process_registry (
         process_id           TEXT PRIMARY KEY,
         job_id               TEXT NOT NULL
@@ -478,6 +482,15 @@ _SCHEMA: tuple[str, ...] = (
         boot_id              TEXT,
         process_start_ticks  INTEGER,
         cgroup_ref           TEXT,
+        scope_ref            TEXT,
+        resource_class       TEXT CHECK (resource_class IN
+                             ('{_RESOURCE_CLASSES}')),
+        policy_version       TEXT,
+        effective_limits     TEXT,
+        termination_class    TEXT CHECK (termination_class IS NULL OR
+                             termination_class IN ('{_TERMINATION_CLASSES}')),
+        timed_out            INTEGER NOT NULL DEFAULT 0 CHECK (timed_out IN (0,1)),
+        scope_events         TEXT,
         status               TEXT NOT NULL DEFAULT 'RUNNING' CHECK (status IN
                              ('RUNNING','TERMINAL','UNKNOWN')),
         created_at           TEXT NOT NULL,
@@ -1040,6 +1053,38 @@ class Store:
              "ALTER TABLE supervisor_jobs ADD COLUMN last_resource_at TEXT"),
         ):
             if col not in sjcols:
+                self._conn.execute(ddl)
+
+        # --- C2 (Phase C): bounded execution-scope evidence (additive) -----
+        # ``cgroup_ref`` (B3 placeholder) now stores the cgroup PATH; ``scope_ref``
+        # stores the systemd scope/unit name (two distinct purposes, no dup).
+        # ``effective_limits`` / ``scope_events`` are bounded JSON (<= 4096 bytes,
+        # serialized by ``ProcessRegistry``); ``termination_class`` is a closed
+        # CHECK set; ``timed_out`` is 0/1.  All NULL-able (older rows stay valid).
+        prcols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(process_registry)")
+        }
+        for col, ddl in (
+            ("scope_ref",
+             "ALTER TABLE process_registry ADD COLUMN scope_ref TEXT"),
+            ("resource_class",
+             f"ALTER TABLE process_registry ADD COLUMN resource_class TEXT "
+             f"CHECK (resource_class IN ('{_RESOURCE_CLASSES}'))"),
+            ("policy_version",
+             "ALTER TABLE process_registry ADD COLUMN policy_version TEXT"),
+            ("effective_limits",
+             "ALTER TABLE process_registry ADD COLUMN effective_limits TEXT"),
+            ("termination_class",
+             f"ALTER TABLE process_registry ADD COLUMN termination_class TEXT "
+             f"CHECK (termination_class IS NULL OR termination_class IN "
+             f"('{_TERMINATION_CLASSES}'))"),
+            ("timed_out",
+             "ALTER TABLE process_registry ADD COLUMN timed_out INTEGER NOT NULL "
+             "DEFAULT 0 CHECK (timed_out IN (0,1))"),
+            ("scope_events",
+             "ALTER TABLE process_registry ADD COLUMN scope_events TEXT"),
+        ):
+            if col not in prcols:
                 self._conn.execute(ddl)
 
         # UPSERT the schema version after successful DDL + migration.
@@ -2240,8 +2285,11 @@ class Store:
     _PROCESS_REGISTRY_COLUMNS: frozenset[str] = frozenset(
         {
             "process_id", "job_id", "dispatch_id", "pid", "boot_id",
-            "process_start_ticks", "cgroup_ref", "status", "created_at",
-            "last_observed_at", "terminal_at", "exit_code",
+            "process_start_ticks", "cgroup_ref", "scope_ref",
+            "resource_class", "policy_version", "effective_limits",
+            "termination_class", "timed_out", "scope_events",
+            "status", "created_at", "last_observed_at", "terminal_at",
+            "exit_code",
         }
     )
 
@@ -3706,6 +3754,35 @@ class Store:
             exit_code=exit_code,
             terminal_at=terminal_at,
             last_observed_at=terminal_at,
+        )
+
+    def mark_process_terminal_with_evidence(
+        self,
+        process_id: str,
+        *,
+        exit_code: Optional[int],
+        terminal_at: str,
+        termination_class: Optional[str] = None,
+        timed_out: bool = False,
+        scope_events: Optional[str] = None,
+    ) -> int:
+        """Mark a registration TERMINAL and persist C2 termination evidence.
+
+        ``termination_class`` (closed enum), ``timed_out`` (0/1) and
+        ``scope_events`` (bounded JSON, serialized by the caller via
+        :func:`argent_core.process_registry._bounded_json`) are post-termination
+        evidence for C3 (F5).  ``scope_events`` is already a JSON string or
+        ``None``.
+        """
+        return self._update_process_registration(
+            process_id,
+            status="TERMINAL",
+            exit_code=exit_code,
+            terminal_at=terminal_at,
+            last_observed_at=terminal_at,
+            termination_class=termination_class,
+            timed_out=1 if timed_out else 0,
+            scope_events=scope_events,
         )
 
     def get_supervisor_action(self, action_id: str) -> Optional[dict]:

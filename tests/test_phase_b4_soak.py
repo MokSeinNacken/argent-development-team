@@ -29,8 +29,16 @@ from argent_core.external_wait import (
 )
 from argent_core.job_state import PrimaryState
 from argent_core.models import LeaseError
+from argent_core.resource_governor import (
+    AdmissionDecision,
+    AdmissionVerdict,
+    ResourceReasonCode,
+)
+from argent_core.resource_policy import ResourceClass, ResourcePolicy
 from argent_core.scheduler import Scheduler
+from argent_core.scope_enforcer import ExecutionEnforcer
 from argent_core.supervisor import Supervisor
+from c2_helpers import FakeGovernor, FakeScopeBackend, FakeSnapshotProvider
 from mock_supervisor_runtime import FakeClock, FakeRunLauncher, FakeRunStatusProvider
 
 OWNER = OWNER_SOURCE
@@ -40,10 +48,43 @@ REOPEN_EVERY = 50
 LEASE_TTL = 30
 
 
+def _light_limits():
+    pol = ResourcePolicy()
+    b = pol.limits_for(ResourceClass.LIGHT)
+    return {
+        "memory_high_bytes": b.memory_high_bytes,
+        "memory_max_bytes": b.memory_max_bytes,
+        "swap_max_bytes": b.swap_max_bytes,
+        "cpu_quota_percent": b.cpu_quota_percent,
+        "timeout_seconds": b.timeout_seconds,
+    }
+
+
+def _allow_admission():
+    return AdmissionDecision(
+        resource_class=ResourceClass.LIGHT.value,
+        policy_version="1",
+        snapshot_ref="snap-1",
+        decision=AdmissionVerdict.ALLOW.value,
+        reason_code=ResourceReasonCode.OK.value,
+        next_eligible_at=None,
+        effective_limits=_light_limits(),
+        timestamp="2026-09-01T00:00:00+00:00",
+    )
+
+
 def _build_env(db_path, clock):
     core = Core(db_path, clock=clock)
     project = core.create_project("p", OWNER)
-    sup = Supervisor(core, FakeRunStatusProvider(), FakeRunLauncher(), clock=clock)
+    # C2: spawn now goes through the execution enforcer (never the legacy
+    # launcher); inject a deterministic fake enforcer + governor/snapshot so
+    # this soak stays offline (no real systemd-run / host reads).
+    sup = Supervisor(
+        core, FakeRunStatusProvider(), FakeRunLauncher(), clock=clock,
+        enforcer=ExecutionEnforcer(FakeScopeBackend()),
+        resource_governor=FakeGovernor(_allow_admission()),
+        snapshot_provider=FakeSnapshotProvider(),
+    )
     sched = Scheduler(sup, owner_instance_id="soak-A", lease_ttl_seconds=LEASE_TTL)
     adapter = FakeExternalWaitAdapter()
     adapter.set_sticky("ci", "org/repo#run", WaitObservation(

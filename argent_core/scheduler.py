@@ -87,6 +87,7 @@ OUTCOME_RELEASED = "released"
 OUTCOME_FENCED = "fenced"
 OUTCOME_RESOURCE_DEFERRED = "resource_deferred"
 OUTCOME_RESOURCE_DENIED = "resource_denied"
+OUTCOME_RESOURCE_LOST = "resource_lost"
 
 #: Far-future ``next_eligible_at`` delay (seconds) for DENY_LOCAL: prevents an
 #: identical automatic retry without inventing a new primary state.  The job
@@ -144,6 +145,11 @@ class Scheduler:
         renew_ttl_seconds: Optional[int] = None,
         resource_governor: Optional[ResourceGovernor] = None,
         snapshot_provider: Optional[HostSnapshotProvider] = None,
+        # C2: execution enforcement (opt-in).  ``enforcer``/``scope_backend`` are
+        # resolved from the injected value -> the supervisor's value -> None (no
+        # auto-creation, so existing deterministic C1/B tests stay unaffected).
+        enforcer=None,
+        scope_backend=None,
     ):
         if not isinstance(owner_instance_id, str) or not owner_instance_id.strip():
             raise ValueError("owner_instance_id must be a non-empty string")
@@ -192,6 +198,25 @@ class Scheduler:
         # Job currently being preflighted (excluded from the active-jobs view so
         # a job never concurrency-blocks itself).  Set by ``_resource_preflight``.
         self._preflight_job_id: Optional[str] = None
+
+        # C2: wire the resolved governor/provider back onto the supervisor so
+        # the supervisor's ``_perform_spawn_run`` performs its own FRESH C1
+        # admission from the SAME policy + snapshot provider this scheduler
+        # uses for its admission gate (single source — never from agent output).
+        if getattr(supervisor, "_resource_governor", None) is None:
+            supervisor._resource_governor = self._governor
+        if getattr(supervisor, "_snapshot_provider", None) is None:
+            supervisor._snapshot_provider = self._snapshot_provider
+        # Resolve and wire the enforcement path.  F1: the Supervisor already
+        # wires a real ``ExecutionEnforcer(SystemdRunScopeBackend())`` by
+        # default, so ``supervisor._enforcer`` is never ``None`` in production;
+        # an explicitly injected fake overrides it here.
+        enforcer = enforcer or getattr(supervisor, "_enforcer", None)
+        if enforcer is not None:
+            supervisor._enforcer = enforcer
+            supervisor._scope_backend = (
+                scope_backend or getattr(supervisor, "_scope_backend", None)
+            )
 
     # ------------------------------------------------------------------ pass
 
@@ -434,6 +459,52 @@ class Scheduler:
             last_resource_at=decision.timestamp,
         )
 
+    def _enforcement_failed_job(self, job_id: str, epoch: int, reason_code) -> None:
+        """C2: requeue a scoped-spawn enforcement failure as QUEUED (RESOURCE).
+
+        Mirrors :meth:`_defer_resource_job`: the job stays QUEUED with
+        ``error_class=RESOURCE`` and a bounded ``next_eligible_at`` (no new
+        primary state, no CODE_FAILURE, no rework).  The holder-CAS enqueue
+        clears the lease; a stale/foreign holder is refused (LeaseError) and the
+        job is left for its current holder.
+        """
+        policy = self._governor.policy
+        now_iso = self._supervisor._now_iso()
+        try:
+            dt = datetime.fromisoformat(now_iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            next_eligible_at = (
+                dt + timedelta(seconds=policy.defer_retry_seconds)
+            ).isoformat()
+        except (ValueError, TypeError):
+            next_eligible_at = None
+        self._supervisor.store.enqueue_job(
+            job_id,
+            queue_reason=job_state.QueueReason.RESOURCE_DEFERRED.value,
+            next_eligible_at=next_eligible_at,
+            error_class=job_state.ErrorClass.RESOURCE.value,
+            error_code=reason_code,
+            owner_instance_id=self.owner_instance_id,
+            lease_epoch=epoch,
+            last_resource_decision=AdmissionVerdict.DEFER.value,
+            last_resource_reason_code=reason_code,
+        )
+
+    def _enforcement_lost_job(self, job_id: str, epoch: int, reason_code) -> None:
+        """C2/F2: quarantine an unprovable-cleanup enforcement failure as LOST.
+
+        A scope whose cleanup could not be proven inactive means a process may
+        still be running — the job must NEVER be silently re-admitted (no
+        DEFER-requeue).  It is quarantined via the existing
+        ``quarantine_lost`` path (fail-closed, no respawn, no takeover).
+        """
+        self._supervisor.store.quarantine_lost(
+            job_id,
+            error_code=reason_code or "SCOPE_CLEANUP_UNVERIFIED",
+            expected=None,
+        )
+
     def _deny_resource_job(self, job_id: str, epoch: int, decision) -> None:
         """DENY_LOCAL: requeue as QUEUED (no spawn) with a far-future horizon."""
         far = self._supervisor._now_iso()
@@ -519,11 +590,13 @@ class Scheduler:
             )
 
         # C1/F3: spawn-adjacent preflight is the BINDING admission point.  A
-        # fresh preflight runs immediately before the only spawning action in
-        # this path (SPAWN_RUN), regardless of ``held``, so a later pass cannot
-        # spawn under a since-changed memory/swap/disk state.  DEFER/DENY_LOCAL
-        # requeue without any launcher call; PREFER_EXTERNAL is a hint only.
-        if decision.action == ReconcileAction.SPAWN_RUN:
+        # fresh preflight runs immediately before the resource-relevant actions
+        # in this path (SPAWN_RUN and RUN_SANDBOX_TESTS), regardless of
+        # ``held``, so a later pass cannot spawn under a since-changed
+        # memory/swap/disk state.  DEFER/DENY_LOCAL requeue without any
+        # launcher call; PREFER_EXTERNAL is a hint only.
+        if decision.action in (ReconcileAction.SPAWN_RUN,
+                               ReconcileAction.RUN_SANDBOX_TESTS):
             gate = self._resource_gate(
                 target_job_id, epoch, self._resource_preflight(target_job_id)
             )
@@ -539,6 +612,27 @@ class Scheduler:
             return SchedulerPassResult(
                 OUTCOME_FENCED, job_id=target_job_id, decision=decision,
                 detail=str(exc),
+            )
+
+        # C2: a scoped-spawn enforcement failure (no process started) must
+        # requeue the job as QUEUED with error_class=RESOURCE + a bounded
+        # ``next_eligible_at`` (the existing DEFER path — no new primary state,
+        # no CODE_FAILURE, no rework).
+        if action_outcome.status == "resource_enforcement_failed":
+            self._enforcement_failed_job(target_job_id, epoch, action_outcome.detail)
+            return SchedulerPassResult(
+                OUTCOME_RESOURCE_DEFERRED, job_id=target_job_id,
+                detail=action_outcome.detail,
+            )
+
+        # F2: a cleanup that could NOT be proven inactive must quarantine the
+        # job as LOST (never a DEFER-requeue — a possibly-running process must
+        # never be silently re-admitted).
+        if action_outcome.status == "resource_enforcement_lost":
+            self._enforcement_lost_job(target_job_id, epoch, action_outcome.detail)
+            return SchedulerPassResult(
+                OUTCOME_RESOURCE_LOST, job_id=target_job_id,
+                detail=action_outcome.detail,
             )
 
         row = self._supervisor.store._job_row(target_job_id)

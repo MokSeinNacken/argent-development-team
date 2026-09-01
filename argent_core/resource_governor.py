@@ -58,6 +58,9 @@ class ResourceReasonCode(str, Enum):
     RESOURCE_EVIDENCE_UNKNOWN = "RESOURCE_EVIDENCE_UNKNOWN"
     LOCAL_CAPACITY_INSUFFICIENT = "LOCAL_CAPACITY_INSUFFICIENT"
     EXTERNAL_CI_PREFERRED = "EXTERNAL_CI_PREFERRED"
+    # C2: execution enforcement (systemd-run --scope / cgroup) was unavailable
+    # or could not be proven.  Fail-closed RESOURCE outcome — never CODE_FAILURE.
+    RESOURCE_ENFORCEMENT_UNAVAILABLE = "RESOURCE_ENFORCEMENT_UNAVAILABLE"
 
 
 class AdmissionVerdict(str, Enum):

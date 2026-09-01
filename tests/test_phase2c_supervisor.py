@@ -56,6 +56,18 @@ from argent_core.supervisor import (  # noqa: E402
 )
 from argent_core.workspace_broker import WorkspaceBroker  # noqa: E402
 from argent_core.gates import binding_hash  # noqa: E402
+from argent_core.resource_governor import (  # noqa: E402
+    AdmissionDecision,
+    AdmissionVerdict,
+    ResourceReasonCode,
+)
+from argent_core.resource_policy import ResourceClass, ResourcePolicy  # noqa: E402
+from argent_core.scope_enforcer import ExecutionEnforcer  # noqa: E402
+from c2_helpers import (  # noqa: E402
+    FakeGovernor,
+    FakeScopeBackend,
+    FakeSnapshotProvider,
+)
 from mock_runtime import build_output  # noqa: E402
 from mock_supervisor_runtime import (  # noqa: E402
     FakeClock,
@@ -89,8 +101,34 @@ def fake_run_tests(workspace, pytest_args=None, limits=None):
     )
 
 
+def _light_limits():
+    pol = ResourcePolicy()
+    b = pol.limits_for(ResourceClass.LIGHT)
+    return {
+        "memory_high_bytes": b.memory_high_bytes,
+        "memory_max_bytes": b.memory_max_bytes,
+        "swap_max_bytes": b.swap_max_bytes,
+        "cpu_quota_percent": b.cpu_quota_percent,
+        "timeout_seconds": b.timeout_seconds,
+    }
+
+
+def _allow_admission():
+    return AdmissionDecision(
+        resource_class=ResourceClass.LIGHT.value,
+        policy_version="1",
+        snapshot_ref="snap-1",
+        decision=AdmissionVerdict.ALLOW.value,
+        reason_code=ResourceReasonCode.OK.value,
+        next_eligible_at=None,
+        effective_limits=_light_limits(),
+        timestamp="2026-09-01T00:00:00+00:00",
+    )
+
+
 def make_env(db_path, clock=None, *, workspace=None, run_tests_fn=None,
-             idempotency_key="job-1"):
+             idempotency_key="job-1", enforcer=None,
+             resource_governor=None, snapshot_provider=None):
     clock = clock or FakeClock()
     core = Core(db_path, clock=clock)
     project = core.create_project("p", OWNER)
@@ -98,14 +136,24 @@ def make_env(db_path, clock=None, *, workspace=None, run_tests_fn=None,
     task_run = core.start_task_run(task.id, OWNER)
     prov = FakeRunStatusProvider()
     launch = FakeRunLauncher()
+    # C2: a deterministic fake enforcement path (spawn now goes through the
+    # enforcer, never the legacy launcher).  A fake governor + snapshot
+    # provider keep the fresh C1 admission at the enforcement point fully
+    # deterministic (no real host reads in these offline tests).
+    backend = FakeScopeBackend()
+    enforcer = enforcer or ExecutionEnforcer(backend)
+    resource_governor = resource_governor or FakeGovernor(_allow_admission())
+    snapshot_provider = snapshot_provider or FakeSnapshotProvider()
     sup = Supervisor(
         core, prov, launch, clock=clock,
         workspace_root=workspace, run_tests_fn=run_tests_fn,
+        enforcer=enforcer, resource_governor=resource_governor,
+        snapshot_provider=snapshot_provider,
     )
     job = sup.store.create_job(task.id, idempotency_key=idempotency_key)
     return SimpleNamespace(
         core=core, task=task, task_run=task_run, prov=prov, launch=launch,
-        sup=sup, job=job, clock=clock,
+        sup=sup, job=job, clock=clock, backend=backend, enforcer=enforcer,
     )
 
 
@@ -542,7 +590,7 @@ def test_spawn_plan_then_launch_once(db_path):
         authoritative_not_found=True,
     ))
     advance(env, ReconcileAction.SPAWN_RUN)
-    assert len(env.launch.spawns) == 1
+    assert len(env.backend.created) == 1  # exactly one scope created
     # A second reconcile while still NOT_FOUND must not re-spawn.
     env.prov.set_current(d.id, make_run_observation(
         dispatch_id=d.id, role=d.role, status=RunStatus.NOT_FOUND,
@@ -550,7 +598,7 @@ def test_spawn_plan_then_launch_once(db_path):
     ))
     d2 = step(env)
     assert d2.action is ReconcileAction.WAIT
-    assert len(env.launch.spawns) == 1
+    assert len(env.backend.created) == 1
 
 
 def test_max_attempts_terminal_failed(db_path):

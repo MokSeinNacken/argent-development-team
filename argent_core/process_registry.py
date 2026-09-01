@@ -27,6 +27,7 @@ persisted registry facts and the live identity tuple are.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -157,6 +158,14 @@ class ProcessRegistry:
         identity: ProcessIdentity,
         status: str = PROCESS_STATUS_RUNNING,
         cgroup_ref: Optional[str] = None,
+        # C2: bounded execution-scope evidence (trusted spawn path only).
+        scope_ref: Optional[str] = None,
+        resource_class: Optional[str] = None,
+        policy_version: Optional[str] = None,
+        effective_limits: Optional[dict] = None,
+        termination_class: Optional[str] = None,
+        timed_out: bool = False,
+        scope_events: Optional[dict] = None,
     ) -> dict:
         """Insert a registration (trusted spawn path only).
 
@@ -165,6 +174,13 @@ class ProcessRegistry:
         UNKNOWN identity (missing boot_id or start_ticks) is persisted with
         ``status=UNKNOWN`` and ``NULL`` identity parts — NEVER a concrete
         ``""``/``0`` identity.
+
+        C2: ``scope_ref`` is the systemd scope/unit name, ``cgroup_ref`` the
+        cgroup path; ``resource_class`` / ``policy_version`` / ``effective_limits``
+        are the bounded enforcement metadata; ``termination_class`` (closed
+        enum), ``timed_out`` and ``scope_events`` (bounded ``memory.events``
+        deltas) are post-termination evidence for C3.  All values come from the
+        LOCAL enforcer — never from agent output.
         """
         if status not in ALLOWED_PROCESS_STATUSES:
             raise ValueError(f"invalid process status {status!r}")
@@ -179,6 +195,13 @@ class ProcessRegistry:
             "boot_id": identity.boot_id,
             "process_start_ticks": identity.process_start_ticks,
             "cgroup_ref": cgroup_ref,
+            "scope_ref": scope_ref,
+            "resource_class": resource_class,
+            "policy_version": policy_version,
+            "effective_limits": _bounded_json(effective_limits),
+            "termination_class": termination_class,
+            "timed_out": 1 if timed_out else 0,
+            "scope_events": _bounded_json(scope_events),
             "status": status,
             "created_at": now,
             "last_observed_at": now,
@@ -223,6 +246,54 @@ class ProcessRegistry:
             registration.get("status") == PROCESS_STATUS_TERMINAL
             and registration.get("terminal_at") is not None
         )
+
+    def mark_terminal(
+        self,
+        process_id: str,
+        *,
+        exit_code: Optional[int],
+        terminal_at: str,
+        termination_class: Optional[str] = None,
+        timed_out: bool = False,
+        scope_events: Optional[dict] = None,
+    ) -> int:
+        """Mark a registration TERMINAL with bounded C2 termination evidence (F5).
+
+        ``scope_events`` (a bounded ``memory.events`` delta dict) is serialized
+        to a bounded JSON string (<= 4KB) before it is persisted — never a huge
+        dump.  The classification must already have been produced via
+        :func:`argent_core.resource_failure.classify_termination`.
+        """
+        return self._store.mark_process_terminal_with_evidence(
+            process_id,
+            exit_code=exit_code,
+            terminal_at=terminal_at,
+            termination_class=termination_class,
+            timed_out=timed_out,
+            scope_events=_bounded_json(scope_events),
+        )
+
+
+def _bounded_json(value) -> Optional[str]:
+    """Serialize a bounded dict to a compact JSON string (or ``None``).
+
+    ``None``/non-dict/empty values map to ``None`` (SQL NULL); a non-serialisable
+    or oversized value is refused (fail-closed) rather than silently dropped.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    if not value:
+        return None
+    try:
+        text = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return None
+    if len(text) > 4096:
+        # Bounded evidence only (never a huge dump).
+        return None
+    return text
 
 
 def _uuid_hex() -> str:

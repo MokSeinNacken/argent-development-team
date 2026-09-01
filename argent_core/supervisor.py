@@ -37,6 +37,9 @@ from . import job_state, notifications, outputs, workflow
 from .core import ReceiveResult
 from .notifications import NotificationStatus, NotificationType
 from .resource_policy import RESOURCE_CLASS_VALUES, ResourceClass
+from .resource_governor import AdmissionVerdict, ResourceReasonCode
+from .execution_scope import SystemdRunScopeBackend
+from .scope_enforcer import ExecutionEnforcer
 from .models import (
     AgentDispatch,
     ApprovalStatus,
@@ -1268,6 +1271,26 @@ class TrajectoryRunStatusProvider:
 # RunLauncher (SPEC V2C §5.2 / §8.2 / A8)
 # ---------------------------------------------------------------------------
 
+
+def build_agent_command(
+    *, agent_id: str, dispatch_id: str, message_file: Path, timeout_seconds: int,
+) -> list:
+    """Build the exact openclaw-agent argv (single source of truth).
+
+    Used by both :meth:`OpenClawRunLauncher.spawn` (legacy detached path) and the
+    C2 :class:`argent_core.scope_enforcer.ExecutionEnforcer` (scoped path), so the
+    two paths can never drift in the command they launch.
+    """
+    return [
+        "openclaw", "agent",
+        "--agent", agent_id,
+        "--session-id", f"dispatch-{dispatch_id}",
+        "--message-file", str(message_file),
+        "--json",
+        "--timeout", str(timeout_seconds),
+    ]
+
+
 class OpenClawRunLauncher:
     """Launches role agents DETACHED (``start_new_session=True``).
 
@@ -1313,18 +1336,11 @@ class OpenClawRunLauncher:
         # F8: increment the persistent launch counter BEFORE the detached spawn
         # so the count is durable even if the supervisor is SIGKILLed right
         # after the launcher returns (the independent no-double-spawn proof).
-        if self._counter_path is not None:
-            data = self._read_counter_file(self._counter_path)
-            data[dispatch_id] = int(data.get(dispatch_id, 0)) + 1
-            self._write_counter_file(self._counter_path, data)
-        cmd = [
-            "openclaw", "agent",
-            "--agent", agent_id,
-            "--session-id", f"dispatch-{dispatch_id}",
-            "--message-file", str(message_file),
-            "--json",
-            "--timeout", str(timeout_seconds),
-        ]
+        self.increment_counter(dispatch_id)
+        cmd = build_agent_command(
+            agent_id=agent_id, dispatch_id=dispatch_id,
+            message_file=message_file, timeout_seconds=timeout_seconds,
+        )
         popen = subprocess.Popen(
             cmd,
             start_new_session=True,
@@ -1337,6 +1353,13 @@ class OpenClawRunLauncher:
         # can register process evidence (boot_id + pid + start_ticks).  A
         # None/placeholder Popen (test seam) yields None.
         return popen.pid if popen is not None else None
+
+    def increment_counter(self, dispatch_id: str) -> None:
+        """Persist the launch count for ``dispatch_id`` BEFORE a spawn (F8)."""
+        if self._counter_path is not None:
+            data = self._read_counter_file(self._counter_path)
+            data[dispatch_id] = int(data.get(dispatch_id, 0)) + 1
+            self._write_counter_file(self._counter_path, data)
 
 
 def read_launch_counter(counter_path) -> dict:
@@ -1456,6 +1479,12 @@ class Supervisor:
         # deterministic fakes; defaults are created lazily by the Scheduler).
         resource_governor=None,
         snapshot_provider=None,
+        # C2: execution enforcement (scope backend + enforcer).  Default ``None``
+        # wires the PRODUCTION default (real ``SystemdRunScopeBackend``) in
+        # ``__init__`` — enforcement is mandatory (F1, no opt-in); tests inject
+        # a fake backend/enforcer and the Scheduler may also wire one.
+        enforcer=None,
+        scope_backend=None,
     ):
         self.core = core
         self.controller_source = controller_source
@@ -1505,6 +1534,20 @@ class Supervisor:
         # tests; real defaults are created by the Scheduler when unset).
         self._resource_governor = resource_governor
         self._snapshot_provider = snapshot_provider
+        # C2: execution enforcement (scope backend + enforcer).  Enforcement is
+        # MANDATORY (F1): when neither ``enforcer`` nor ``scope_backend`` is
+        # injected, the PRODUCTION default is wired here
+        # (``ExecutionEnforcer`` over the real ``SystemdRunScopeBackend``) —
+        # there is NO legacy unbounded ``launcher.spawn`` fallback.  Tests
+        # inject a fake enforcer/backend; the Scheduler may also wire one.
+        if enforcer is None and scope_backend is None:
+            backend = SystemdRunScopeBackend()
+            enforcer = ExecutionEnforcer(backend)
+            scope_backend = backend
+        elif enforcer is None and scope_backend is not None:
+            enforcer = ExecutionEnforcer(scope_backend)
+        self._enforcer = enforcer
+        self._scope_backend = scope_backend
 
     # ---------------------------------------------------------------- utils
 
@@ -3111,21 +3154,34 @@ class Supervisor:
                                  dispatch_id=dispatch_id)
         # Build the prompt message file (task contract + context).
         try:
+            # F1.3: a FRESH C1 admission is enforced HERE at the enforcement
+            # point (single source of truth for the effective limits).  Only
+            # ALLOW proceeds to enforcement + spawn; DEFER/DENY_LOCAL/
+            # PREFER_EXTERNAL (non-local) fail-closed into a requeue.
+            admission = self._fresh_admission(job)
+            if admission.decision != AdmissionVerdict.ALLOW.value:
+                reason = admission.reason_code \
+                    or ResourceReasonCode.RESOURCE_ENFORCEMENT_UNAVAILABLE.value
+                self._finish_action(row["id"], "FAILED",
+                                    f"admission:{admission.decision}")
+                return ActionOutcome("SPAWN_RUN", "resource_enforcement_failed",
+                                     reason, dispatch_id=dispatch_id)
+            # F1.2: enforcement is MANDATORY — no enforcer => fail-closed for
+            # ALL classes (incl. LIGHT), no legacy ``launcher.spawn`` fallback.
+            if self._enforcer is None:
+                self._finish_action(row["id"], "FAILED", "no_enforcer")
+                return ActionOutcome(
+                    "SPAWN_RUN", "resource_enforcement_failed",
+                    ResourceReasonCode.RESOURCE_ENFORCEMENT_UNAVAILABLE.value,
+                    dispatch_id=dispatch_id,
+                )
             message_file = self._build_message_file(d)
             # F1: re-assert the lease fence IMMEDIATELY before the external
             # spawn effect (a stale holder must never launch an agent).
             self._recheck_lease_fence(job["id"])
-            pid = self._launcher.spawn(
-                agent_id=AGENT_IDS[d.role], dispatch_id=dispatch_id,
-                message_file=message_file, timeout_seconds=AGENT_TIMEOUT_SECONDS,
-            )
-            # B3/F2: register process evidence at the trusted spawn path.  The
-            # registry values (boot_id + pid + start_ticks) come from the
-            # LOCAL identity provider, never from agent output.  An unreadable
-            # identity is persisted as UNKNOWN (never a concrete tuple); a
-            # registration failure leaves NO registration, which recovery
-            # treats as unknown -> LOST (fail-closed, never "surely dead").
-            self._register_process_evidence(job["id"], dispatch_id, pid)
+            outcome = self._spawn_scoped(d, job, message_file, row, admission)
+            if outcome is not None:
+                return outcome
         except Exception as exc:
             self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
             return ActionOutcome("SPAWN_RUN", "failed", str(exc),
@@ -3133,7 +3189,105 @@ class Supervisor:
         self._finish_action(row["id"], "SUCCEEDED")
         return ActionOutcome("SPAWN_RUN", "executed", dispatch_id=dispatch_id)
 
-    def _register_process_evidence(self, job_id: str, dispatch_id, pid) -> None:
+    def _default_active_jobs_reader(self):
+        """Store-backed active-jobs reader for the default host provider (F1)."""
+        store = self.core._store
+
+        def reader():
+            try:
+                rows = store.list_supervisor_jobs()
+            except Exception:
+                return None
+            try:
+                return [
+                    (row["id"], row.get("resource_class") or ResourceClass.LIGHT.value)
+                    for row in rows
+                    if row.get("terminal") is None
+                    and row.get("primary_state") == job_state.PrimaryState.RUNNING.value
+                ]
+            except Exception:
+                return None
+
+        return reader
+
+    def _fresh_admission(self, job: dict):
+        """Fresh C1 admission at the enforcement point (F1.3).
+
+        Uses the SAME injected governor/snapshot provider the Scheduler wires
+        (``self._resource_governor``/``self._snapshot_provider``), falling back
+        to the real (read-only) defaults when none are injected.  The effective
+        limits come from THIS admission — a single source, never a separate
+        recomputation.
+        """
+        from .host_snapshot import HostSnapshotProvider
+        from .resource_governor import ResourceGovernor
+
+        governor = self._resource_governor or ResourceGovernor()
+        provider = self._snapshot_provider or HostSnapshotProvider(
+            active_jobs_reader=self._default_active_jobs_reader(),
+        )
+        rc = ResourceClass(job.get("resource_class") or ResourceClass.LIGHT.value)
+        snapshot = provider.capture(self._workspace_root)
+        return governor.decide(
+            resource_class=rc, snapshot=snapshot, now_iso=self._now_iso(),
+        )
+
+    def _spawn_scoped(self, d, job, message_file, row, admission):
+        """C2 scoped spawn (Start-Barrier + verify + registry binding).
+
+        Returns ``None`` on success (the caller finalizes the SPAWN_RUN action
+        as SUCCEEDED) or a bounded ``ActionOutcome`` on enforcement failure
+        (fail-closed: no unbounded process is ever started).  A cleanup that
+        could not be proven inactive maps to ``resource_enforcement_lost``
+        (LOST quarantine, never a requeue — F2).
+        """
+        from .resource_governor import ResourceReasonCode
+        from .scope_enforcer import EnforcementStatus
+
+        dispatch_id = d.id
+        effective_limits = admission.effective_limits or {}
+
+        # F8: persist the launch count BEFORE the scoped spawn (no-double-spawn
+        # proof), mirroring the legacy launcher path.
+        increment = getattr(self._launcher, "increment_counter", None)
+        if increment is not None:
+            increment(dispatch_id)
+
+        command = build_agent_command(
+            agent_id=AGENT_IDS[d.role], dispatch_id=dispatch_id,
+            message_file=message_file, timeout_seconds=AGENT_TIMEOUT_SECONDS,
+        )
+        result = self._enforcer.enforce_and_spawn(
+            command=command,
+            effective_limits=effective_limits,
+            resource_class=admission.resource_class,
+            policy_version=admission.policy_version,
+            job_id=job["id"],
+            dispatch_id=dispatch_id,
+        )
+        if not result.ok:
+            self._finish_action(row["id"], "FAILED", f"enforcement:{result.status}")
+            if result.status == EnforcementStatus.SCOPE_CLEANUP_UNVERIFIED.value:
+                return ActionOutcome(
+                    "SPAWN_RUN", "resource_enforcement_lost",
+                    result.status, dispatch_id=dispatch_id,
+                )
+            return ActionOutcome(
+                "SPAWN_RUN", "resource_enforcement_failed",
+                ResourceReasonCode.RESOURCE_ENFORCEMENT_UNAVAILABLE.value,
+                dispatch_id=dispatch_id,
+            )
+        # Scope created + verified; bind process evidence (scope_ref, class,
+        # policy version, effective limits).  The identity comes from the LOCAL
+        # provider, never agent output.
+        self._register_process_evidence(
+            job["id"], dispatch_id, result.scope.process_id, scope=result.scope,
+        )
+        return None
+
+    def _register_process_evidence(
+        self, job_id: str, dispatch_id, pid, *, scope=None,
+    ) -> None:
         """Register process evidence at the trusted spawn path (F2, fail-closed).
 
         The identity comes from the LOCAL provider, never agent output.  An
@@ -3141,6 +3295,10 @@ class Supervisor:
         registration failure leaves NO registration, which restart recovery
         treats as unknown -> LOST (never "surely dead"/takeover).  This must
         never flip the (already detached) spawn to FAILED.
+
+        C2: when ``scope`` is provided (scoped spawn), its bounded metadata
+        (scope_ref / resource_class / policy_version / effective_limits) is
+        persisted alongside the identity and the cgroup path.
         """
         if pid is None or self._process_registry is None:
             return
@@ -3154,6 +3312,14 @@ class Supervisor:
         try:
             self._process_registry.register(
                 job_id=job_id, dispatch_id=dispatch_id, identity=identity,
+                cgroup_ref=getattr(scope, "cgroup_path", None) if scope else None,
+                scope_ref=getattr(scope, "unit_name", None) if scope else None,
+                resource_class=getattr(scope, "resource_class", None) if scope else None,
+                policy_version=getattr(scope, "policy_version", None) if scope else None,
+                effective_limits=getattr(scope, "effective_limits", None) if scope else None,
+                # F5: the bounded memory.events baseline captured at scope build
+                # is persisted so a later terminal detection can compute the delta.
+                scope_events=getattr(scope, "memory_events_baseline", None) if scope else None,
             )
         except Exception:
             # A store failure leaves NO registration; recovery treats a missing
@@ -3745,8 +3911,13 @@ class Supervisor:
 
     def _perform_run_sandbox_tests(self, decision, job):
         dispatch_id = decision.dispatch_id
-        if self._workspace_root is None or self._run_tests_fn is None:
-            return ActionOutcome("RUN_SANDBOX_TESTS", "skipped", "no_test_runner")
+        # F3: the PRODUCTION sandbox run goes through the enforcement path
+        # (the bwrap command is built and run INSIDE a bounded scope); the
+        # injected ``run_tests_fn`` seam is a deterministic TEST-ONLY
+        # substitute (never set in production) so unit tests stay fast and
+        # deterministic.  Both need a workspace root.
+        if self._workspace_root is None:
+            return ActionOutcome("RUN_SANDBOX_TESTS", "skipped", "no_workspace")
         frozen = self._frozen_write_result_hash(dispatch_id)
         if frozen is None:
             return ActionOutcome("RUN_SANDBOX_TESTS", "skipped",
@@ -3775,14 +3946,91 @@ class Supervisor:
             return ActionOutcome("RUN_SANDBOX_TESTS", "exhausted")
         # RUNNING: the bwrap run is read-only; re-running it is safe and
         # bounded by MAX_ACTION_RETRIES via the journal retry budget.
-        res = self._run_tests_fn(self._workspace_root)
+        # F3: the injected ``run_tests_fn`` seam runs the deterministic
+        # sandbox substitute (test-only; production never sets it).
+        if self._run_tests_fn is not None:
+            res = self._run_tests_fn(self._workspace_root)
+            self._finish_action(
+                row["id"],
+                "SUCCEEDED" if res.exit_code == 0 else "FAILED",
+                None if res.exit_code == 0 else f"exit_code_{res.exit_code}",
+            )
+            return ActionOutcome("RUN_SANDBOX_TESTS", "executed",
+                                 dispatch_id=dispatch_id)
+        # F3 (production): the sandbox test path runs through the SAME
+        # enforcement path as spawn — a fresh C1 admission, a bounded scope,
+        # bwrap INSIDE the scope, and registry binding (bwrap's own
+        # prlimit/timeout remain as defense-in-depth).
+        admission = self._fresh_admission(job)
+        if admission.decision != AdmissionVerdict.ALLOW.value:
+            reason = admission.reason_code \
+                or ResourceReasonCode.RESOURCE_ENFORCEMENT_UNAVAILABLE.value
+            self._finish_action(row["id"], "FAILED",
+                                f"admission:{admission.decision}")
+            return ActionOutcome("RUN_SANDBOX_TESTS", "resource_enforcement_failed",
+                                 reason, dispatch_id=dispatch_id)
+        exit_code = self._run_sandbox_scoped(d, job, dispatch_id)
         self._finish_action(
             row["id"],
-            "SUCCEEDED" if res.exit_code == 0 else "FAILED",
-            None if res.exit_code == 0 else f"exit_code_{res.exit_code}",
+            "SUCCEEDED" if exit_code == 0 else "FAILED",
+            None if exit_code == 0 else f"exit_code_{exit_code}",
         )
         return ActionOutcome("RUN_SANDBOX_TESTS", "executed",
                              dispatch_id=dispatch_id)
+
+    def _run_sandbox_scoped(self, d, job, dispatch_id) -> int:
+        """Run the bwrap sandbox tests inside an enforced scope (F3/F5).
+
+        Returns the exit code (0 = green).  Enforcement failures return a
+        non-zero sentinel so the write pipeline fails closed (never a silent
+        pass).  The bwrap process is bound into the registry with its scope
+        metadata, then marked TERMINAL with the termination evidence (F5).
+        """
+        from .resource_governor import ResourceGovernor
+        from .sandbox_runner import build_command
+        from .scope_enforcer import EnforcementStatus
+
+        governor = self._resource_governor or ResourceGovernor()
+        policy = governor.policy
+        limits = policy.limits_for(ResourceClass.LIGHT)
+        effective_limits = {
+            "memory_high_bytes": limits.memory_high_bytes,
+            "memory_max_bytes": limits.memory_max_bytes,
+            "swap_max_bytes": limits.swap_max_bytes,
+            "cpu_quota_percent": limits.cpu_quota_percent,
+            "timeout_seconds": limits.timeout_seconds,
+        }
+        command = build_command(self._workspace_root)
+        result = self._enforcer.enforce_and_run(
+            command=command,
+            effective_limits=effective_limits,
+            resource_class=ResourceClass.LIGHT,
+            policy_version=policy.policy_version,
+            job_id=job["id"],
+            dispatch_id=dispatch_id,
+        )
+        if result.status == EnforcementStatus.SCOPE_CLEANUP_UNVERIFIED.value:
+            return -1  # F2: unproven cleanup -> fail-closed, never a pass
+        if result.scope is None:
+            return -1
+        if result.scope.process_id:
+            self._register_process_evidence(
+                job["id"], dispatch_id, result.scope.process_id,
+                scope=result.scope,
+            )
+            reg = self.core._store.get_process_registration_for_dispatch(
+                dispatch_id,
+            )
+            if reg is not None:
+                self._process_registry.mark_terminal(
+                    reg["process_id"],
+                    exit_code=result.exit_code,
+                    terminal_at=self._now_iso(),
+                    termination_class=result.termination_class,
+                    timed_out=result.timed_out,
+                    scope_events=result.scope_events,
+                )
+        return result.exit_code if result.exit_code is not None else -1
 
     def _perform_record_test_result(self, decision, job):
         dispatch_id = decision.dispatch_id
