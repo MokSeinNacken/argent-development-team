@@ -126,7 +126,22 @@ class CapabilityTier(str, Enum):
 CONTEXT_BUDGET_EXCEEDED = "CONTEXT_BUDGET_EXCEEDED"
 
 
-class ContextBuildError(ArgentError):
+class ContextError(ArgentError):
+    """Base class for every Context-Pack / D2 context failure (bounded code).
+
+    ``ContextBuildError``, ``RetrievalError``, ``CheckpointError`` and
+    ``HandoffError`` all inherit from this class so the dispatch gate can catch
+    them uniformly as ``context_build_failed`` (``error_class=CONTEXT``) — never
+    a CODE_FAILURE, never a RESOURCE failure, never a model failure.
+    """
+
+    def __init__(self, code: str, detail: str = ""):
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}" if detail else code)
+
+
+class ContextBuildError(ContextError):
     """A Context Pack build failed (orchestration error, fail-closed).
 
     ``code`` is a bounded reason code (``CONTEXT_BUDGET_EXCEEDED`` or a
@@ -134,11 +149,6 @@ class ContextBuildError(ArgentError):
     ``RESOURCE`` failure and never a model failure — it carries no escalation
     semantics.
     """
-
-    def __init__(self, code: str, detail: str = ""):
-        self.code = code
-        self.detail = detail
-        super().__init__(f"{code}: {detail}" if detail else code)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +170,17 @@ _PERMANENT_CONTEXT_CODES = frozenset({
     "CONTEXT_HASH_MISMATCH",
     "CONTEXT_STALE_PACK",
     "CONTEXT_MISSING_TASK",
+    # D2 (Phase D): checkpoint / retrieval / handoff failure codes.  A bounded
+    # retry can never fix an invalid/stale checkpoint, a refused retrieval root
+    # or a malformed request — these must fail-closed to BLOCKED, never re-queue.
+    "CONTEXT_CHECKPOINT_INVALID",
+    "STALE_CONTEXT_REFERENCE",
+    "RETRIEVAL_ROOT_DENIED",
+    "RETRIEVAL_PATH_TRAVERSAL",
+    "RETRIEVAL_SYMLINK_ESCAPE",
+    "RETRIEVAL_INVALID_REQUEST",
+    "RETRIEVAL_FORBIDDEN_PATTERN",
+    "RETRIEVAL_LIMIT_EXCEEDED",
 })
 
 #: Provably transient Context-Pack failure codes — a bounded re-queue is safe

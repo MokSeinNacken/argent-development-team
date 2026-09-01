@@ -74,6 +74,8 @@ from .models import (
     TestRun,
 )
 from .context_pack import ContextPackRecord
+from .checkpoint import CHECKPOINT_VERSION as CHECKPOINT_RECORD_VERSION
+from .handoff import HANDOFF_VERSION as HANDOFF_RECORD_VERSION
 
 # B3 (Phase B): external waits + minimal process registry + minimal
 # worktree/writer binding (additive).
@@ -82,7 +84,77 @@ from .context_pack import ContextPackRecord
 # C2 (Phase C): bounded execution-scope evidence on process_registry (additive).
 # C3 (Phase C): bounded recovery-decision audit on supervisor_jobs (additive).
 # D1 (Phase D): immutable context-pack metadata (context_packs table, additive).
-SCHEMA_VERSION = "12"
+# D2 (Phase D): structured handoffs (handoffs_v2) + immutable checkpoints
+# (checkpoints) — additive, non-destructive (B4 migration pattern).
+SCHEMA_VERSION = "13"
+
+# D2 (Phase D): bounded JSON column budget enforced at the persistence gate.
+# Each handoff/checkpoint JSON column (result/artifacts/evidence/next-step/
+# provenance/workflow/context/code/progress) must not exceed this many UTF-8
+# bytes; an oversized record is rejected before any DB write (fail-closed).
+MAX_JSON_COLUMN_BYTES = 64 * 1024
+
+_HEX_CHARS = frozenset("0123456789abcdef")
+
+
+def _is_sha256_hex(value) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        c in _HEX_CHARS for c in value)
+
+
+def _is_prefixed_id(value, prefix: str) -> bool:
+    return (isinstance(value, str) and value.startswith(prefix)
+            and len(value) == len(prefix) + 24
+            and all(c in _HEX_CHARS for c in value[len(prefix):]))
+
+
+def _check_json_column_budget(**cols) -> None:
+    """Enforce the bounded per-column JSON byte budget (fail-closed)."""
+    for name, value in cols.items():
+        if value is None:
+            continue
+        n = len(value.encode("utf-8"))
+        if n > MAX_JSON_COLUMN_BYTES:
+            raise ValueError(
+                f"{name} exceeds {MAX_JSON_COLUMN_BYTES} bytes ({n})")
+
+
+def _validate_handoff_v2_insert(*, handoff_id, record_version, job_id,
+                                source_dispatch_id, source_role, result_json,
+                                artifacts_json, evidence_json, next_step_json,
+                                provenance_json, content_hash) -> None:
+    if record_version != HANDOFF_RECORD_VERSION:
+        raise ValueError(
+            f"handoff record_version {record_version!r} != "
+            f"{HANDOFF_RECORD_VERSION!r}")
+    if not _is_prefixed_id(handoff_id, "ho_"):
+        raise ValueError(f"malformed handoff_id {handoff_id!r}")
+    if not _is_sha256_hex(content_hash):
+        raise ValueError("handoff content_hash must be sha256 hex")
+    _check_json_column_budget(
+        result_json=result_json, artifacts_json=artifacts_json,
+        evidence_json=evidence_json, next_step_json=next_step_json,
+        provenance_json=provenance_json,
+    )
+
+
+def _validate_checkpoint_insert(*, checkpoint_id, record_version, job_id,
+                                checkpoint_no, workflow_json, context_json,
+                                code_json, progress_json, content_hash) -> None:
+    if record_version != CHECKPOINT_RECORD_VERSION:
+        raise ValueError(
+            f"checkpoint record_version {record_version!r} != "
+            f"{CHECKPOINT_RECORD_VERSION!r}")
+    if not _is_prefixed_id(checkpoint_id, "ck_"):
+        raise ValueError(f"malformed checkpoint_id {checkpoint_id!r}")
+    if not isinstance(checkpoint_no, int) or checkpoint_no < 1:
+        raise ValueError(f"checkpoint_no {checkpoint_no!r} < 1")
+    if not _is_sha256_hex(content_hash):
+        raise ValueError("checkpoint content_hash must be sha256 hex")
+    _check_json_column_budget(
+        workflow_json=workflow_json, context_json=context_json,
+        code_json=code_json, progress_json=progress_json,
+    )
 
 _TASK_STATES = "', '".join(s.value for s in TaskState)
 _TASK_RUN_STATUSES = "', '".join(s.value for s in TaskRunStatus)
@@ -386,6 +458,52 @@ _SCHEMA: tuple[str, ...] = (
         artifact_location TEXT,
         created_at        TEXT NOT NULL
     )
+    """,
+    # D2 (Phase D): structured handoff records (handoffs_v2).  Bounded JSON
+    # columns only; large content never lives here (immutable artifacts go to
+    # ~/.local/share/argent/).  This is additive and does NOT touch the
+    # existing minimal ``handoffs`` workflow table.
+    """
+    CREATE TABLE IF NOT EXISTS handoffs_v2 (
+        handoff_id         TEXT PRIMARY KEY,
+        record_version     TEXT NOT NULL DEFAULT '1',
+        job_id             TEXT NOT NULL,
+        source_dispatch_id TEXT NOT NULL,
+        source_role        TEXT NOT NULL,
+        result_json        TEXT NOT NULL,
+        artifacts_json     TEXT NOT NULL,
+        evidence_json      TEXT NOT NULL,
+        next_step_json     TEXT NOT NULL,
+        provenance_json    TEXT NOT NULL,
+        content_hash       TEXT NOT NULL,
+        created_at         TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_handoffs_v2_job
+        ON handoffs_v2(job_id)
+    """,
+    # D2 (Phase D): immutable checkpoints (INSERT-only) with a CAS-guarded
+    # mutable latest pointer (partial unique index: at most one latest per job).
+    """
+    CREATE TABLE IF NOT EXISTS checkpoints (
+        checkpoint_id  TEXT PRIMARY KEY,
+        record_version TEXT NOT NULL DEFAULT '1',
+        job_id         TEXT NOT NULL,
+        checkpoint_no  INTEGER NOT NULL CHECK (checkpoint_no >= 1),
+        workflow_json  TEXT NOT NULL,
+        context_json   TEXT NOT NULL,
+        code_json      TEXT NOT NULL,
+        progress_json  TEXT NOT NULL,
+        content_hash   TEXT NOT NULL,
+        created_at     TEXT NOT NULL,
+        latest         INTEGER NOT NULL DEFAULT 0 CHECK (latest IN (0,1)),
+        UNIQUE (job_id, checkpoint_no)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_latest
+        ON checkpoints(job_id) WHERE latest = 1
     """,
     f"""
     CREATE TABLE IF NOT EXISTS supervisor_jobs (
@@ -1142,6 +1260,23 @@ class Store:
         ):
             if col not in sjcols:
                 self._conn.execute(ddl)
+
+        # --- D2 (Phase D): record_version on checkpoints + handoffs_v2 -------
+        # Additive; a schema-12 DB that already has these tables (without the
+        # record_version column) gains it idempotently with the current version
+        # as the default for pre-existing rows (fail-closed on a wrong version
+        # when the loader reads it back).
+        for table, version in (
+            ("checkpoints", CHECKPOINT_RECORD_VERSION),
+            ("handoffs_v2", HANDOFF_RECORD_VERSION),
+        ):
+            tcols = {r[1] for r in self._conn.execute(
+                f"PRAGMA table_info({table})")}
+            if "record_version" not in tcols:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN record_version "
+                    f"TEXT NOT NULL DEFAULT '{version}'"
+                )
 
         # UPSERT the schema version after successful DDL + migration.
         self._conn.execute(
@@ -2362,6 +2497,114 @@ class Store:
             artifact_location=row["artifact_location"],
             created_at=row["created_at"],
         )
+
+    def list_context_packs(self, job_id: Optional[str] = None) -> list:
+        q = "SELECT context_pack_id, content_hash FROM context_packs"
+        params: list = []
+        if job_id is not None:
+            q += " WHERE job_id = ?"
+            params.append(job_id)
+        q += " ORDER BY rowid"
+        return [dict(r) for r in self._conn.execute(q, params).fetchall()]
+
+    # -- structured handoffs (Phase D2) -------------------------------------
+    # Bounded JSON columns only; rows are returned as plain dicts (never the
+    # raw connection).  Serialization lives in ``argent_core/handoff.py``.
+
+    def _insert_handoff_v2(self, *, handoff_id, record_version, job_id,
+                           source_dispatch_id, source_role, result_json,
+                           artifacts_json, evidence_json, next_step_json,
+                           provenance_json, content_hash, created_at) -> None:
+        _validate_handoff_v2_insert(
+            handoff_id=handoff_id, record_version=record_version, job_id=job_id,
+            source_dispatch_id=source_dispatch_id, source_role=source_role,
+            result_json=result_json, artifacts_json=artifacts_json,
+            evidence_json=evidence_json, next_step_json=next_step_json,
+            provenance_json=provenance_json, content_hash=content_hash,
+        )
+        self._conn.execute(
+            "INSERT INTO handoffs_v2 (handoff_id, record_version, job_id, "
+            "source_dispatch_id, source_role, result_json, artifacts_json, "
+            "evidence_json, next_step_json, provenance_json, content_hash, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (handoff_id, record_version, job_id, source_dispatch_id,
+             source_role, result_json, artifacts_json, evidence_json,
+             next_step_json, provenance_json, content_hash, created_at),
+        )
+
+    def get_handoff_v2(self, handoff_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM handoffs_v2 WHERE handoff_id = ?", (handoff_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_handoffs_v2(self, job_id: Optional[str] = None) -> list:
+        q = "SELECT * FROM handoffs_v2"
+        params: list = []
+        if job_id is not None:
+            q += " WHERE job_id = ?"
+            params.append(job_id)
+        q += " ORDER BY rowid"
+        return [dict(r) for r in self._conn.execute(q, params).fetchall()]
+
+    def get_latest_handoff_v2(self, job_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM handoffs_v2 WHERE job_id = ? ORDER BY rowid DESC LIMIT 1",
+            (job_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    # -- checkpoints (Phase D2) ---------------------------------------------
+
+    def _insert_checkpoint(self, *, checkpoint_id, record_version, job_id,
+                           checkpoint_no, workflow_json, context_json,
+                           code_json, progress_json, content_hash, created_at,
+                           latest) -> None:
+        _validate_checkpoint_insert(
+            checkpoint_id=checkpoint_id, record_version=record_version,
+            job_id=job_id, checkpoint_no=checkpoint_no,
+            workflow_json=workflow_json, context_json=context_json,
+            code_json=code_json, progress_json=progress_json,
+            content_hash=content_hash,
+        )
+        self._conn.execute(
+            "INSERT INTO checkpoints (checkpoint_id, record_version, job_id, "
+            "checkpoint_no, workflow_json, context_json, code_json, "
+            "progress_json, content_hash, created_at, latest) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (checkpoint_id, record_version, job_id, checkpoint_no,
+             workflow_json, context_json, code_json, progress_json,
+             content_hash, created_at, latest),
+        )
+
+    def _clear_latest_checkpoint(self, job_id: str) -> None:
+        self._conn.execute(
+            "UPDATE checkpoints SET latest = 0 WHERE job_id = ? AND latest = 1",
+            (job_id,),
+        )
+
+    def get_checkpoint(self, checkpoint_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM checkpoints WHERE checkpoint_id = ?",
+            (checkpoint_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_latest_checkpoint(self, job_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM checkpoints WHERE job_id = ? AND latest = 1",
+            (job_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_checkpoints(self, job_id: Optional[str] = None) -> list:
+        q = "SELECT * FROM checkpoints"
+        params: list = []
+        if job_id is not None:
+            q += " WHERE job_id = ?"
+            params.append(job_id)
+        q += " ORDER BY checkpoint_no"
+        return [dict(r) for r in self._conn.execute(q, params).fetchall()]
 
     # -- supervisor jobs (V4, SPEC V2C §4.1) --------------------------------
     # The supervisor subsystem lives in ``argent_core/supervisor.py``; these

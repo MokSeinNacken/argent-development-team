@@ -60,12 +60,17 @@ from .context_pack import (
     CapabilityTier,
     ContextBuilder,
     ContextBuildError,
+    ContextError,
     ContextPackRecord,
     FactInput,
     Importance,
     render_pack,
     validate_context_pack,
 )
+from .context_handoff_integration import build_pack_with_retrieval
+from .retrieval import RetrievalRequest, RetrievalType
+from . import handoff as handoff_mod
+from . import checkpoint as checkpoint_mod
 
 # ---------------------------------------------------------------------------
 # Constants (SPEC V2C §9)
@@ -1507,6 +1512,11 @@ class Supervisor:
         # fake; default = the real pure ContextBuilder).  Build failures are
         # fail-closed (no dispatch), never a legacy fallback.
         context_builder=None,
+        # D2: optional retrieval / checkpoint / handoff injections (tests pass
+        # deterministic fakes; default None = the D1-only path, unchanged).
+        retriever=None,
+        checkpoint_store=None,
+        handoff_builder=None,
     ):
         self.core = core
         self.controller_source = controller_source
@@ -1573,6 +1583,10 @@ class Supervisor:
         # D1: Context Builder (pure/deterministic).  The default is the real
         # builder; tests inject a fake to script build success/failure.
         self._context_builder = context_builder or ContextBuilder()
+        # D2: optional retrieval / checkpoint / handoff wiring (None = D1 path).
+        self._retriever = retriever
+        self._checkpoint_store = checkpoint_store
+        self._handoff_builder = handoff_builder
 
     # ---------------------------------------------------------------- utils
 
@@ -3217,9 +3231,10 @@ class Supervisor:
             outcome = self._spawn_scoped(d, job, message_file, row, admission)
             if outcome is not None:
                 return outcome
-        except ContextBuildError as exc:
-            # Context errors are ORCHESTRATION errors — never CODE_FAILURE,
-            # never a resource/model failure.  No spawn happened.
+        except ContextError as exc:
+            # Context errors (build/retrieval/checkpoint/handoff) are
+            # ORCHESTRATION errors — never CODE_FAILURE, never a resource/model
+            # failure.  No spawn happened.
             self._finish_action(row["id"], "FAILED", exc.code)
             return ActionOutcome("SPAWN_RUN", "context_build_failed",
                                  exc.code, dispatch_id=dispatch_id)
@@ -3411,14 +3426,51 @@ class Supervisor:
                       source_ref="task.risk_class"),
             FactInput(f"state: {task.state.value}", source_ref="task.state"),
         ]
+        constraints = tuple(PROJECT_RULES) + tuple(SECURITY_ARCH_RULES)
+        capability = self._capability_for(d.expected_model_class)
+
+        # D2: when retrieval/checkpoint wiring is present, enrich the pack with
+        # bounded prior-handoff refs (AGENT_RESULT) and/or a checkpoint resume.
+        # D1 remains the single budget/integrity authority; without D2 wiring
+        # the path is byte-identical to D1.
+        if self._retriever is not None or self._checkpoint_store is not None:
+            requests = []
+            if self._retriever is not None:
+                requests.append(RetrievalRequest(
+                    job_id=job["id"], dispatch_id=d.id,
+                    source_type=RetrievalType.HANDOFF_LOOKUP,
+                    task_id=d.task_id, max_results=16,
+                ))
+            checkpoint = None
+            checkpoint_current_facts = None
+            if self._checkpoint_store is not None:
+                checkpoint = self._checkpoint_store.latest_checkpoint(job["id"])
+                if checkpoint is not None:
+                    # F1: current trusted facts are OBLIGATORY for a resume —
+                    # assembled from the Store + git provenance (fail-closed if
+                    # incomplete, never guessed).
+                    checkpoint_current_facts = \
+                        self._checkpoint_store.current_facts(job["id"])
+            return build_pack_with_retrieval(
+                context_builder=self._context_builder,
+                job_id=job["id"], dispatch_id=d.id, role=d.role.value,
+                objective=objective, constraints=constraints,
+                facts=tuple(facts), capability=capability,
+                retriever=self._retriever,
+                retrieval_requests=requests,
+                checkpoint=checkpoint,
+                checkpoint_current_facts=checkpoint_current_facts,
+                now_iso=self._now_iso(),
+            )
+
         return self._context_builder.build(
             job_id=job["id"],
             dispatch_id=d.id,
             role=d.role.value,
             objective=objective,
-            constraints=tuple(PROJECT_RULES) + tuple(SECURITY_ARCH_RULES),
+            constraints=constraints,
             facts=tuple(facts),
-            capability=self._capability_for(d.expected_model_class),
+            capability=capability,
             now_iso=self._now_iso(),
         )
 
@@ -3490,6 +3542,179 @@ class Supervisor:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(prompt)
         return Path(path)
+
+    # -- D2: structured handoff + checkpoint persistence --------------------
+
+    def _default_handoff_record(self, d, job, envelope):
+        """Build a bounded HandoffRecord from a validated envelope (best effort).
+
+        Extracts only bounded text fields (status/proposal/own_assessment/
+        findings/decision/recommendation/blockers).  Artifact refs WITH hashes
+        are intentionally NOT synthesized here (that needs git/artifact hashing,
+        wired in D3); the record therefore carries zero filesystem reads.
+        """
+        def _bounded(v, limit):
+            s = str(v or "")
+            return s[:limit]
+
+        outcome = _bounded(envelope.get("status"), 128)
+        key_observations = []
+        for f in (envelope.get("findings") or [])[:8]:
+            key_observations.append(_bounded(f, 1024))
+        proposal = _bounded(envelope.get("proposal"), 1024)
+        own = _bounded(envelope.get("own_assessment"), 1024)
+        if proposal:
+            key_observations.append(proposal)
+        if own:
+            key_observations.append(own)
+
+        decisions = []
+        for k in ("decision", "recommendation", "requested_next_state"):
+            v = envelope.get(k)
+            if v:
+                decisions.append(_bounded(v, 1024))
+
+        unresolved = []
+        for k in ("blockers", "concerns"):
+            for v in (envelope.get(k) or [])[:8]:
+                unresolved.append(_bounded(v, 1024))
+
+        evidence = handoff_mod.HandoffEvidence(
+            test_refs=tuple(_bounded(t, 512) for t in
+                            (envelope.get("tests_run") or
+                             envelope.get("tests") or [])[:16]),
+            commit_refs=(),
+            diff_refs=(),
+            trusted_facts=(),
+            observations=tuple(key_observations),
+        )
+        nxt = handoff_mod.HandoffNextStep(
+            proposed_capability=_bounded(
+                envelope.get("requested_next_state"), 128),
+            required_context_refs=(),
+        )
+        prov = handoff_mod.HandoffProvenance(
+            source_agent_id=_bounded(
+                d.expected_agent_class or d.role.value, 128),
+            source_dispatch_id=d.id,
+            trust_class="AGENT_RESULT",
+        )
+        return handoff_mod.build_handoff_record(
+            job_id=job["id"],
+            source_dispatch_id=d.id,
+            source_role=d.role.value,
+            created_at=self._now_iso(),
+            result=handoff_mod.HandoffResult(
+                outcome=outcome,
+                key_observations=tuple(key_observations),
+                decisions=tuple(decisions),
+                unresolved_questions=tuple(unresolved),
+            ),
+            evidence=evidence,
+            next_step=nxt,
+            provenance=prov,
+        )
+
+    def _persist_structured_handoff(self, d, job, envelope) -> None:
+        """Best-effort structured handoff persistence after a consumed result.
+
+        Never fails the consume; a handoff build/persist error is swallowed
+        (the existing minimal ``Handoff`` workflow row already carries the
+        workflow transition).
+        """
+        try:
+            builder = self._handoff_builder or self._default_handoff_record
+            record = builder(d, job, envelope)
+            if record is None:
+                return
+            existing = self.core._store.get_handoff_v2(record.handoff_id)
+            if existing is not None:
+                return
+            self.core._store._insert_handoff_v2(
+                **handoff_mod.handoff_to_store_json(record))
+        except Exception:
+            pass
+
+    def _create_checkpoint(self, d, job) -> None:
+        """Best-effort bounded checkpoint after a consumed agent result.
+
+        INSERT-only; fenced by the current lease holder (a stale holder is
+        refused) and the store derives the sequential ``checkpoint_no``.  The
+        checkpoint persists REAL refs (last pack id+hash, latest handoff refs,
+        artifact refs, bounded progress) — never empty placeholders.  Never
+        fails the consume.
+        """
+        try:
+            if self._checkpoint_store is None:
+                return
+            cs = self._checkpoint_store
+
+            # Real last context pack (id + content hash) for this dispatch.
+            pack = self.core._store.get_context_pack(d.id)
+            pack_id = pack.context_pack_id if pack is not None else ""
+            pack_hash = pack.content_hash if pack is not None else ""
+
+            # Real latest structured handoff (refs + bounded progress).
+            latest_ho = self.core._store.get_latest_handoff_v2(job["id"])
+            handoff_refs = (latest_ho["handoff_id"],) if latest_ho else ()
+            artifact_refs: tuple = ()
+            milestones: tuple = ()
+            if latest_ho:
+                try:
+                    arts = json.loads(latest_ho.get("artifacts_json") or "[]")
+                    artifact_refs = tuple(
+                        (a.get("ref", ""), a.get("content_hash", ""))
+                        for a in arts if a.get("ref")
+                    )
+                except Exception:
+                    artifact_refs = ()
+                try:
+                    result = json.loads(latest_ho.get("result_json") or "{}")
+                    obs = (result.get("key_observations") or [])[
+                        :checkpoint_mod.MAX_MILESTONES]
+                    milestones = tuple(
+                        str(o)[:checkpoint_mod.MAX_MILESTONE_LEN] for o in obs
+                    )
+                except Exception:
+                    milestones = ()
+
+            rec = checkpoint_mod.build_checkpoint_record(
+                job_id=job["id"],
+                checkpoint_no=1,  # placeholder — the store derives MAX+1
+                created_at=self._now_iso(),
+                workflow=checkpoint_mod.CheckpointWorkflow(
+                    primary_state=job.get("primary_state") or "",
+                    logical_step=(job.get("workflow_state") or "")
+                    [:checkpoint_mod.MAX_STEP_LEN],
+                    attempt_no=job.get("attempt_no") or 0,
+                    queue_meta=(),
+                ),
+                context=checkpoint_mod.CheckpointContext(
+                    last_context_pack_id=pack_id,
+                    last_context_pack_hash=pack_hash,
+                    required_trusted_source_refs=(),
+                    selected_artifact_refs=artifact_refs,
+                    latest_handoff_refs=handoff_refs,
+                ),
+                code=checkpoint_mod.CheckpointCode(
+                    worktree_path=job.get("canonical_worktree_path") or "",
+                    repo_identity=job.get("repo_identity") or "",
+                    base_commit=job.get("base_commit") or "",
+                    head_commit=job.get("current_head") or job.get("expected_head") or "",
+                ),
+                progress=checkpoint_mod.CheckpointProgress(
+                    completed_milestones=milestones,
+                    remaining_milestones=(),
+                    unresolved_questions=(),
+                ),
+            )
+            cs.create_checkpoint(
+                rec,
+                owner_instance_id=self._lease_owner,
+                lease_epoch=self._lease_epoch,
+            )
+        except Exception:
+            pass
 
     def _perform_bind_run(self, decision, job):
         dispatch_id = decision.dispatch_id
@@ -4359,6 +4584,11 @@ class Supervisor:
         # missed, task/run mismatch) must FAIL the action so the bounded
         # retry policy applies - never a silent infinite re-plan.
         if res.status in ("consumed", "duplicate"):
+            # D2: best-effort structured handoff + bounded checkpoint after a
+            # consumed agent result (never fails the consume; the existing
+            # minimal workflow handoff already carries the transition).
+            self._persist_structured_handoff(d, job, envelope)
+            self._create_checkpoint(d, job)
             self._finish_action(row["id"], "SUCCEEDED")
             return ActionOutcome("CONSUME_RESULT", "executed",
                                  detail=res.status, dispatch_id=dispatch_id)
