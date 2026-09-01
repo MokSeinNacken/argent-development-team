@@ -657,6 +657,12 @@ class SupervisorStore:
     def persist_resource_decision(self, job_id: str, **kwargs) -> dict:
         return self._store.persist_resource_decision(job_id, **kwargs)
 
+    def commit_recovery_decision(self, job_id: str, **kwargs) -> dict:
+        return self._store.commit_recovery_decision(job_id, **kwargs)
+
+    def has_recovery_marker(self, job_id: str, process_id: str) -> bool:
+        return self._store.has_recovery_marker(job_id, process_id)
+
     def lease_is_current(
         self, job_id: str, owner_instance_id: str, lease_epoch: int
     ) -> bool:
@@ -3970,6 +3976,13 @@ class Supervisor:
             return ActionOutcome("RUN_SANDBOX_TESTS", "resource_enforcement_failed",
                                  reason, dispatch_id=dispatch_id)
         exit_code = self._run_sandbox_scoped(d, job, dispatch_id)
+        # C3: a sandbox termination with resource evidence (OOM / memory-limit /
+        # timeout / unknown) is a resource event, never a code failure.  The
+        # scheduler performs the fenced recovery commit; here we only SIGNAL it.
+        if self._sandbox_resource_termination(dispatch_id):
+            self._finish_action(row["id"], "FAILED", "resource_termination")
+            return ActionOutcome("RUN_SANDBOX_TESTS", "resource_termination_failed",
+                                 dispatch_id=dispatch_id)
         self._finish_action(
             row["id"],
             "SUCCEEDED" if exit_code == 0 else "FAILED",
@@ -3977,6 +3990,34 @@ class Supervisor:
         )
         return ActionOutcome("RUN_SANDBOX_TESTS", "executed",
                              dispatch_id=dispatch_id)
+
+    def _sandbox_resource_termination(self, dispatch_id) -> bool:
+        """True when the sandbox process ended with resource evidence (C3).
+
+        Reads the bounded termination evidence persisted by
+        :meth:`_run_sandbox_scoped` and classifies it via the shared C3
+        classifier.  A resource failure class routes to the scheduler's fenced
+        recovery commit; a NORMAL_EXIT / code failure returns False (the normal
+        code-failure workflow continues).
+        """
+        reg = self.core._store.get_process_registration_for_dispatch(dispatch_id)
+        if reg is None:
+            return False
+        scope_events = None
+        if reg.get("scope_events"):
+            try:
+                import json
+                scope_events = json.loads(reg["scope_events"])
+            except (ValueError, TypeError):
+                scope_events = None
+        from .resource_recovery import classify_failure, is_resource_failure
+        fc = classify_failure(
+            termination_class=reg.get("termination_class"),
+            exit_code=reg.get("exit_code"),
+            timed_out=bool(reg.get("timed_out")),
+            scope_events=scope_events,
+        )
+        return is_resource_failure(fc)
 
     def _run_sandbox_scoped(self, d, job, dispatch_id) -> int:
         """Run the bwrap sandbox tests inside an enforced scope (F3/F5).
@@ -4010,7 +4051,30 @@ class Supervisor:
             dispatch_id=dispatch_id,
         )
         if result.status == EnforcementStatus.SCOPE_CLEANUP_UNVERIFIED.value:
-            return -1  # F2: unproven cleanup -> fail-closed, never a pass
+            # C3/F4: an unproven cleanup means a process may STILL be running —
+            # this is a resource failure (LOST quarantine), never a code failure
+            # and never a silent pass.  Persist authoritative terminal evidence
+            # (termination_class=SCOPE_CLEANUP_UNVERIFIED) so
+            # :meth:`_sandbox_resource_termination` signals it and the scheduler
+            # maps it to QUARANTINE_LOST (no code rework, no retry).
+            if result.scope is not None and result.scope.process_id:
+                self._register_process_evidence(
+                    job["id"], dispatch_id, result.scope.process_id,
+                    scope=result.scope,
+                )
+                reg = self.core._store.get_process_registration_for_dispatch(
+                    dispatch_id,
+                )
+                if reg is not None:
+                    self._process_registry.mark_terminal(
+                        reg["process_id"],
+                        exit_code=result.exit_code,
+                        terminal_at=self._now_iso(),
+                        termination_class=EnforcementStatus.SCOPE_CLEANUP_UNVERIFIED.value,
+                        timed_out=False,
+                        scope_events=None,
+                    )
+            return -1
         if result.scope is None:
             return -1
         if result.scope.process_id:

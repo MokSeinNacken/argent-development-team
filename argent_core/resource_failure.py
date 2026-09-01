@@ -40,6 +40,10 @@ class TerminationClass(str, Enum):
     SCOPE_CREATION_FAILED = "SCOPE_CREATION_FAILED"
     SCOPE_VERIFICATION_FAILED = "SCOPE_VERIFICATION_FAILED"
     ENFORCEMENT_UNAVAILABLE = "ENFORCEMENT_UNAVAILABLE"
+    # C3/F4: cleanup could not be proven inactive (a process may still be
+    # running) — persisted as an authoritative termination class so recovery
+    # maps it to LOST quarantine (never a code failure, never a retry).
+    SCOPE_CLEANUP_UNVERIFIED = "SCOPE_CLEANUP_UNVERIFIED"
     UNKNOWN_TERMINATION = "UNKNOWN_TERMINATION"
 
 

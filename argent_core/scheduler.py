@@ -56,6 +56,16 @@ from .process_registry import (
 )
 from .resource_governor import AdmissionVerdict, ResourceGovernor, ResourceReasonCode
 from .resource_policy import ResourceClass
+from .resource_recovery import (
+    FailureClass,
+    RecoveryDecision,
+    RecoveryPolicy,
+    classify_failure,
+    decide_recovery,
+    is_resource_failure,
+    next_eligible_at_after,
+    reason_code_for_failure,
+)
 from .store import MAX_LEASE_TTL_SECONDS
 from .supervisor import (
     ActionOutcome,
@@ -88,6 +98,7 @@ OUTCOME_FENCED = "fenced"
 OUTCOME_RESOURCE_DEFERRED = "resource_deferred"
 OUTCOME_RESOURCE_DENIED = "resource_denied"
 OUTCOME_RESOURCE_LOST = "resource_lost"
+OUTCOME_RESOURCE_RECOVERED = "resource_recovered"
 
 #: Far-future ``next_eligible_at`` delay (seconds) for DENY_LOCAL: prevents an
 #: identical automatic retry without inventing a new primary state.  The job
@@ -118,6 +129,7 @@ class RestartReconcileSummary:
     blocked_worktree: int = 0
     foreign_lease_kept: int = 0
     process_alive: int = 0
+    resource_recovered: int = 0
     left: int = 0
     details: Tuple[tuple, ...] = ()
 
@@ -150,6 +162,8 @@ class Scheduler:
         # auto-creation, so existing deterministic C1/B tests stay unaffected).
         enforcer=None,
         scope_backend=None,
+        # C3: bounded recovery policy (bounded retry only, never escalation).
+        recovery_policy=None,
     ):
         if not isinstance(owner_instance_id, str) or not owner_instance_id.strip():
             raise ValueError("owner_instance_id must be a non-empty string")
@@ -217,6 +231,8 @@ class Scheduler:
             supervisor._scope_backend = (
                 scope_backend or getattr(supervisor, "_scope_backend", None)
             )
+        # C3: bounded recovery policy (injectable for tests).
+        self._recovery_policy = recovery_policy or RecoveryPolicy()
 
     # ------------------------------------------------------------------ pass
 
@@ -576,6 +592,16 @@ class Scheduler:
             if gate is not None:
                 return gate
 
+        # C3/F1: a RUNNING job (continuation OR takeover) whose process has
+        # authoritative terminal registry evidence (detached agent finished /
+        # failed) is classified + recovered exactly once BEFORE any further
+        # reconcile/spawn — no duplicate spawn, no second agent.  A non-resource
+        # class or a live process returns None and continues normally.
+        recovered = self.classify_and_recover(target_job_id, epoch)
+        if recovered is not None:
+            self._supervisor.clear_lease_owner()
+            return recovered
+
         try:
             decision = self._supervisor.reconcile(target_job_id)
         except LeaseFencedError as exc:
@@ -633,6 +659,17 @@ class Scheduler:
             return SchedulerPassResult(
                 OUTCOME_RESOURCE_LOST, job_id=target_job_id,
                 detail=action_outcome.detail,
+            )
+
+        # C3: a synchronous sandbox termination with resource evidence routes
+        # through the central fenced recovery commit (classification happens in
+        # the scheduler, exactly-once under the holder lease).
+        if action_outcome.status == "resource_termination_failed":
+            recovered = self.classify_and_recover(target_job_id, epoch)
+            self._supervisor.clear_lease_owner()
+            return recovered or SchedulerPassResult(
+                OUTCOME_STEPPED, job_id=target_job_id, decision=decision,
+                action_outcome=action_outcome, detail="recovery_noop",
             )
 
         row = self._supervisor.store._job_row(target_job_id)
@@ -721,6 +758,7 @@ class Scheduler:
         details: list = []
         scanned = rebound = quarantined = takeover = foreign = left = 0
         process_alive = 0
+        resource_recovered = 0
         blocked_worktree = 0
 
         for row in rows:
@@ -748,6 +786,8 @@ class Scheduler:
                 quarantined += 1
             elif kind == "process_alive":
                 process_alive += 1
+            elif kind == "resource_recovered":
+                resource_recovered += 1
             elif kind == "skip_terminal":
                 pass  # a terminal appeared concurrently; counted in scanned only
             else:  # "left" (re-classified to a non-RUNNING state)
@@ -758,7 +798,8 @@ class Scheduler:
             scanned=scanned, rebound=rebound, quarantined_lost=quarantined,
             takeover_candidates=takeover, blocked_worktree=blocked_worktree,
             foreign_lease_kept=foreign,
-            process_alive=process_alive, left=left, details=tuple(details),
+            process_alive=process_alive, resource_recovered=resource_recovered,
+            left=left, details=tuple(details),
         )
 
     def _classify_running(self, row: dict, now_iso: str) -> tuple:
@@ -781,6 +822,18 @@ class Scheduler:
         current = row
         for _ in range(3):  # bounded re-classification attempts
             jid = current["id"]
+            # C3/F1: a RUNNING job whose process has authoritative terminal
+            # registry evidence is a post-terminal resource-recovery point
+            # (detached agent).  Classify + recover exactly once under the
+            # holder lease; a fenced/foreign holder or a non-resource class
+            # falls through to the normal D-rule classification below.
+            reg = self._bound_terminal_evidence(jid)
+            if reg is not None:
+                recovered = self.classify_and_recover(
+                    jid, current.get("lease_epoch") or 0,
+                )
+                if recovered is not None:
+                    return ("resource_recovered", recovered.detail)
             owner = current.get("owner_instance_id")
             epoch = current.get("lease_epoch")
             expires = current.get("lease_expires_at")
@@ -915,3 +968,137 @@ class Scheduler:
             "writer_binding_mode",
         )
         return {k: row.get(k) for k in keys}
+
+    # -- C3 resource-failure classification + fenced recovery commit --------
+
+    @staticmethod
+    def _parse_scope_events(scope_events) -> Optional[dict]:
+        """Parse the bounded ``scope_events`` JSON (fail-closed to None)."""
+        if not scope_events:
+            return None
+        try:
+            import json
+            value = json.loads(scope_events)
+        except (ValueError, TypeError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _bound_terminal_evidence(self, job_id: str) -> Optional[dict]:
+        """Return the terminal registry row BOUND to the job's frontier.
+
+        C3/F3: persisted OOM_KILL/TIMEOUT facts are only authoritative when they
+        belong to the CONCRETE process bound to (a) the current frontier
+        dispatch, (b) the current boot identity and (c/d) the row's own
+        process_id + scope_ref/cgroup binding.  A different dispatch, a
+        stale/fremde boot_id or a missing frontier binding is historical
+        evidence -> ``None`` (no classification).  This is a TARGETED query for
+        the frontier's terminal evidence — never "the newest arbitrary row".
+        """
+        row = self._supervisor.store._job_row(job_id)
+        if row is None:
+            return None
+        if row.get("primary_state") != job_state.PrimaryState.RUNNING.value:
+            return None
+        if row.get("terminal") is not None:
+            return None
+        expected_dispatch = row.get("expected_dispatch_id")
+        provider = self._supervisor._process_identity_provider \
+            or ProcessIdentityProvider()
+        try:
+            current_boot = provider.boot_id()
+        except Exception:
+            current_boot = None
+        regs = self._supervisor.core._store.list_process_registrations(job_id)
+        for reg in reversed(regs):  # newest first
+            if not ProcessRegistry.is_terminally_dead(reg):
+                continue
+            # (b) bind to the current frontier dispatch.
+            if expected_dispatch is not None:
+                if reg.get("dispatch_id") != expected_dispatch:
+                    continue
+            elif reg.get("dispatch_id") is not None:
+                # No frontier dispatch persisted yet -> no binding -> fail closed.
+                continue
+            # (c) boot_id consistency: a stale/fremde boot is historical only.
+            if current_boot is not None and reg.get("boot_id") != current_boot:
+                continue
+            # (a/d) the row IS the concrete bound process (process_id + scope_ref
+            # + cgroup_ref + evidence live in this single row).
+            return reg
+        return None
+
+    def classify_and_recover(
+        self, job_id: str, epoch: int,
+    ) -> Optional[SchedulerPassResult]:
+        """C3: classify terminal process evidence and commit a fenced recovery.
+
+        The central classification point.  Reads the terminal process-registry
+        evidence BOUND to the job's current frontier (trusted store data — never
+        agent output), derives the C3 :class:`FailureClass` from the persisted
+        ``termination_class`` / ``scope_events`` / ``timed_out`` / ``exit_code``,
+        decides a bounded :class:`RecoveryDecision`, and commits it exactly-once
+        under the current holder lease (stale/foreign holders write NOTHING;
+        the same process_id is recovered at most once via the consumed marker).
+
+        Returns a :class:`SchedulerPassResult` when a resource decision was
+        committed, or ``None`` when there is no authoritative terminal resource
+        evidence (the job continues through the normal workflow — NORMAL_EXIT /
+        code failure are NOT resource recoveries).
+        """
+        row = self._supervisor.store._job_row(job_id)
+        if row is None:
+            return None
+        if row.get("primary_state") != job_state.PrimaryState.RUNNING.value:
+            return None
+        if row.get("terminal") is not None:
+            return None
+        reg = self._bound_terminal_evidence(job_id)
+        if reg is None:
+            return None
+        # C3/F5: exactly-once — an already-consumed process_id is a no-op.
+        process_id = reg.get("process_id")
+        if process_id and self._supervisor.store.has_recovery_marker(job_id, process_id):
+            return None
+
+        scope_events = self._parse_scope_events(reg.get("scope_events"))
+        failure_class = classify_failure(
+            termination_class=reg.get("termination_class"),
+            exit_code=reg.get("exit_code"),
+            timed_out=bool(reg.get("timed_out")),
+            scope_events=scope_events,
+            policy=self._recovery_policy,
+        )
+        if not is_resource_failure(failure_class):
+            return None  # NORMAL_EXIT / code failure -> normal workflow
+
+        attempt_no = row.get("attempt_no") or 0
+        decision = decide_recovery(
+            failure_class, attempt_no=attempt_no, policy=self._recovery_policy,
+        )
+        reason = reason_code_for_failure(failure_class)
+        backoff = (
+            self._recovery_policy.retry_backoff_seconds
+            if decision is RecoveryDecision.RETRY_BOUNDED
+            else self._recovery_policy.defer_backoff_seconds
+        )
+        next_eligible_at = next_eligible_at_after(
+            self._supervisor._now_iso(), backoff,
+        )
+        try:
+            self._supervisor.store.commit_recovery_decision(
+                job_id,
+                owner_instance_id=self.owner_instance_id,
+                lease_epoch=epoch,
+                failure_class=failure_class,
+                recovery_decision=decision,
+                reason_code=reason,
+                next_eligible_at=next_eligible_at,
+                process_id=process_id,
+            )
+        except (LeaseError, LeaseFencedError):
+            # Fenced/foreign holder or already-consumed — write nothing, leave
+            # the job for its current holder (exactly-once under the fence).
+            return None
+        return SchedulerPassResult(
+            OUTCOME_RESOURCE_RECOVERED, job_id=job_id, detail=decision.value,
+        )

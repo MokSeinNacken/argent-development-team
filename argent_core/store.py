@@ -28,6 +28,12 @@ from . import job_state
 from .gates import binding_hash
 from .resource_policy import RESOURCE_CLASS_VALUES, ResourceClass
 from .resource_failure import TERMINATION_CLASS_VALUES
+from .resource_recovery import (
+    FailureClass,
+    RecoveryDecision,
+    assert_valid_recovery_pair,
+    normalized_reason_code,
+)
 from .worktree import (
     V_AMBIGUOUS_WRITER,
     V_BLOCKED_DIVERGED,
@@ -73,7 +79,8 @@ from .models import (
 # C1 (Phase C): resource class + bounded last-resource-decision audit columns
 # (additive).  Enforcement (cgroup/systemd-run/prlimit) is Phase C2.
 # C2 (Phase C): bounded execution-scope evidence on process_registry (additive).
-SCHEMA_VERSION = "10"
+# C3 (Phase C): bounded recovery-decision audit on supervisor_jobs (additive).
+SCHEMA_VERSION = "11"
 
 _TASK_STATES = "', '".join(s.value for s in TaskState)
 _TASK_RUN_STATUSES = "', '".join(s.value for s in TaskRunStatus)
@@ -427,6 +434,9 @@ _SCHEMA: tuple[str, ...] = (
         last_resource_reason_code TEXT,
         last_resource_snapshot_hash TEXT,
         last_resource_at      TEXT,
+        last_recovery_decision TEXT,
+        last_failure_class    TEXT,
+        last_recovery_at      TEXT,
         created_at            TEXT NOT NULL,
         updated_at            TEXT NOT NULL,
         CHECK ((terminal IS NULL) OR (status = 'TERMINAL' AND next_action = 'NONE'))
@@ -506,6 +516,14 @@ _SCHEMA: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS idx_process_registry_identity
         ON process_registry(boot_id, pid, process_start_ticks)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS resource_recovery_markers (
+        job_id      TEXT NOT NULL REFERENCES supervisor_jobs(id) ON DELETE CASCADE,
+        process_id  TEXT NOT NULL,
+        consumed_at TEXT NOT NULL,
+        PRIMARY KEY (job_id, process_id)
+    )
     """,
     """
     CREATE TABLE IF NOT EXISTS supervisor_actions (
@@ -1085,6 +1103,25 @@ class Store:
              "ALTER TABLE process_registry ADD COLUMN scope_events TEXT"),
         ):
             if col not in prcols:
+                self._conn.execute(ddl)
+
+        # --- C3 (Phase C): bounded recovery-decision audit (additive) ------
+        # ``last_recovery_decision`` / ``last_failure_class`` / ``last_recovery_at``
+        # are pure audit (bounded TEXT; never authorise an automatic admission —
+        # a new claim always re-runs preflight).  Additive columns only; fresh
+        # CREATE TABLE already carries them.
+        sjcols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(supervisor_jobs)")
+        }
+        for col, ddl in (
+            ("last_recovery_decision",
+             "ALTER TABLE supervisor_jobs ADD COLUMN last_recovery_decision TEXT"),
+            ("last_failure_class",
+             "ALTER TABLE supervisor_jobs ADD COLUMN last_failure_class TEXT"),
+            ("last_recovery_at",
+             "ALTER TABLE supervisor_jobs ADD COLUMN last_recovery_at TEXT"),
+        ):
+            if col not in sjcols:
                 self._conn.execute(ddl)
 
         # UPSERT the schema version after successful DDL + migration.
@@ -2260,6 +2297,8 @@ class Store:
             "resource_class", "last_resource_decision",
             "last_resource_reason_code", "last_resource_snapshot_hash",
             "last_resource_at",
+            "last_recovery_decision", "last_failure_class",
+            "last_recovery_at",
         }
     )
 
@@ -2338,6 +2377,13 @@ class Store:
         for col in (
             "last_resource_decision", "last_resource_reason_code",
             "last_resource_snapshot_hash", "last_resource_at",
+        ):
+            if col not in row:
+                row[col] = None
+        # C3: bounded recovery-decision audit columns defaulted for older
+        # callers/tests that build a partial job row.
+        for col in (
+            "last_recovery_decision", "last_failure_class", "last_recovery_at",
         ):
             if col not in row:
                 row[col] = None
@@ -3512,6 +3558,232 @@ class Store:
             )
             return self.get_supervisor_job(job_id)
 
+    def commit_recovery_decision(
+        self,
+        job_id: str,
+        *,
+        owner_instance_id: str,
+        lease_epoch: int,
+        failure_class: str,
+        recovery_decision: str,
+        reason_code: Optional[str] = None,
+        next_eligible_at: Optional[str] = None,
+        expected: Optional[dict] = None,
+        process_id: Optional[str] = None,
+    ) -> dict:
+        """Atomically commit a C3 recovery decision for a RUNNING job (fenced).
+
+        The single trusted commit point for resource-failure recovery.  Runs in
+        ONE ``BEGIN IMMEDIATE`` and, in order:
+
+        (a) fresh read + optional snapshot-CAS (``expected`` — same fence as
+            :meth:`quarantine_lost`);
+        (b) fence: the job must be RUNNING, non-terminal, held by the CURRENT
+            ``(owner_instance_id, lease_epoch)`` with an unexpired lease — a
+            stale/foreign holder writes NOTHING (:class:`LeaseFencedError`);
+        (c) exactly-once (structural): the transition atomically moves the job
+            out of RUNNING, so a re-invocation for the SAME terminal event
+            fails the RUNNING fence (no separate idempotency table, no
+            duplicate recovery on restart/crash);
+        (d) the bounded audit columns ``last_recovery_decision`` /
+            ``last_failure_class`` / ``last_recovery_at`` are persisted WITH
+            the transition (audit-only, never an admission authority).
+
+        Decision -> transition mapping (no new primary states):
+
+        * ``RETRY_BOUNDED`` -> QUEUED + ``queue_reason=RETRY_BACKOFF`` +
+          ``attempt_no+1`` + bounded ``next_eligible_at`` +
+          ``error_class=RESOURCE``;
+        * ``DEFER_RESOURCE`` -> QUEUED + ``queue_reason=RESOURCE_DEFERRED`` +
+          bounded ``next_eligible_at`` + ``error_class=RESOURCE`` + ``attempt_no+1``
+          (C3/F2: a defer consumes the shared bounded budget);
+        * ``BLOCK_RESOURCE`` / ``PREFER_EXTERNAL`` -> BLOCKED
+          (``terminal=BLOCKED``, not terminal-DONE) with the bounded reason
+          code; PREFER_EXTERNAL is only an audit hint (no external action);
+        * ``QUARANTINE_LOST`` -> LOST (``status=RECOVERING``) fail-closed;
+
+        ``COMPLETE`` / ``FAIL_NONRESOURCE`` are NOT accepted here — those are
+        "no resource action" outcomes handled by the caller (a ``ValueError``
+        is raised so no free string ever reaches the DB).
+        """
+        # Validate closed sets first (no free agent strings reach the DB).
+        fc = failure_class if isinstance(failure_class, FailureClass) \
+            else FailureClass(failure_class)
+        decision = recovery_decision if isinstance(recovery_decision, RecoveryDecision) \
+            else RecoveryDecision(recovery_decision)
+        if decision in (RecoveryDecision.COMPLETE, RecoveryDecision.FAIL_NONRESOURCE):
+            raise ValueError(
+                f"commit_recovery_decision does not handle {decision.value!r}; "
+                f"it is a no-resource-action outcome"
+            )
+        # C3/F7a: the (failure -> decision) pairing must be a valid closed pair.
+        assert_valid_recovery_pair(fc, decision)
+        # C3/F7b: reason code is bounded (derived from the failure class when
+        # absent; a free string is refused).
+        reason_code = normalized_reason_code(fc, reason_code)
+        self._validate_lease_owner(owner_instance_id)
+        now = self._clock()
+        now_iso = _format_dt(now)
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            job = dict(row)
+            cas_ps = cas_owner = cas_epoch = None
+            if expected is not None:
+                for field in ("primary_state", "owner_instance_id",
+                              "lease_epoch", "lease_expires_at",
+                              "facts_version"):
+                    if job.get(field) != expected.get(field):
+                        raise LeaseFencedError(
+                            f"recovery-decision CAS lost for job {job_id!r} ({field})"
+                        )
+                cas_ps = expected.get("primary_state")
+                cas_owner = expected.get("owner_instance_id")
+                cas_epoch = expected.get("lease_epoch")
+            if job.get("terminal") is not None:
+                raise LeaseError(
+                    f"terminal job {job_id!r} cannot commit a recovery decision"
+                )
+            if job["primary_state"] != job_state.PrimaryState.RUNNING.value:
+                raise LeaseError(
+                    f"job {job_id!r} is {job['primary_state']!r}; recovery "
+                    f"decision requires RUNNING"
+                )
+            if job["owner_instance_id"] != owner_instance_id:
+                raise LeaseFencedError(
+                    f"recovery-decision owner mismatch for job {job_id!r}"
+                )
+            if job["lease_epoch"] != lease_epoch:
+                raise LeaseFencedError(
+                    f"recovery-decision epoch mismatch for job {job_id!r}"
+                )
+            if job["lease_expires_at"] is None or job["lease_expires_at"] <= now_iso:
+                raise LeaseFencedError(f"lease expired for job {job_id!r}")
+
+            # C3/F5: explicit exactly-once consumed marker keyed by process_id.
+            # A re-invocation for the SAME terminal process event is refused
+            # (no duplicate recovery, no duplicate retry action), independent of
+            # the structural RUNNING-exit guard.  Inserted atomically WITH the
+            # transition below; any fence/CAS loss rolls the marker back too.
+            if process_id is not None:
+                already = self._conn.execute(
+                    "SELECT 1 FROM resource_recovery_markers "
+                    "WHERE job_id = ? AND process_id = ?",
+                    (job_id, process_id),
+                ).fetchone()
+                if already is not None:
+                    raise LeaseFencedError(
+                        f"recovery already consumed for job {job_id!r} "
+                        f"process {process_id!r}"
+                    )
+                self._conn.execute(
+                    "INSERT INTO resource_recovery_markers "
+                    "(job_id, process_id, consumed_at) VALUES (?, ?, ?)",
+                    (job_id, process_id, now_iso),
+                )
+
+            audit = {
+                "last_recovery_decision": decision.value,
+                "last_failure_class": fc.value,
+                "last_recovery_at": now_iso,
+                "last_error_code": reason_code,
+            }
+            if decision is RecoveryDecision.RETRY_BOUNDED:
+                fields = dict(audit, **{
+                    "queue_reason": job_state.QueueReason.RETRY_BACKOFF.value,
+                    "next_eligible_at": next_eligible_at,
+                    "error_class": job_state.ErrorClass.RESOURCE.value,
+                    "attempt_no": job["attempt_no"] + 1,
+                    "owner_instance_id": None,
+                    "lease_expires_at": None,
+                })
+                return self._transition_job(
+                    job_id,
+                    to_primary_state=job_state.PrimaryState.QUEUED.value,
+                    to_status=job_state.status_for_enqueue(
+                        job_state.QueueReason.RETRY_BACKOFF.value,
+                    ),
+                    fields=fields,
+                    bump_facts_version=True,
+                    cas_primary_state=cas_ps,
+                    cas_owner_instance_id=cas_owner,
+                    cas_lease_epoch=cas_epoch,
+                    cas_lease_unexpired=True,
+                    now_iso=now_iso,
+                )
+            if decision is RecoveryDecision.DEFER_RESOURCE:
+                fields = dict(audit, **{
+                    "queue_reason": job_state.QueueReason.RESOURCE_DEFERRED.value,
+                    "next_eligible_at": next_eligible_at,
+                    "error_class": job_state.ErrorClass.RESOURCE.value,
+                    # C3/F2: a defer consumes the shared bounded budget (countable,
+                    # hard-capped) so an unbounded defer loop is impossible.
+                    "attempt_no": job["attempt_no"] + 1,
+                    "owner_instance_id": None,
+                    "lease_expires_at": None,
+                })
+                return self._transition_job(
+                    job_id,
+                    to_primary_state=job_state.PrimaryState.QUEUED.value,
+                    to_status=job_state.status_for_enqueue(
+                        job_state.QueueReason.RESOURCE_DEFERRED.value,
+                    ),
+                    fields=fields,
+                    bump_facts_version=True,
+                    cas_primary_state=cas_ps,
+                    cas_owner_instance_id=cas_owner,
+                    cas_lease_epoch=cas_epoch,
+                    cas_lease_unexpired=True,
+                    now_iso=now_iso,
+                )
+            if decision in (RecoveryDecision.BLOCK_RESOURCE,
+                            RecoveryDecision.PREFER_EXTERNAL):
+                fields = dict(audit, **{
+                    "terminal": "BLOCKED",
+                    "owner_instance_id": None,
+                    "lease_expires_at": None,
+                    "error_class": job_state.ErrorClass.RESOURCE.value,
+                    "next_action": "NONE",
+                    "next_wake_at": None,
+                })
+                return self._transition_job(
+                    job_id,
+                    to_primary_state=job_state.PrimaryState.BLOCKED.value,
+                    to_status="TERMINAL",
+                    fields=fields,
+                    bump_facts_version=True,
+                    cas_primary_state=cas_ps,
+                    cas_owner_instance_id=cas_owner,
+                    cas_lease_epoch=cas_epoch,
+                    cas_lease_unexpired=True,
+                    now_iso=now_iso,
+                )
+            if decision is RecoveryDecision.QUARANTINE_LOST:
+                fields = dict(audit, **{
+                    "owner_instance_id": None,
+                    "lease_expires_at": None,
+                    "error_class": job_state.ErrorClass.OWNER_REQUIRED.value,
+                    "next_action": "NONE",
+                    "next_wake_at": None,
+                })
+                return self._transition_job(
+                    job_id,
+                    to_primary_state=job_state.PrimaryState.LOST.value,
+                    to_status="RECOVERING",
+                    fields=fields,
+                    bump_facts_version=True,
+                    cas_primary_state=cas_ps,
+                    cas_owner_instance_id=cas_owner,
+                    cas_lease_epoch=cas_epoch,
+                    cas_lease_unexpired=True,
+                    now_iso=now_iso,
+                )
+            # unreachable (closed set validated above); fail-closed.
+            raise ValueError(f"unknown recovery decision {decision.value!r}")
+
     # -- B3 external waits (atomic transition + bounded requeue) -----------
     #
     # ``transition_to_waiting_external`` is the SINGLE trusted path that moves a
@@ -3730,6 +4002,17 @@ class Store:
         rows = self._conn.execute(q, params).fetchall()
         return [dict(r) for r in rows]
 
+    # -- C3/F5: explicit exactly-once recovery consumed markers -------------
+
+    def has_recovery_marker(self, job_id: str, process_id: str) -> bool:
+        """True when a recovery for ``(job_id, process_id)`` was already consumed."""
+        row = self._conn.execute(
+            "SELECT 1 FROM resource_recovery_markers "
+            "WHERE job_id = ? AND process_id = ?",
+            (job_id, process_id),
+        ).fetchone()
+        return row is not None
+
     def _update_process_registration(self, process_id: str, **fields) -> int:
         unknown = set(fields) - (
             self._PROCESS_REGISTRY_COLUMNS - {"process_id", "created_at"}
@@ -3773,7 +4056,15 @@ class Store:
         :func:`argent_core.process_registry._bounded_json`) are post-termination
         evidence for C3 (F5).  ``scope_events`` is already a JSON string or
         ``None``.
+
+        C3/F5: idempotent — the FIRST terminal write wins; a later re-mark for
+        the same ``process_id`` is a no-op (returns 0) and never overwrites the
+        original terminal evidence (no duplicate terminal rows, no clobbered
+        facts on a restart/replay).
         """
+        existing = self.get_process_registration(process_id)
+        if existing is not None and existing.get("status") == "TERMINAL":
+            return 0
         return self._update_process_registration(
             process_id,
             status="TERMINAL",
