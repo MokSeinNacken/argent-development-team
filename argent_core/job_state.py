@@ -64,6 +64,9 @@ class ErrorClass(str, Enum):
     EXTERNAL = "EXTERNAL"
     SECURITY = "SECURITY"
     OWNER_REQUIRED = "OWNER_REQUIRED"
+    # D1 (Phase D): Context-Pack build failures are ORCHESTRATION errors
+    # (distinct from DETERMINISTIC code failures and RESOURCE failures).
+    CONTEXT = "CONTEXT"
 
 
 class WaitKind(str, Enum):

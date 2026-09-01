@@ -47,7 +47,6 @@ def _build_v10_db(path: str) -> str:
 def test_fresh_db_lands_on_v11_with_c3_columns(tmp_path):
     core = Core(str(tmp_path / "fresh.db"))
     try:
-        assert _schema_version(core) == "11"
         assert _schema_version(core) == SCHEMA_VERSION
         cols = _job_cols(core)
         for c in _C3_COLUMNS:
@@ -61,7 +60,7 @@ def test_v10_to_v11_adds_columns_and_preserves_rows(tmp_path):
     jid = _build_v10_db(db)
     core = Core(db)
     try:
-        assert _schema_version(core) == "11"
+        assert _schema_version(core) == SCHEMA_VERSION
         cols = _job_cols(core)
         for c in _C3_COLUMNS:
             assert c in cols, f"missing migrated column {c}"
@@ -86,7 +85,7 @@ def test_migration_is_idempotent(tmp_path):
 
     c2 = Core(db)
     try:
-        assert _schema_version(c2) == v1 == "11"
+        assert _schema_version(c2) == v1 == SCHEMA_VERSION
         assert c2._store.get_supervisor_job(row_before["id"]) == row_before
     finally:
         c2.close()

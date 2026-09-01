@@ -55,6 +55,17 @@ from .store import Store, utcnow
 from .workspace_broker import WorkspaceBroker
 from .worktree import GitProvenanceProvider
 from .process_registry import ProcessIdentity, ProcessIdentityProvider, ProcessRegistry
+from .context import PROJECT_RULES, SECURITY_ARCH_RULES
+from .context_pack import (
+    CapabilityTier,
+    ContextBuilder,
+    ContextBuildError,
+    ContextPackRecord,
+    FactInput,
+    Importance,
+    render_pack,
+    validate_context_pack,
+)
 
 # ---------------------------------------------------------------------------
 # Constants (SPEC V2C §9)
@@ -626,10 +637,11 @@ class SupervisorStore:
 
     def quarantine_blocked(
         self, job_id: str, *, error_code: str = "WORKTREE_DIVERGED",
-        expected: Optional[dict] = None,
+        error_class: str = "OWNER_REQUIRED", expected: Optional[dict] = None,
     ) -> Optional[dict]:
         return self._store.quarantine_blocked(
-            job_id, error_code=error_code, expected=expected,
+            job_id, error_code=error_code, error_class=error_class,
+            expected=expected,
         )
 
     def recover_takeover_job(
@@ -1491,6 +1503,10 @@ class Supervisor:
         # a fake backend/enforcer and the Scheduler may also wire one.
         enforcer=None,
         scope_backend=None,
+        # D1: optional Context Builder injection (tests pass a deterministic
+        # fake; default = the real pure ContextBuilder).  Build failures are
+        # fail-closed (no dispatch), never a legacy fallback.
+        context_builder=None,
     ):
         self.core = core
         self.controller_source = controller_source
@@ -1554,6 +1570,9 @@ class Supervisor:
             enforcer = ExecutionEnforcer(scope_backend)
         self._enforcer = enforcer
         self._scope_backend = scope_backend
+        # D1: Context Builder (pure/deterministic).  The default is the real
+        # builder; tests inject a fake to script build success/failure.
+        self._context_builder = context_builder or ContextBuilder()
 
     # ---------------------------------------------------------------- utils
 
@@ -3181,13 +3200,29 @@ class Supervisor:
                     ResourceReasonCode.RESOURCE_ENFORCEMENT_UNAVAILABLE.value,
                     dispatch_id=dispatch_id,
                 )
-            message_file = self._build_message_file(d)
+            # D1: build the immutable Context Pack BEFORE the message file /
+            # spawn.  A build failure (CONTEXT_BUDGET_EXCEEDED / invalid) is a
+            # fail-closed orchestration error: NO dispatch, NO legacy prompt
+            # fallback (§23-J/§30).
+            pack = self._build_context_pack(d, job)
+            # F3: the integration point re-validates ANY builder result before
+            # persistence / message-file rendering / spawn.  An injected builder
+            # must never slip a formally-invalid pack through.
+            validate_context_pack(pack)
+            pack_id = self._persist_context_pack(pack)
+            message_file = self._build_message_file(d, pack, pack_id=pack_id)
             # F1: re-assert the lease fence IMMEDIATELY before the external
             # spawn effect (a stale holder must never launch an agent).
             self._recheck_lease_fence(job["id"])
             outcome = self._spawn_scoped(d, job, message_file, row, admission)
             if outcome is not None:
                 return outcome
+        except ContextBuildError as exc:
+            # Context errors are ORCHESTRATION errors — never CODE_FAILURE,
+            # never a resource/model failure.  No spawn happened.
+            self._finish_action(row["id"], "FAILED", exc.code)
+            return ActionOutcome("SPAWN_RUN", "context_build_failed",
+                                 exc.code, dispatch_id=dispatch_id)
         except Exception as exc:
             self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
             return ActionOutcome("SPAWN_RUN", "failed", str(exc),
@@ -3332,19 +3367,125 @@ class Supervisor:
             # registration as unknown evidence -> LOST (fail-closed).
             pass
 
-    def _build_message_file(self, d: AgentDispatch) -> Path:
-        """Write a minimal, privacy-safe prompt to a temp file for the agent."""
-        import tempfile
+    def _capability_for(self, model_class: Optional[str]) -> str:
+        """Map a trusted dispatch model class to a capability tier (D1).
+
+        The budget tier is selected from the trusted ``expected_model_class``
+        (set by the controller via :mod:`routing`), NEVER from agent output.
+        Conservative default is PRO (the ordinary writer tier).
+        """
+        mc = (model_class or "").lower()
+        if "flash" in mc:
+            return CapabilityTier.FLASH.value
+        if "sol" in mc:
+            return CapabilityTier.SOL.value
+        return CapabilityTier.PRO.value
+
+    def _build_context_pack(self, d: AgentDispatch, job):
+        """Build the immutable Context Pack from trusted local facts (D1).
+
+        Inputs come exclusively from the Core ledger / static policy / bounded
+        repo facts — never from agent text.  Raises :class:`ContextBuildError`
+        (fail-closed) on any budget/validation violation.
+        """
         task = self.core._store.get_task(d.task_id)
-        prompt = (
-            "You are an agent in a deterministic, isolated development team.\n"
-            f"task_id: {d.task_id}\n"
-            f"dispatch_id: {d.id}\n"
-            f"role: {d.role.value}\n"
-            f"title: {task.title}\n"
-            f"{task.description or ''}\n"
-            "Reply with exactly one JSON object matching your role schema.\n"
+        if task is None:
+            raise ContextBuildError("CONTEXT_MISSING_TASK",
+                                    f"task {d.task_id!r} not found")
+        # F1: title AND description are both part of the owner task contract and
+        # must never be silently trimmed.  Fold them losslessly into the single
+        # REQUIRED OWNER_INSTRUCTION objective (the builder assigns that slot
+        # TrustClass.OWNER_INSTRUCTION / Importance.REQUIRED) — never a trimmable
+        # NORMAL fact.
+        title = task.title or ""
+        if task.description:
+            objective = f"Title: {title}\nDescription: {task.description}"
+        else:
+            objective = title
+        facts = [
+            FactInput(f"task_id: {d.task_id}", source_ref="task.id",
+                      importance=Importance.REQUIRED.value),
+            FactInput(f"dispatch_id: {d.id}", source_ref="dispatch.id",
+                      importance=Importance.REQUIRED.value),
+            FactInput(f"risk_class: {task.risk_class.value}",
+                      source_ref="task.risk_class"),
+            FactInput(f"state: {task.state.value}", source_ref="task.state"),
+        ]
+        return self._context_builder.build(
+            job_id=job["id"],
+            dispatch_id=d.id,
+            role=d.role.value,
+            objective=objective,
+            constraints=tuple(PROJECT_RULES) + tuple(SECURITY_ARCH_RULES),
+            facts=tuple(facts),
+            capability=self._capability_for(d.expected_model_class),
+            now_iso=self._now_iso(),
         )
+
+    def _persist_context_pack(self, pack) -> str:
+        """Persist bounded pack metadata (idempotent, fail-closed on drift).
+
+        Only bounded metadata is stored in SQLite (``context_packs``); large
+        pack contents live in the message file / persistent artifacts, never in
+        a DB blob.  Rebuilding the same trusted inputs yields the same
+        ``content_hash`` (and now the same content-stable ``context_pack_id``,
+        F2), so a repeated build reuses the existing row.  Returns the canonical
+        ``context_pack_id`` to render (the message file must carry the EXACT
+        persisted id).  A different hash for the same dispatch is a stale pack
+        (fail-closed).
+        """
+        with self.core._store._transaction():
+            existing = self.core._store.get_context_pack(pack.dispatch_id)
+            if existing is not None:
+                if existing.content_hash == pack.content_hash:
+                    return existing.context_pack_id  # idempotent re-build
+                raise ContextBuildError(
+                    "CONTEXT_STALE_PACK",
+                    f"dispatch {pack.dispatch_id!r} already has a pack with a "
+                    "different content hash",
+                )
+            self.core._store._insert_context_pack(ContextPackRecord(
+                context_pack_id=pack.context_pack_id,
+                dispatch_id=pack.dispatch_id,
+                job_id=pack.job_id,
+                role=pack.role,
+                version=pack.version,
+                content_hash=pack.content_hash,
+                size_estimate=pack.budget_estimated,
+                token_count=pack.token_count,
+                soft_budget=pack.budget_soft,
+                hard_budget=pack.budget_hard,
+                expansion_reason=pack.expansion_reason,
+                artifact_location=None,
+                created_at=pack.created_at,
+            ))
+            return pack.context_pack_id
+
+    def _build_message_file(self, d: AgentDispatch, pack=None, pack_id=None) -> Path:
+        """Write the agent prompt to a temp file.
+
+        D1: when ``pack`` is provided (the only D1-migrated dispatch path), the
+        file is rendered from the immutable Context Pack via
+        :func:`render_pack` (with ``pack_id`` overriding the id so the message
+        file carries the EXACT persisted id — F2).  ``pack=None`` is the LEGACY
+        minimal-prompt path used ONLY by non-D1-migrated callers (none exist
+        today; kept isolated and documented in PHASE_D1_NOTES.md — a migrated
+        dispatch must NEVER fall back to it).
+        """
+        import tempfile
+        if pack is not None:
+            prompt = render_pack(pack, context_pack_id=pack_id)
+        else:
+            task = self.core._store.get_task(d.task_id)
+            prompt = (
+                "You are an agent in a deterministic, isolated development team.\n"
+                f"task_id: {d.task_id}\n"
+                f"dispatch_id: {d.id}\n"
+                f"role: {d.role.value}\n"
+                f"title: {task.title}\n"
+                f"{task.description or ''}\n"
+                "Reply with exactly one JSON object matching your role schema.\n"
+            )
         fd, path = tempfile.mkstemp(suffix=".md", prefix="argent-supervisor-", text=True)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(prompt)

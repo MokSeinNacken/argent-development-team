@@ -73,6 +73,7 @@ from .models import (
     TestResult,
     TestRun,
 )
+from .context_pack import ContextPackRecord
 
 # B3 (Phase B): external waits + minimal process registry + minimal
 # worktree/writer binding (additive).
@@ -80,7 +81,8 @@ from .models import (
 # (additive).  Enforcement (cgroup/systemd-run/prlimit) is Phase C2.
 # C2 (Phase C): bounded execution-scope evidence on process_registry (additive).
 # C3 (Phase C): bounded recovery-decision audit on supervisor_jobs (additive).
-SCHEMA_VERSION = "11"
+# D1 (Phase D): immutable context-pack metadata (context_packs table, additive).
+SCHEMA_VERSION = "12"
 
 _TASK_STATES = "', '".join(s.value for s in TaskState)
 _TASK_RUN_STATUSES = "', '".join(s.value for s in TaskRunStatus)
@@ -366,6 +368,23 @@ _SCHEMA: tuple[str, ...] = (
         context_hash       TEXT NOT NULL,
         context_summary_json TEXT NOT NULL,
         created_at         TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS context_packs (
+        context_pack_id   TEXT PRIMARY KEY,
+        dispatch_id       TEXT NOT NULL UNIQUE REFERENCES agent_dispatches(id) ON DELETE CASCADE,
+        job_id            TEXT NOT NULL,
+        role              TEXT NOT NULL,
+        version           TEXT NOT NULL,
+        content_hash      TEXT NOT NULL,
+        size_estimate     INTEGER NOT NULL CHECK (size_estimate >= 0),
+        token_count       INTEGER NOT NULL CHECK (token_count >= 0),
+        soft_budget       INTEGER NOT NULL CHECK (soft_budget >= 0),
+        hard_budget       INTEGER NOT NULL CHECK (hard_budget >= 0),
+        expansion_reason  TEXT,
+        artifact_location TEXT,
+        created_at        TEXT NOT NULL
     )
     """,
     f"""
@@ -2270,6 +2289,80 @@ class Store:
             for r in rows
         ]
 
+    # -- context packs (Phase D1) -------------------------------------------
+
+    def _insert_context_pack(self, rec: ContextPackRecord) -> None:
+        """Persist immutable context-pack metadata (plain INSERT, no REPLACE)."""
+        self._conn.execute(
+            "INSERT INTO context_packs (context_pack_id, dispatch_id, job_id, "
+            "role, version, content_hash, size_estimate, token_count, "
+            "soft_budget, hard_budget, expansion_reason, artifact_location, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rec.context_pack_id,
+                rec.dispatch_id,
+                rec.job_id,
+                rec.role,
+                rec.version,
+                rec.content_hash,
+                rec.size_estimate,
+                rec.token_count,
+                rec.soft_budget,
+                rec.hard_budget,
+                rec.expansion_reason,
+                rec.artifact_location,
+                rec.created_at,
+            ),
+        )
+
+    def get_context_pack(self, dispatch_id: str) -> Optional[ContextPackRecord]:
+        row = self._conn.execute(
+            "SELECT * FROM context_packs WHERE dispatch_id = ?",
+            (dispatch_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ContextPackRecord(
+            context_pack_id=row["context_pack_id"],
+            dispatch_id=row["dispatch_id"],
+            job_id=row["job_id"],
+            role=row["role"],
+            version=row["version"],
+            content_hash=row["content_hash"],
+            size_estimate=row["size_estimate"],
+            token_count=row["token_count"],
+            soft_budget=row["soft_budget"],
+            hard_budget=row["hard_budget"],
+            expansion_reason=row["expansion_reason"],
+            artifact_location=row["artifact_location"],
+            created_at=row["created_at"],
+        )
+
+    def get_context_pack_by_id(
+        self, context_pack_id: str
+    ) -> Optional[ContextPackRecord]:
+        row = self._conn.execute(
+            "SELECT * FROM context_packs WHERE context_pack_id = ?",
+            (context_pack_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ContextPackRecord(
+            context_pack_id=row["context_pack_id"],
+            dispatch_id=row["dispatch_id"],
+            job_id=row["job_id"],
+            role=row["role"],
+            version=row["version"],
+            content_hash=row["content_hash"],
+            size_estimate=row["size_estimate"],
+            token_count=row["token_count"],
+            soft_budget=row["soft_budget"],
+            hard_budget=row["hard_budget"],
+            expansion_reason=row["expansion_reason"],
+            artifact_location=row["artifact_location"],
+            created_at=row["created_at"],
+        )
+
     # -- supervisor jobs (V4, SPEC V2C §4.1) --------------------------------
     # The supervisor subsystem lives in ``argent_core/supervisor.py``; these
     # methods are the only persistence surface it uses.  Rows are returned as
@@ -2949,18 +3042,22 @@ class Store:
         job_id: str,
         *,
         error_code: str = "WORKTREE_DIVERGED",
+        error_class: str = "OWNER_REQUIRED",
         expected: Optional[dict] = None,
     ) -> Optional[dict]:
         """Fail-closed transition of a nonterminal job to ``BLOCKED`` quarantine
-        (Phase B4 worktree divergence).
+        (Phase B4 worktree divergence; reused by D1 for permanent context
+        failures).
 
         Mirrors :meth:`quarantine_lost` but lands the job in ``BLOCKED``
         (``primary_state=BLOCKED`` / ``status=TERMINAL`` / ``terminal=BLOCKED``)
-        instead of LOST.  A divergent worktree is never overwritten; the job
-        stays BLOCKED until an owner/policy requeue (``enqueue_job``
-        ``owner_authorized``).  When ``expected`` is provided it is a
-        stale-scan snapshot fence (CAS) — drift writes nothing and returns
-        ``None``.
+        instead of LOST.  A divergent worktree (or a deterministic Context
+        failure) is never overwritten; the job stays BLOCKED until an
+        owner/policy requeue (``enqueue_job`` ``owner_authorized``).  When
+        ``expected`` is provided it is a stale-scan snapshot fence (CAS) —
+        drift writes nothing and returns ``None``.  ``error_class`` defaults to
+        ``OWNER_REQUIRED`` (worktree/owner scenarios) but D1 passes ``CONTEXT``
+        to keep the failure taxonomised as an ORCHESTRATION error.
         """
         now = self._clock()
         now_iso = _format_dt(now)
@@ -2989,7 +3086,7 @@ class Store:
                     "terminal": "BLOCKED",
                     "owner_instance_id": None,
                     "lease_expires_at": None,
-                    "error_class": job_state.ErrorClass.OWNER_REQUIRED.value,
+                    "error_class": error_class,
                     "last_error_code": error_code,
                     "next_action": "NONE",
                     "next_wake_at": None,
@@ -4584,6 +4681,12 @@ class Queries:
 
     def list_context_snapshots(self, task_id=None):
         return self._store.list_context_snapshots(task_id)
+
+    def get_context_pack(self, dispatch_id: str):
+        return self._store.get_context_pack(dispatch_id)
+
+    def get_context_pack_by_id(self, context_pack_id: str):
+        return self._store.get_context_pack_by_id(context_pack_id)
 
     def get_latest_decision(self, task_id: str):
         return self._store.get_latest_decision(task_id)

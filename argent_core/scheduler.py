@@ -47,6 +47,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from . import job_state
+from .context_pack import is_permanent_context_code
 from .host_snapshot import HostSnapshotProvider
 from .models import LeaseError, LeaseFencedError, NotFound
 from .process_registry import (
@@ -99,6 +100,8 @@ OUTCOME_RESOURCE_DEFERRED = "resource_deferred"
 OUTCOME_RESOURCE_DENIED = "resource_denied"
 OUTCOME_RESOURCE_LOST = "resource_lost"
 OUTCOME_RESOURCE_RECOVERED = "resource_recovered"
+# D1 (Phase D): a Context-Pack build failure (fail-closed, no dispatch).
+OUTCOME_CONTEXT_FAILED = "context_build_failed"
 
 #: Far-future ``next_eligible_at`` delay (seconds) for DENY_LOCAL: prevents an
 #: identical automatic retry without inventing a new primary state.  The job
@@ -521,6 +524,55 @@ class Scheduler:
             expected=None,
         )
 
+    def _context_failed_job(self, job_id: str, epoch: int, reason_code) -> None:
+        """D1/F6: bounded re-queue for a TRANSIENT Context-Pack failure.
+
+        Only provably transient context errors (e.g. a persist/artifact-write
+        I/O error) may be re-queued.  Mirrors :meth:`_enforcement_failed_job`:
+        the job stays QUEUED with ``error_class=CONTEXT`` (an ORCHESTRATION
+        error — never CODE_FAILURE, never RESOURCE) and a bounded
+        ``next_eligible_at``.  No new primary state, no rework, no spawn.
+        Permanent context codes must go through :meth:`_context_blocked_job`.
+        """
+        policy = self._governor.policy if self._governor is not None else None
+        defer_seconds = getattr(policy, "defer_retry_seconds", 300) \
+            if policy is not None else 300
+        now_iso = self._supervisor._now_iso()
+        try:
+            dt = datetime.fromisoformat(now_iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            next_eligible_at = (
+                dt + timedelta(seconds=defer_seconds)
+            ).isoformat()
+        except (ValueError, TypeError):
+            next_eligible_at = None
+        self._supervisor.store.enqueue_job(
+            job_id,
+            queue_reason=job_state.QueueReason.RETRY_BACKOFF.value,
+            next_eligible_at=next_eligible_at,
+            error_class=job_state.ErrorClass.CONTEXT.value,
+            error_code=reason_code or "CONTEXT_BUDGET_EXCEEDED",
+            owner_instance_id=self.owner_instance_id,
+            lease_epoch=epoch,
+        )
+
+    def _context_blocked_job(self, job_id: str, epoch: int, reason_code) -> None:
+        """D1/F6: fail-closed a PERMANENT Context-Pack error to BLOCKED.
+
+        A deterministic Context failure (budget exceeded, invalid/foreign/stale
+        pack) can never be fixed by a bounded retry.  Route it through the
+        existing ``quarantine_blocked`` semantics (``primary_state=BLOCKED``,
+        no retry, no spawn); an owner/policy requeue is the only way back.  This
+        remains an ORCHESTRATION failure — never CODE_FAILURE, never RESOURCE,
+        never a model failure.
+        """
+        self._supervisor.store.quarantine_blocked(
+            job_id,
+            error_code=reason_code or "CONTEXT_BUDGET_EXCEEDED",
+            error_class=job_state.ErrorClass.CONTEXT.value,
+        )
+
     def _deny_resource_job(self, job_id: str, epoch: int, decision) -> None:
         """DENY_LOCAL: requeue as QUEUED (no spawn) with a far-future horizon."""
         far = self._supervisor._now_iso()
@@ -659,6 +711,22 @@ class Scheduler:
             return SchedulerPassResult(
                 OUTCOME_RESOURCE_LOST, job_id=target_job_id,
                 detail=action_outcome.detail,
+            )
+
+        # D1: a Context-Pack build failure (CONTEXT_BUDGET_EXCEEDED / invalid)
+        # must fail-closed — an ORCHESTRATION error, never CODE_FAILURE, never
+        # RESOURCE, never a spawn.  F6: a permanent context code routes to
+        # BLOCKED (quarantine, no retry); only a provably transient context
+        # error is bounded re-queued as QUEUED with error_class=CONTEXT.
+        if action_outcome.status == "context_build_failed":
+            code = action_outcome.detail or "CONTEXT_BUDGET_EXCEEDED"
+            if is_permanent_context_code(code):
+                self._context_blocked_job(target_job_id, epoch, code)
+            else:
+                self._context_failed_job(target_job_id, epoch, code)
+            return SchedulerPassResult(
+                OUTCOME_CONTEXT_FAILED, job_id=target_job_id,
+                detail=code,
             )
 
         # C3: a synchronous sandbox termination with resource evidence routes
