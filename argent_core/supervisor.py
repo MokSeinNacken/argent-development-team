@@ -36,6 +36,7 @@ from typing import Callable, Optional, Protocol
 from . import job_state, notifications, outputs, workflow
 from .core import ReceiveResult
 from .notifications import NotificationStatus, NotificationType
+from .resource_policy import RESOURCE_CLASS_VALUES, ResourceClass
 from .models import (
     AgentDispatch,
     ApprovalStatus,
@@ -464,9 +465,18 @@ class SupervisorStore:
 
     # -- create (idempotent via deterministic id + command_idempotency, A6) --
 
-    def create_job(self, task_id: str, *, idempotency_key: str) -> SupervisorState:
+    def create_job(
+        self,
+        task_id: str,
+        *,
+        idempotency_key: str,
+        resource_class: Optional[str] = None,
+    ) -> SupervisorState:
         job_id = "supervisor:" + task_id
         args_hash = _sha256(_canonical_json({"task_id": task_id}))
+        rc = resource_class or ResourceClass.LIGHT.value
+        if rc not in RESOURCE_CLASS_VALUES:
+            raise ValueError(f"invalid resource_class {rc!r}")
         with self._store._transaction():
             existing = self._store.get_command_idempotency(
                 idempotency_key, "create_supervisor_job"
@@ -546,6 +556,11 @@ class SupervisorStore:
                 "writer_binding_mode": None,
                 "expected_head": None,
                 "current_head": None,
+                "resource_class": rc,
+                "last_resource_decision": None,
+                "last_resource_reason_code": None,
+                "last_resource_snapshot_hash": None,
+                "last_resource_at": None,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -635,6 +650,9 @@ class SupervisorStore:
 
     def enqueue_job(self, job_id: str, **kwargs) -> dict:
         return self._store.enqueue_job(job_id, **kwargs)
+
+    def persist_resource_decision(self, job_id: str, **kwargs) -> dict:
+        return self._store.persist_resource_decision(job_id, **kwargs)
 
     def lease_is_current(
         self, job_id: str, owner_instance_id: str, lease_epoch: int
@@ -1434,6 +1452,10 @@ class Supervisor:
         process_registry: Optional["ProcessRegistry"] = None,
         process_identity_provider: Optional["ProcessIdentityProvider"] = None,
         git_provenance_provider: Optional["GitProvenanceProvider"] = None,
+        # C1: resource governor + host-snapshot provider injection (tests pass
+        # deterministic fakes; defaults are created lazily by the Scheduler).
+        resource_governor=None,
+        snapshot_provider=None,
     ):
         self.core = core
         self.controller_source = controller_source
@@ -1479,6 +1501,10 @@ class Supervisor:
         self._git_provenance_provider = git_provenance_provider or GitProvenanceProvider(
             self._workspace_root
         )
+        # C1: optional resource-governor / snapshot-provider injection (fakes in
+        # tests; real defaults are created by the Scheduler when unset).
+        self._resource_governor = resource_governor
+        self._snapshot_provider = snapshot_provider
 
     # ---------------------------------------------------------------- utils
 

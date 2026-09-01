@@ -43,17 +43,26 @@ Renewal policy (Design-Vorgabe 3):
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from . import job_state
+from .host_snapshot import HostSnapshotProvider
 from .models import LeaseError, LeaseFencedError, NotFound
 from .process_registry import (
     IDENTITY_SAME,
     ProcessIdentityProvider,
     ProcessRegistry,
 )
+from .resource_governor import AdmissionVerdict, ResourceGovernor, ResourceReasonCode
+from .resource_policy import ResourceClass
 from .store import MAX_LEASE_TTL_SECONDS
-from .supervisor import ActionOutcome, ReconcileDecision, Supervisor
+from .supervisor import (
+    ActionOutcome,
+    ReconcileAction,
+    ReconcileDecision,
+    Supervisor,
+)
 from .worktree import (
     V_AMBIGUOUS_WRITER,
     V_BLOCKED_DIVERGED,
@@ -76,6 +85,13 @@ OUTCOME_STEPPED = "stepped"
 OUTCOME_RENEWED = "renewed"
 OUTCOME_RELEASED = "released"
 OUTCOME_FENCED = "fenced"
+OUTCOME_RESOURCE_DEFERRED = "resource_deferred"
+OUTCOME_RESOURCE_DENIED = "resource_denied"
+
+#: Far-future ``next_eligible_at`` delay (seconds) for DENY_LOCAL: prevents an
+#: identical automatic retry without inventing a new primary state.  The job
+#: stays QUEUED but will not be re-claimed until this bounded horizon elapses.
+DENY_LOCAL_RETRY_SECONDS = 24 * 3600
 
 
 @dataclass(frozen=True)
@@ -126,6 +142,8 @@ class Scheduler:
         owner_instance_id: str,
         lease_ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS,
         renew_ttl_seconds: Optional[int] = None,
+        resource_governor: Optional[ResourceGovernor] = None,
+        snapshot_provider: Optional[HostSnapshotProvider] = None,
     ):
         if not isinstance(owner_instance_id, str) or not owner_instance_id.strip():
             raise ValueError("owner_instance_id must be a non-empty string")
@@ -150,6 +168,30 @@ class Scheduler:
         self.owner_instance_id = owner_instance_id
         self._lease_ttl_seconds = lease_ttl_seconds
         self._renew_ttl_seconds = renew_ttl_seconds
+        # C1: resource preflight.  A test/fake governor or snapshot provider may
+        # be injected; otherwise fall back to the supervisor's injected one, then
+        # to the real (read-only) defaults.
+        self._governor = (
+            resource_governor
+            or getattr(supervisor, "_resource_governor", None)
+            or ResourceGovernor()
+        )
+        self._snapshot_provider = (
+            snapshot_provider
+            or getattr(supervisor, "_snapshot_provider", None)
+        )
+        # C1/F1: when neither a test fake nor the supervisor's injected provider
+        # is present, wire the real host provider WITH a trusted store-backed
+        # active-jobs reader so concurrency rules actually see sibling RUNNING
+        # jobs (dual-supervisor protection).  The reader returns None (UNKNOWN)
+        # on a store read error — never an empty set.
+        if self._snapshot_provider is None:
+            self._snapshot_provider = HostSnapshotProvider(
+                active_jobs_reader=self._store_active_jobs_reader(),
+            )
+        # Job currently being preflighted (excluded from the active-jobs view so
+        # a job never concurrency-blocks itself).  Set by ``_resource_preflight``.
+        self._preflight_job_id: Optional[str] = None
 
     # ------------------------------------------------------------------ pass
 
@@ -293,6 +335,149 @@ class Scheduler:
             )
         )
 
+    # -- C1 resource preflight (decision basis only; no enforcement) --------
+
+    def _store_active_jobs_reader(self):
+        """Build the default active-jobs reader from the trusted job store (F1).
+
+        Reads every non-terminal RUNNING job (with its persisted
+        ``resource_class`` — trusted store data, never agent output) and returns
+        ``[(job_id, resource_class), ...]``.  The job currently being preflighted
+        (``self._preflight_job_id``) is excluded so a job never blocks itself.
+        Any store read/parse error returns ``None`` (UNKNOWN, fail-closed) —
+        never an empty list for an unreadable store.
+        """
+        store = self._supervisor.core._store
+
+        def reader():
+            try:
+                rows = store.list_supervisor_jobs()
+            except Exception:
+                return None
+            try:
+                exclude = self._preflight_job_id
+                return [
+                    (row["id"], row.get("resource_class") or ResourceClass.LIGHT.value)
+                    for row in rows
+                    if row.get("terminal") is None
+                    and row.get("primary_state") == job_state.PrimaryState.RUNNING.value
+                    and row["id"] != exclude
+                ]
+            except Exception:
+                return None
+
+        return reader
+
+    def _resource_preflight(self, job_id: str):
+        """Run the C1 admission preflight for a job.
+
+        Captures a bounded host snapshot (injectable provider) and asks the
+        (injectable) governor.  Returns an :class:`AdmissionDecision`.
+        The job's ``resource_class`` comes from the trusted persisted job row —
+        never from agent output.
+        """
+        self._preflight_job_id = job_id
+        try:
+            row = self._supervisor.store._job_row(job_id)
+            rc = (row or {}).get("resource_class") or ResourceClass.LIGHT.value
+            snapshot = self._snapshot_provider.capture(
+                self._supervisor._workspace_root
+            )
+            return self._governor.decide(
+                resource_class=rc,
+                snapshot=snapshot,
+                now_iso=self._supervisor._now_iso(),
+            )
+        finally:
+            self._preflight_job_id = None
+
+    def _resource_gate(self, job_id: str, epoch: int, admission):
+        """Apply a non-ALLOW admission verdict; returns a result or None.
+
+        DEFER/DENY_LOCAL requeue the job (no spawn) and return the terminal
+        pass result; PREFER_EXTERNAL/ALLOW persist nothing blocking and return
+        ``None`` so the caller continues (PREFER_EXTERNAL is a hint only).
+        """
+        if admission.decision == AdmissionVerdict.DEFER.value:
+            self._defer_resource_job(job_id, epoch, admission)
+            self._supervisor.clear_lease_owner()
+            return SchedulerPassResult(
+                OUTCOME_RESOURCE_DEFERRED, job_id=job_id,
+                detail=admission.reason_code,
+            )
+        if admission.decision == AdmissionVerdict.DENY_LOCAL.value:
+            self._deny_resource_job(job_id, epoch, admission)
+            self._supervisor.clear_lease_owner()
+            return SchedulerPassResult(
+                OUTCOME_RESOURCE_DENIED, job_id=job_id,
+                detail=admission.reason_code,
+            )
+        if admission.decision == AdmissionVerdict.PREFER_EXTERNAL.value:
+            # C1 never triggers external CI; persist the routing hint only and
+            # continue as ALLOW (local admission proceeds unchanged).
+            self._persist_resource_hint(job_id, epoch, admission)
+        return None
+
+    def _defer_resource_job(self, job_id: str, epoch: int, decision) -> None:
+        """DEFER: requeue as QUEUED (no spawn) with a bounded retry horizon."""
+        self._supervisor.store.enqueue_job(
+            job_id,
+            queue_reason=job_state.QueueReason.RESOURCE_DEFERRED.value,
+            next_eligible_at=decision.next_eligible_at,
+            error_class=job_state.ErrorClass.RESOURCE.value,
+            error_code=decision.reason_code,
+            owner_instance_id=self.owner_instance_id,
+            lease_epoch=epoch,
+            last_resource_decision=decision.decision,
+            last_resource_reason_code=decision.reason_code,
+            last_resource_snapshot_hash=decision.snapshot_ref,
+            last_resource_at=decision.timestamp,
+        )
+
+    def _deny_resource_job(self, job_id: str, epoch: int, decision) -> None:
+        """DENY_LOCAL: requeue as QUEUED (no spawn) with a far-future horizon."""
+        far = self._supervisor._now_iso()
+        try:
+            dt = datetime.fromisoformat(far)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            far = (dt + timedelta(seconds=DENY_LOCAL_RETRY_SECONDS)).isoformat()
+        except (ValueError, TypeError):
+            far = None
+        self._supervisor.store.enqueue_job(
+            job_id,
+            queue_reason=job_state.QueueReason.RESOURCE_DENIED.value,
+            next_eligible_at=far,
+            error_class=job_state.ErrorClass.RESOURCE.value,
+            error_code=ResourceReasonCode.LOCAL_CAPACITY_INSUFFICIENT.value,
+            owner_instance_id=self.owner_instance_id,
+            lease_epoch=epoch,
+            last_resource_decision=decision.decision,
+            last_resource_reason_code=decision.reason_code,
+            last_resource_snapshot_hash=decision.snapshot_ref,
+            last_resource_at=decision.timestamp,
+        )
+
+    def _persist_resource_hint(self, job_id: str, epoch: int, decision) -> None:
+        """PREFER_EXTERNAL: persist the routing hint only (best-effort audit).
+
+        Uses the transactional holder-CAS store operation (F5) — a stale/foreign
+        holder cannot overwrite another owner's audit columns.  On a fence loss
+        the hint is simply dropped (the local ALLOW path continues unchanged).
+        """
+        try:
+            self._supervisor.store.persist_resource_decision(
+                job_id,
+                owner_instance_id=self.owner_instance_id,
+                lease_epoch=epoch,
+                last_resource_decision=decision.decision,
+                last_resource_reason_code=decision.reason_code,
+                last_resource_snapshot_hash=decision.snapshot_ref,
+                last_resource_at=decision.timestamp,
+            )
+        except (LeaseError, LeaseFencedError):
+            pass
+
     def run_pass(self, job_id: Optional[str] = None) -> SchedulerPassResult:
         """Run one bounded scheduler pass (exactly one safe step, then return).
 
@@ -309,6 +494,17 @@ class Scheduler:
         target_job_id, epoch, held = target
         self._supervisor.set_lease_owner(self.owner_instance_id, epoch)
 
+        # C1: resource preflight runs on every NEW claim (``held=False``), after
+        # the atomic claim and BEFORE reconcile/spawn — the earliest trusted
+        # admission filter (avoids unnecessary dispatches).  A continuation
+        # (``held=True``) is re-checked at the spawn gate below.
+        if not held:
+            gate = self._resource_gate(
+                target_job_id, epoch, self._resource_preflight(target_job_id)
+            )
+            if gate is not None:
+                return gate
+
         try:
             decision = self._supervisor.reconcile(target_job_id)
         except LeaseFencedError as exc:
@@ -321,6 +517,18 @@ class Scheduler:
             return SchedulerPassResult(
                 OUTCOME_NO_WORK, job_id=target_job_id, detail="job_missing",
             )
+
+        # C1/F3: spawn-adjacent preflight is the BINDING admission point.  A
+        # fresh preflight runs immediately before the only spawning action in
+        # this path (SPAWN_RUN), regardless of ``held``, so a later pass cannot
+        # spawn under a since-changed memory/swap/disk state.  DEFER/DENY_LOCAL
+        # requeue without any launcher call; PREFER_EXTERNAL is a hint only.
+        if decision.action == ReconcileAction.SPAWN_RUN:
+            gate = self._resource_gate(
+                target_job_id, epoch, self._resource_preflight(target_job_id)
+            )
+            if gate is not None:
+                return gate
 
         try:
             action_outcome = self._supervisor.perform_next_safe_action_if_required(

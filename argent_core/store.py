@@ -26,6 +26,7 @@ from typing import Callable, Iterator, Optional
 from . import events as events_mod
 from . import job_state
 from .gates import binding_hash
+from .resource_policy import RESOURCE_CLASS_VALUES, ResourceClass
 from .worktree import (
     V_AMBIGUOUS_WRITER,
     V_BLOCKED_DIVERGED,
@@ -68,7 +69,9 @@ from .models import (
 
 # B3 (Phase B): external waits + minimal process registry + minimal
 # worktree/writer binding (additive).
-SCHEMA_VERSION = "8"
+# C1 (Phase C): resource class + bounded last-resource-decision audit columns
+# (additive).  Enforcement (cgroup/systemd-run/prlimit) is Phase C2.
+SCHEMA_VERSION = "9"
 
 _TASK_STATES = "', '".join(s.value for s in TaskState)
 _TASK_RUN_STATUSES = "', '".join(s.value for s in TaskRunStatus)
@@ -99,6 +102,7 @@ _ENUM_FIELDS: dict[str, type] = {
     "queue_reason": job_state.QueueReason,
     "wait_kind": job_state.WaitKind,
     "error_class": job_state.ErrorClass,
+    "resource_class": ResourceClass,
 }
 
 
@@ -413,6 +417,12 @@ _SCHEMA: tuple[str, ...] = (
                               writer_binding_mode IN ('BOUND')),
         expected_head         TEXT,
         current_head          TEXT,
+        resource_class        TEXT NOT NULL DEFAULT 'LIGHT' CHECK (resource_class IN
+                              ('LIGHT','MEDIUM','HEAVY','EXCLUSIVE')),
+        last_resource_decision TEXT,
+        last_resource_reason_code TEXT,
+        last_resource_snapshot_hash TEXT,
+        last_resource_at      TEXT,
         created_at            TEXT NOT NULL,
         updated_at            TEXT NOT NULL,
         CHECK ((terminal IS NULL) OR (status = 'TERMINAL' AND next_action = 'NONE'))
@@ -1001,6 +1011,33 @@ class Store:
              "ALTER TABLE supervisor_jobs ADD COLUMN expected_head TEXT"),
             ("current_head",
              "ALTER TABLE supervisor_jobs ADD COLUMN current_head TEXT"),
+        ):
+            if col not in sjcols:
+                self._conn.execute(ddl)
+
+        # --- C1 (Phase C): resource class + bounded last-resource audit -----
+        # Additive columns only.  ``resource_class`` is backfilled to 'LIGHT' for
+        # pre-existing rows (NOT NULL DEFAULT) and carries the same CHECK
+        # constraint as the fresh CREATE TABLE (SQLite supports CHECK on
+        # ``ADD COLUMN`` here — identical to the B1 ``primary_state`` pattern).
+        # ``last_resource_*`` are pure audit (the persisted decision must NEVER
+        # authorise an automatic admission — every new claim re-runs preflight).
+        sjcols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(supervisor_jobs)")
+        }
+        for col, ddl in (
+            ("resource_class",
+             "ALTER TABLE supervisor_jobs ADD COLUMN resource_class TEXT NOT NULL "
+             "DEFAULT 'LIGHT' CHECK (resource_class IN ('LIGHT','MEDIUM',"
+             "'HEAVY','EXCLUSIVE'))"),
+            ("last_resource_decision",
+             "ALTER TABLE supervisor_jobs ADD COLUMN last_resource_decision TEXT"),
+            ("last_resource_reason_code",
+             "ALTER TABLE supervisor_jobs ADD COLUMN last_resource_reason_code TEXT"),
+            ("last_resource_snapshot_hash",
+             "ALTER TABLE supervisor_jobs ADD COLUMN last_resource_snapshot_hash TEXT"),
+            ("last_resource_at",
+             "ALTER TABLE supervisor_jobs ADD COLUMN last_resource_at TEXT"),
         ):
             if col not in sjcols:
                 self._conn.execute(ddl)
@@ -2175,6 +2212,9 @@ class Store:
             "branch_identity", "writer_dispatch_id",
             "writer_owner_instance_id", "writer_lease_epoch",
             "expected_head", "current_head", "writer_binding_mode",
+            "resource_class", "last_resource_decision",
+            "last_resource_reason_code", "last_resource_snapshot_hash",
+            "last_resource_at",
         }
     )
 
@@ -2243,6 +2283,16 @@ class Store:
                 row[col] = None
         if "writer_lease_epoch" not in row:
             row["writer_lease_epoch"] = 0
+        # C1: resource-class + last-resource audit columns defaulted for older
+        # callers/tests that build a partial job row.
+        if "resource_class" not in row or row["resource_class"] is None:
+            row["resource_class"] = ResourceClass.LIGHT.value
+        for col in (
+            "last_resource_decision", "last_resource_reason_code",
+            "last_resource_snapshot_hash", "last_resource_at",
+        ):
+            if col not in row:
+                row[col] = None
         missing = [c for c in self._SUPERVISOR_JOB_COLUMNS if c not in row]
         if missing:
             raise ValueError(f"missing supervisor_jobs columns: {missing}")
@@ -3213,6 +3263,13 @@ class Store:
         lease_epoch: Optional[int] = None,
         owner_authorized: bool = False,
         policy_ref: Optional[str] = None,
+        # C1: bounded resource metadata (persisted for audit; never authorizes
+        # an automatic admission — a new claim always re-runs preflight).
+        resource_class: Optional[str] = None,
+        last_resource_decision: Optional[str] = None,
+        last_resource_reason_code: Optional[str] = None,
+        last_resource_snapshot_hash: Optional[str] = None,
+        last_resource_at: Optional[str] = None,
     ) -> dict:
         """(Re-)enqueue a job as ``QUEUED`` with queue/retry metadata (F2).
 
@@ -3260,6 +3317,16 @@ class Store:
                 "owner_instance_id": None,
                 "lease_expires_at": None,
             }
+            if resource_class is not None:
+                common_fields["resource_class"] = resource_class
+            for key, val in (
+                ("last_resource_decision", last_resource_decision),
+                ("last_resource_reason_code", last_resource_reason_code),
+                ("last_resource_snapshot_hash", last_resource_snapshot_hash),
+                ("last_resource_at", last_resource_at),
+            ):
+                if val is not None:
+                    common_fields[key] = val
             if owner_authorized:
                 # (c) authorized BLOCKED→QUEUED requeue (F4: EXACT CAS).
                 if policy_ref is None or not isinstance(policy_ref, str) \
@@ -3340,6 +3407,62 @@ class Store:
                 bump_facts_version=True,
                 now_iso=now_iso,
             )
+
+    def persist_resource_decision(
+        self,
+        job_id: str,
+        *,
+        owner_instance_id: str,
+        lease_epoch: int,
+        last_resource_decision: str,
+        last_resource_reason_code: str,
+        last_resource_snapshot_hash: Optional[str],
+        last_resource_at: Optional[str],
+    ) -> dict:
+        """Atomically persist the bounded ``last_resource_*`` audit columns (C1/F5).
+
+        Holder-CAS: only the current, unexpired ``(owner_instance_id,
+        lease_epoch)`` holder of a RUNNING job may write these audit columns.
+        A stale/foreign/expired holder raises :class:`LeaseFencedError`; a
+        terminal or non-RUNNING job raises :class:`LeaseError` (never written).
+        The persisted decision is audit-only and NEVER authorises admission.
+        """
+        self._validate_lease_owner(owner_instance_id)
+        now_iso = self.now_iso()
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            job = dict(row)
+            if job.get("terminal") is not None:
+                raise LeaseError(
+                    f"terminal job {job_id!r} cannot record a resource decision"
+                )
+            if job["primary_state"] != job_state.PrimaryState.RUNNING.value:
+                raise LeaseError(
+                    f"job {job_id!r} is {job['primary_state']!r}; resource "
+                    f"decision requires RUNNING"
+                )
+            if job["owner_instance_id"] != owner_instance_id:
+                raise LeaseFencedError(
+                    f"resource-decision owner mismatch for job {job_id!r}"
+                )
+            if job["lease_epoch"] != lease_epoch:
+                raise LeaseFencedError(
+                    f"resource-decision epoch mismatch for job {job_id!r}"
+                )
+            if job["lease_expires_at"] is None or job["lease_expires_at"] <= now_iso:
+                raise LeaseFencedError(f"lease expired for job {job_id!r}")
+            self._conn.execute(
+                "UPDATE supervisor_jobs SET last_resource_decision = ?, "
+                "last_resource_reason_code = ?, last_resource_snapshot_hash = ?, "
+                "last_resource_at = ?, updated_at = ? WHERE id = ?",
+                (last_resource_decision, last_resource_reason_code,
+                 last_resource_snapshot_hash, last_resource_at, now_iso, job_id),
+            )
+            return self.get_supervisor_job(job_id)
 
     # -- B3 external waits (atomic transition + bounded requeue) -----------
     #

@@ -48,6 +48,10 @@ class QueueReason(str, Enum):
     WAIT_DEADLINE = "WAIT_DEADLINE"
     GATE_APPROVED = "GATE_APPROVED"
     RECOVERY = "RECOVERY"
+    # C1: resource-governor deferrals/denials (not new primary states — the
+    # job stays QUEUED; these are just queue_reason values).
+    RESOURCE_DEFERRED = "RESOURCE_DEFERRED"
+    RESOURCE_DENIED = "RESOURCE_DENIED"
 
 
 class ErrorClass(str, Enum):
