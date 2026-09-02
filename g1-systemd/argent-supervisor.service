@@ -1,0 +1,65 @@
+# Argent Phase G1 — systemd USER service template (SPEC G1 §K/§L/§S).
+#
+#   SERVICE CREATED/VALIDATED  !=  SERVICE ACTIVATED
+#
+# This file is versioned and statically validated by G1, but it is NEVER
+# enabled, started or activated by G1 (no daemon-reload for activation, no
+# linger, no WSL/Windows startup).  Activation is an explicit owner action in
+# Phase G2 — see docs/PHASE_G1_NOTES.md for the exact commands and required
+# protected locations.
+#
+# NO SECRETS live in this file.  The Phase-F evidence MAC key is referenced
+# indirectly through an OPTIONAL EnvironmentFile (the `-` prefix) that the
+# owner provisions outside any agent write area.  The key itself is never
+# committed, never embedded here, and never readable by the writer/agent.
+#
+# The supervisor opens NO public network listener (loopback-only by
+# construction: outbound notifications only).  Nothing is bound here.
+
+[Unit]
+Description=Argent background supervisor (single-active, durable queue)
+Documentation=file:%h/argent/docs/PHASE_G1_NOTES.md
+After=network-online.target
+Wants=network-online.target
+# Bounded restart policy (no endless crash loops, SPEC G1 §L): retry on failure
+# with backoff, then stop.  A persistent init/policy corruption is therefore
+# VISIBLE as a failed/inactive unit after StartLimitBurst, never a hidden
+# aggressive respawn.
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+# Operator: set this to the checkout directory that contains argent_core/.
+# `python -m argent_core.argent_service` resolves argent_core from the working
+# directory, so the package must be importable from here.
+WorkingDirectory=%h/argent
+ExecStart=/usr/bin/python3 -m argent_core.argent_service
+
+# Optional operator secrets (evidence MAC key path).  `-` = optional file, so a
+# missing file is NOT a unit error.  The owner writes e.g.:
+#   ARGENT_EVIDENCE_MAC_KEY_FILE=%h/.config/argent/evidence-mac.key
+EnvironmentFile=-%h/.config/argent/service.env
+
+# Durable state/cache locations — the canonical XDG base directories, never
+# /tmp (Phase-B tmpfs-ENOSPC rule).  systemd maps these to the same paths the
+# entrypoint resolves by default:
+#   StateDirectory -> $STATE_DIRECTORY  (~/.local/state/argent)
+#   CacheDirectory -> $CACHE_DIRECTORY  (~/.cache/argent)
+StateDirectory=argent
+CacheDirectory=argent
+
+# Graceful shutdown: SIGTERM -> bounded STOPPING (SPEC G1 §G).  The entrypoint
+# drains the current bounded pass, releases only safe ownerships, and exits 0.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Bounded restart policy (no endless crash loops, SPEC G1 §L).
+Restart=on-failure
+RestartSec=5
+
+# Hardening (user service, never root): drop privilege escalation.
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

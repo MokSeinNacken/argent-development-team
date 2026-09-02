@@ -167,6 +167,9 @@ class Scheduler:
         scope_backend=None,
         # C3: bounded recovery policy (bounded retry only, never escalation).
         recovery_policy=None,
+        # G1 (F6): optional stop-predicate checked immediately before expensive
+        # spawn/test actions so a SIGTERM mid-pass aborts the pass (no spawn).
+        stop_check=None,
     ):
         if not isinstance(owner_instance_id, str) or not owner_instance_id.strip():
             raise ValueError("owner_instance_id must be a non-empty string")
@@ -236,6 +239,18 @@ class Scheduler:
             )
         # C3: bounded recovery policy (injectable for tests).
         self._recovery_policy = recovery_policy or RecoveryPolicy()
+        # G1 (F6): stop-predicate for mid-pass shutdown abort.
+        self._stop_check = stop_check
+
+    # -- G1 (F6): mid-pass shutdown gate -----------------------------------
+
+    def set_stop_check(self, stop_check) -> None:
+        """Wire a stop-predicate (e.g. the runtime's ``stop_event.is_set``)."""
+        self._stop_check = stop_check
+
+    def _stop_requested(self) -> bool:
+        """True when a shutdown has been requested (abort before spawn)."""
+        return bool(self._stop_check is not None and self._stop_check())
 
     # ------------------------------------------------------------------ pass
 
@@ -256,10 +271,19 @@ class Scheduler:
                 owner_instance_id=self.owner_instance_id,
                 ttl_seconds=self._lease_ttl_seconds,
             )
-            if claimed is None:
-                return None
-            return (claimed["id"], claimed["lease_epoch"], False)
+            if claimed is not None:
+                return (claimed["id"], claimed["lease_epoch"], False)
+            # G1 (F1): the background loop must ALSO steer continuation-capable
+            # own RUNNING jobs and evidence-bound expired-lease recovery — not
+            # only fresh QUEUED claims (otherwise a multi-step job stalls at
+            # RUNNING forever in background operation).
+            return self._resolve_loop_continuation()
 
+        return self._resolve_explicit_target(job_id)
+
+    def _resolve_explicit_target(
+        self, job_id: str
+    ) -> Optional[Tuple[str, int, bool]]:
         row = self._supervisor.store._job_row(job_id)
         if row is None:
             return None
@@ -295,6 +319,41 @@ class Scheduler:
         except LeaseError:
             return None
         return (claimed["id"], claimed["lease_epoch"], False)
+
+    def _resolve_loop_continuation(
+        self,
+    ) -> Optional[Tuple[str, int, bool]]:
+        """G1 (F1): pick a continuation/recovery target for the background loop.
+
+        After ``claim_next_job`` returns no QUEUED work, scan the nonterminal
+        RUNNING jobs: continue our own still-leased job (with no future
+        eligibility block), or evidence-bound takeover of an expired-lease
+        RUNNING job.  Exactly one target is stepped per pass; a job we cannot
+        safely touch is skipped (never a blind claim / duplicate spawn).
+        """
+        now_iso = self._supervisor._now_iso()
+        try:
+            rows = self._supervisor.core._store.list_supervisor_jobs(
+                nonterminal_only=True)
+        except Exception:  # noqa: BLE001 - store read error -> no work this pass
+            return None
+        for row in rows:
+            jid = row["id"]
+            if row.get("primary_state") != job_state.PrimaryState.RUNNING.value:
+                continue
+            if row.get("owner_instance_id") == self.owner_instance_id and \
+                    self._supervisor.store.lease_is_current(
+                        jid, self.owner_instance_id, row["lease_epoch"]):
+                eligible = row.get("next_eligible_at")
+                if eligible is None or eligible <= now_iso:
+                    return (jid, row["lease_epoch"], True)
+                continue
+            expires = row.get("lease_expires_at")
+            if expires is not None and expires <= now_iso:
+                taken = self._try_recover_takeover(jid, row)
+                if taken is not None:
+                    return (jid, taken["lease_epoch"], False)
+        return None
 
     def _worktree_recovery_verdict(self, job_id: str) -> Optional[str]:
         """Worktree recovery verdict for a RUNNING job (F1/F3).
@@ -675,6 +734,14 @@ class Scheduler:
         # launcher call; PREFER_EXTERNAL is a hint only.
         if decision.action in (ReconcileAction.SPAWN_RUN,
                                ReconcileAction.RUN_SANDBOX_TESTS):
+            # G1 (F6): a shutdown requested mid-pass aborts BEFORE any spawn or
+            # test launch — the launcher/enforcer is never invoked and the job
+            # stays RUNNING under a valid lease (consistent, re-claimable).
+            if self._stop_requested():
+                self._supervisor.clear_lease_owner()
+                return SchedulerPassResult(
+                    OUTCOME_NO_WORK, job_id=target_job_id, detail="stop_requested",
+                )
             gate = self._resource_gate(
                 target_job_id, epoch, self._resource_preflight(target_job_id)
             )

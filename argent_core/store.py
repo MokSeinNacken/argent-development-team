@@ -91,7 +91,14 @@ from .handoff import HANDOFF_VERSION as HANDOFF_RECORD_VERSION
 # metadata on agent_dispatches (additive).
 # E2 fix-round (F2/F4): provenance marker (source_class) on findings/test_runs/
 # reviews + attempt_outcome on agent_dispatches (additive).
-SCHEMA_VERSION = "16"
+# G1 (Phase G1): single-active-supervisor instance coordination
+# (supervisor_instances, additive).  The canonical (boot_id, pid,
+# process_start_ticks) identity is the authoritative liveness signal; the
+# persisted instance row is recovery evidence, never a PID-only authority.
+# G1 fix-round (F2): a monotonic ``revision`` INTEGER column is the CAS fence
+# for the singleton instance row (``updated_at`` alone is ABA-prone under a
+# frozen clock); it is atomically incremented on every write.
+SCHEMA_VERSION = "18"
 
 # D2 (Phase D): bounded JSON column budget enforced at the persistence gate.
 # Each handoff/checkpoint JSON column (result/artifacts/evidence/next-step/
@@ -795,6 +802,33 @@ _SCHEMA: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS idx_notification_outbox_job
         ON notification_outbox(supervisor_job_id, created_at)
     """,
+    # G1 (Phase G1): single-active-supervisor instance coordination
+    # (SPEC G1 §C/§D/§G).  Exactly ONE active supervisor instance per durable
+    # state store.  The authoritative liveness signal is the (boot_id, pid,
+    # process_start_ticks) tuple; ``instance_id`` is a stable per-process
+    # identifier used to fence heartbeats/releases (a stale instance that has
+    # been taken over can never write again).  No secrets live here.
+    """
+    CREATE TABLE IF NOT EXISTS supervisor_instances (
+        singleton_id        TEXT PRIMARY KEY CHECK (singleton_id = 'primary'),
+        instance_id         TEXT NOT NULL,
+        boot_id             TEXT,
+        host_id             TEXT,
+        pid                 INTEGER CHECK (pid IS NULL OR pid > 0),
+        process_start_ticks INTEGER,
+        status              TEXT NOT NULL DEFAULT 'ACTIVE'
+                            CHECK (status IN ('ACTIVE','RELEASED')),
+        acquired_at         TEXT NOT NULL,
+        lease_expires_at    TEXT,
+        last_heartbeat_at   TEXT,
+        stopped_at          TEXT,
+        stop_reason         TEXT,
+        last_error_code     TEXT,
+        updated_at          TEXT NOT NULL,
+        revision            INTEGER NOT NULL DEFAULT 0
+                            CHECK (revision >= 0)
+    )
+    """,
     # V6 (SPEC V3C §8.1): owner-approval challenges + Telegram inbound dedup
     # and offset cursor.  Transport-neutral persistence only: the raw challenge
     # token is NEVER stored (only its sha256 token_hash) and the real
@@ -1358,6 +1392,21 @@ class Store:
         ):
             if col not in sjcols:
                 self._conn.execute(ddl)
+
+        # --- G1 (Phase G1): monotonic revision on supervisor_instances -----
+        # F2: ``revision`` is the CAS fence (monotonic INTEGER, atomically
+        # incremented on every write).  An existing pre-revision table gains it
+        # idempotently with DEFAULT 0 (a fresh CREATE TABLE already carries it).
+        sicols = {
+            r[1] for r in self._conn.execute(
+                "PRAGMA table_info(supervisor_instances)")}
+        if "revision" not in sicols:
+            self._conn.execute(
+                "ALTER TABLE supervisor_instances ADD COLUMN revision "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)")
+        if "host_id" not in sicols:
+            self._conn.execute(
+                "ALTER TABLE supervisor_instances ADD COLUMN host_id TEXT")
 
         # --- D2 (Phase D): record_version on checkpoints + handoffs_v2 -------
         # Additive; a schema-12 DB that already has these tables (without the
@@ -2897,6 +2946,86 @@ class Store:
         q += " ORDER BY rowid"
         rows = self._conn.execute(q).fetchall()
         return [dict(r) for r in rows]
+
+    # -- G1 (Phase G1): single-active-supervisor instance coordination ------
+    # The authoritative liveness decision is made in ``background_runtime``
+    # (which reads live /proc identity); these primitives only provide the
+    # atomic compare-and-swap on the persisted singleton row so two processes
+    # can never both believe they own the store.
+
+    def get_supervisor_instance(self) -> Optional[dict]:
+        """Read the persisted singleton instance row (or ``None``)."""
+        row = self._conn.execute(
+            "SELECT * FROM supervisor_instances WHERE singleton_id = 'primary'"
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def cas_supervisor_instance(
+        self, *, row: dict, expected_revision: Optional[int]
+    ) -> bool:
+        """Atomically insert-or-replace the singleton instance row iff the
+        current row's monotonic ``revision`` equals ``expected_revision``
+        (``None`` means "no row exists").  On success the revision is atomically
+        incremented.  Returns ``True`` on a successful compare-and-swap,
+        ``False`` when the row changed concurrently (a losing caller must
+        re-read and re-decide — no split-brain, no ABA even under a frozen
+        clock, because the fence token is a monotonically-increasing integer,
+        never ``updated_at``).
+        """
+        with self._transaction():
+            cur = self._conn.execute(
+                "SELECT revision FROM supervisor_instances "
+                "WHERE singleton_id = 'primary'"
+            ).fetchone()
+            cur_rev = cur["revision"] if cur is not None else None
+            if cur_rev != expected_revision:
+                return False
+            new_rev = (cur_rev or 0) + 1
+            row = dict(row)
+            row["revision"] = new_rev
+            cols = sorted(row.keys())
+            ph = ", ".join("?" for _ in cols)
+            assignments = ", ".join(f"{c}=excluded.{c}" for c in cols)
+            self._conn.execute(
+                f"INSERT INTO supervisor_instances ({', '.join(cols)}) "
+                f"VALUES ({ph}) ON CONFLICT(singleton_id) DO UPDATE SET "
+                f"{assignments}",
+                tuple(row[c] for c in cols),
+            )
+            return True
+
+    def update_supervisor_instance(
+        self, *, expected_instance_id: str, fields: dict
+    ) -> bool:
+        """Atomically update the singleton instance row iff ``instance_id``
+        matches (fences heartbeats/releases from a since-replaced instance).
+        The monotonic ``revision`` is atomically incremented on every write.
+        Returns ``True`` on success, ``False`` when the current instance_id no
+        longer matches (we were taken over — fail-closed, no further writes).
+        """
+        if not fields:
+            return True
+        # F2: the caller can never set ``revision`` directly — the store owns
+        # the monotonic increment (a caller-supplied revision would reintroduce
+        # the ABA hazard).
+        fields = {k: v for k, v in fields.items() if k != "revision"}
+        with self._transaction():
+            cur = self._conn.execute(
+                "SELECT instance_id FROM supervisor_instances "
+                "WHERE singleton_id = 'primary'"
+            ).fetchone()
+            if cur is None or cur["instance_id"] != expected_instance_id:
+                return False
+            if not fields:
+                return True
+            assignments = ", ".join(f"{c} = ?" for c in fields)
+            self._conn.execute(
+                f"UPDATE supervisor_instances SET {assignments}, "
+                "revision = revision + 1 "
+                "WHERE singleton_id = 'primary'",
+                list(fields.values()),
+            )
+            return True
 
     def _insert_supervisor_job(self, row: dict) -> None:
         row = dict(row)

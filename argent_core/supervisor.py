@@ -39,7 +39,7 @@ from .core import ReceiveResult
 from .notifications import NotificationStatus, NotificationType
 from .resource_policy import RESOURCE_CLASS_VALUES, ResourceClass
 from .resource_governor import AdmissionVerdict, ResourceReasonCode
-from .execution_scope import SystemdRunScopeBackend
+from .execution_scope import SystemdRunScopeBackend, agent_spawn_env
 from .scope_enforcer import ExecutionEnforcer
 from .models import (
     AgentDispatch,
@@ -1401,6 +1401,9 @@ class OpenClawRunLauncher:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
+            # G1 (F4): a minimal allowlisted environment — never inherit the
+            # supervisor's evidence-MAC key / key-file path.
+            env=agent_spawn_env(),
         )
         # B3: the trusted spawn path returns the child PID so the supervisor
         # can register process evidence (boot_id + pid + start_ticks).  A

@@ -55,6 +55,43 @@ from typing import Mapping, Optional, Sequence
 from .resource_policy import ResourceClass, ResourcePolicy
 
 # ---------------------------------------------------------------------------
+# Agent-spawn environment allowlist (G1 F4)
+# ---------------------------------------------------------------------------
+
+#: A fixed allowlist of environment variable NAMES that a spawned agent/command
+#: may inherit.  Everything else — crucially ``ARGENT_EVIDENCE_MAC_KEY``,
+#: ``ARGENT_EVIDENCE_MAC_KEY_FILE`` and any evidence-key-file path — is
+#: STRIPPED so a child process can never see the supervisor's secrets.
+#: ``XDG_RUNTIME_DIR``/``DBUS_SESSION_BUS_ADDRESS`` are retained for
+#: ``systemd-run --user`` (scope creation); they carry no secrets.
+_AGENT_ENV_ALLOWLIST: frozenset[str] = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL",
+    "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_NUMERIC", "LC_TIME",
+    "TZ", "TERM", "NO_COLOR", "FORCE_COLOR", "CLICOLOR",
+    "PYTHONIOENCODING", "PYTHONUTF8", "PYTHONUNBUFFERED",
+    "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+    "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
+})
+
+
+def agent_spawn_env(extra: Optional[Mapping[str, str]] = None) -> dict:
+    """Build a minimal, allowlisted environment for a spawned agent/command.
+
+    Copies only ``_AGENT_ENV_ALLOWLIST`` names from ``os.environ`` so secrets
+    (``ARGENT_EVIDENCE_*`` and the key-file path) can never leak to a child.
+    ``extra`` (if any) is merged LAST; any ``ARGENT_EVIDENCE_*`` key in it is
+    refused (fail-closed).
+    """
+    env = {k: v for k, v in os.environ.items() if k in _AGENT_ENV_ALLOWLIST}
+    if extra:
+        for k, v in extra.items():
+            if k.startswith("ARGENT_EVIDENCE_"):
+                raise ValueError(f"refusing to inject {k!r} into agent env")
+            env[k] = v
+    return env
+
+
+# ---------------------------------------------------------------------------
 # Scope naming (locally generated, strictly validated)
 # ---------------------------------------------------------------------------
 
@@ -583,6 +620,7 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
+                env=agent_spawn_env(),
             )
         except (OSError, ValueError) as exc:
             raise ScopeCreateError(f"systemd-run failed to start: {exc}") from exc
@@ -684,6 +722,7 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
+                env=agent_spawn_env(),
             )
         except (OSError, ValueError) as exc:
             raise ScopeCreateError(f"agent start failed: {exc}") from exc
@@ -711,6 +750,7 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 close_fds=True,
+                env=agent_spawn_env(),
             )
         except (OSError, ValueError) as exc:
             raise ScopeCreateError(f"command start failed: {exc}") from exc

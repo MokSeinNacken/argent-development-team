@@ -80,11 +80,20 @@ class ProcessIdentityProvider:
         proc_root: str = "/proc",
         boot_id_reader: Optional[callable] = None,
         stat_reader: Optional[callable] = None,
+        # G1 (F3): host identity for single-active ownership on a SHARED store.
+        # ``machine_id`` is the stable per-host D-Bus machine id
+        # (``/etc/machine-id``); it distinguishes "same host rebooted" (safe
+        # takeover) from "different host on a shared FS/network" (never a
+        # blind takeover).  Injectable for deterministic tests.
+        machine_id_path: str = "/etc/machine-id",
+        machine_id_reader: Optional[callable] = None,
     ):
         self._boot_id_path = boot_id_path
         self._proc_root = proc_root
         self._boot_id_reader = boot_id_reader
         self._stat_reader = stat_reader
+        self._machine_id_path = machine_id_path
+        self._machine_id_reader = machine_id_reader
 
     def boot_id(self) -> Optional[str]:
         if self._boot_id_reader is not None:
@@ -92,6 +101,25 @@ class ProcessIdentityProvider:
         else:
             try:
                 with open(self._boot_id_path, "r", encoding="utf-8") as fh:
+                    value = fh.read()
+            except OSError:
+                return None
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return value.strip()
+
+    def machine_id(self) -> Optional[str]:
+        """The stable per-host machine id (``/etc/machine-id``) or ``None``.
+
+        G1 (F3): the host-identity signal used to fence single-active ownership
+        on a shared store.  Unreadable -> ``None`` (fail-closed: a foreign boot
+        can never be assumed dead without provable same-host identity).
+        """
+        if self._machine_id_reader is not None:
+            value = self._machine_id_reader()
+        else:
+            try:
+                with open(self._machine_id_path, "r", encoding="utf-8") as fh:
                     value = fh.read()
             except OSError:
                 return None
