@@ -1,0 +1,119 @@
+{
+  "policy_version": "1",
+  "risk_raising_changes": {
+    "SCHEMA_MIGRATION": "CRITICAL",
+    "LEASE_FENCING_SCHEDULER": "HIGH",
+    "SECURITY_TRUST_BOUNDARY": "HIGH",
+    "WRITE_BROKER_EXECUTION_BOUNDARY": "HIGH",
+    "CRASH_RECOVERY": "HIGH",
+    "PROCESS_OWNERSHIP": "HIGH",
+    "RESOURCE_ENFORCEMENT": "HIGH",
+    "CONTEXT_INTEGRITY": "MEDIUM",
+    "MODEL_ROUTING_INDEPENDENCE": "HIGH",
+    "TERMINAL_STATE_TRANSITION": "HIGH",
+    "TEST_INFRASTRUCTURE": "HIGH"
+  },
+  "subsystem_risk_tags": {
+    "CORE": [],
+    "SUPERVISOR": ["LEASE_FENCING_SCHEDULER", "CRASH_RECOVERY", "PROCESS_OWNERSHIP"],
+    "RESOURCE": ["RESOURCE_ENFORCEMENT"],
+    "CONTEXT": ["CONTEXT_INTEGRITY"],
+    "MODEL_ROUTING": ["MODEL_ROUTING_INDEPENDENCE"],
+    "SECURITY": ["SECURITY_TRUST_BOUNDARY"],
+    "PERSISTENCE": ["SCHEMA_MIGRATION"],
+    "TEST_INFRA": ["TEST_INFRASTRUCTURE"],
+    "DOCUMENTATION": []
+  },
+  "module_tag_overrides": {
+    "state_machine.py": ["TERMINAL_STATE_TRANSITION"],
+    "workspace_broker.py": ["WRITE_BROKER_EXECUTION_BOUNDARY"],
+    "sandbox_runner.py": ["WRITE_BROKER_EXECUTION_BOUNDARY"],
+    "scheduler.py": ["LEASE_FENCING_SCHEDULER", "CRASH_RECOVERY"],
+    "job_state.py": ["TERMINAL_STATE_TRANSITION"],
+    "store.py": ["SCHEMA_MIGRATION"],
+    "checkpoint.py": ["LEASE_FENCING_SCHEDULER", "CRASH_RECOVERY"]
+  },
+  "hard_invariants": {
+    "PERSISTENCE": {
+      "required_regression": ["tests/test_persistence.py", "tests/test_phase_b4_migration.py", "tests/test_phase_b*.py"],
+      "full_suite": true
+    },
+    "SECURITY": {
+      "required_regression": [
+        "tests/test_trust.py",
+        "tests/test_roles.py",
+        "tests/test_security_hardening.py",
+        "tests/test_sandbox_runner.py",
+        "tests/test_workspace_broker.py",
+        "tests/test_phase_b4_security.py",
+        "tests/test_phase_c2_security.py",
+        "tests/test_phase_e1_security.py"
+      ],
+      "full_suite": true
+    },
+    "SUPERVISOR": {
+      "required_regression": ["tests/test_phase2c_supervisor.py", "tests/test_phase_b*.py"],
+      "full_suite": true
+    },
+    "RESOURCE": {
+      "required_regression": ["tests/test_phase_c*.py"],
+      "full_suite": false
+    },
+    "MODEL_ROUTING": {
+      "required_regression": ["tests/test_phase_e*.py", "tests/test_phase2a_routing.py"],
+      "full_suite": false
+    },
+    "CONTEXT": {
+      "required_regression": ["tests/test_phase_d*.py", "tests/test_context_snapshot.py"],
+      "full_suite": false
+    }
+  },
+  "module_hard_invariants": {
+    "checkpoint.py": {
+      "required_regression": ["tests/test_phase_b*.py", "tests/test_phase_d2_checkpoint.py"],
+      "full_suite": true
+    }
+  },
+  "full_suite_required_when": [
+    "phase_closing",
+    "risk_CRITICAL",
+    "risk_HIGH",
+    "test_infrastructure_change",
+    "schema_migration",
+    "multiple_subsystems",
+    "test_plan_uncertainty",
+    "planner_metadata_uncertainty",
+    "security_reviewed_patch"
+  ],
+  "unknown_handling": {
+    "policy": "BROADEN",
+    "required_regression": [
+      "tests/test_phase_b*.py",
+      "tests/test_phase_c*.py",
+      "tests/test_phase_d*.py",
+      "tests/test_phase_e*.py",
+      "tests/test_trust.py",
+      "tests/test_roles.py",
+      "tests/test_security_hardening.py",
+      "tests/test_sandbox_runner.py",
+      "tests/test_workspace_broker.py"
+    ],
+    "full_suite": true
+  },
+  "test_infra_handling": {
+    "policy": "BROAD_CLOSING",
+    "required_regression": [
+      "tests/test_phase_b*.py",
+      "tests/test_phase_c*.py",
+      "tests/test_phase_d*.py",
+      "tests/test_phase_e*.py",
+      "tests/test_trust.py",
+      "tests/test_roles.py",
+      "tests/test_security_hardening.py",
+      "tests/test_sandbox_runner.py",
+      "tests/test_workspace_broker.py"
+    ],
+    "full_suite": true
+  },
+  "stage_order": ["targeted", "module", "phase_regression", "full_suite"]
+}

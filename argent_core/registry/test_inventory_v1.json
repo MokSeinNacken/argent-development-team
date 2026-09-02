@@ -1,0 +1,228 @@
+{
+  "inventory_version": "1",
+  "module_ownership": {
+    "argent_core/__init__.py": "CORE",
+    "argent_core/core.py": "CORE",
+    "argent_core/models.py": "CORE",
+    "argent_core/state_machine.py": "CORE",
+    "argent_core/gates.py": "CORE",
+    "argent_core/events.py": "CORE",
+    "argent_core/outputs.py": "CORE",
+    "argent_core/workflow.py": "CORE",
+    "argent_core/notifications.py": "CORE",
+    "argent_core/visualizer_snapshot.py": "CORE",
+    "argent_core/supervisor.py": "SUPERVISOR",
+    "argent_core/scheduler.py": "SUPERVISOR",
+    "argent_core/job_state.py": "SUPERVISOR",
+    "argent_core/recovery.py": "SUPERVISOR",
+    "argent_core/external_wait.py": "SUPERVISOR",
+    "argent_core/process_registry.py": "SUPERVISOR",
+    "argent_core/worktree.py": "SUPERVISOR",
+    "argent_core/resource_policy.py": "RESOURCE",
+    "argent_core/host_snapshot.py": "RESOURCE",
+    "argent_core/resource_governor.py": "RESOURCE",
+    "argent_core/execution_scope.py": "RESOURCE",
+    "argent_core/scope_enforcer.py": "RESOURCE",
+    "argent_core/resource_failure.py": "RESOURCE",
+    "argent_core/resource_recovery.py": "RESOURCE",
+    "argent_core/context.py": "CONTEXT",
+    "argent_core/context_pack.py": "CONTEXT",
+    "argent_core/handoff.py": "CONTEXT",
+    "argent_core/retrieval.py": "CONTEXT",
+    "argent_core/checkpoint.py": "CONTEXT",
+    "argent_core/artifact_refs.py": "CONTEXT",
+    "argent_core/context_handoff_integration.py": "CONTEXT",
+    "argent_core/model_registry.py": "MODEL_ROUTING",
+    "argent_core/model_router.py": "MODEL_ROUTING",
+    "argent_core/evidence_registry.py": "MODEL_ROUTING",
+    "argent_core/routing.py": "MODEL_ROUTING",
+    "argent_core/trust.py": "SECURITY",
+    "argent_core/roles.py": "SECURITY",
+    "argent_core/workspace_broker.py": "SECURITY",
+    "argent_core/sandbox_runner.py": "SECURITY",
+    "argent_core/approval_core.py": "SECURITY",
+    "argent_core/approval_processor.py": "SECURITY",
+    "argent_core/telegram_approval_adapter.py": "SECURITY",
+    "argent_core/store.py": "PERSISTENCE",
+    "argent_core/registry/routing_policy_v1.json": "MODEL_ROUTING",
+    "argent_core/registry/models.json": "MODEL_ROUTING",
+    "argent_core/registry/providers.json": "MODEL_ROUTING",
+    "argent_core/registry/benchmarks_v1.json": "MODEL_ROUTING",
+    "argent_core/registry/test_inventory_v1.json": "TEST_INFRA",
+    "argent_core/registry/test_policy_v1.json": "TEST_INFRA",
+    "argent_core/test_inventory.py": "TEST_INFRA",
+    "argent_core/change_impact.py": "TEST_INFRA",
+    "argent_core/test_planning.py": "TEST_INFRA",
+    "e2e-fixture/parser.py": "TEST_INFRA",
+    "e2e-fixture/service.py": "TEST_INFRA"
+  },
+  "subsystem_tests": {
+    "CORE": {
+      "phase": null,
+      "module_selectors": [
+        "tests/test_phase2a*.py",
+        "tests/test_phase2b*.py",
+        "tests/test_phase2c*.py",
+        "tests/test_phase3a*.py",
+        "tests/test_phase3c*.py",
+        "tests/test_phase3cb1*.py",
+        "tests/test_phase3d*.py",
+        "tests/test_state_machine.py",
+        "tests/test_events.py",
+        "tests/test_gates.py",
+        "tests/test_idempotency.py",
+        "tests/test_context_snapshot.py",
+        "tests/test_v12_regressions.py",
+        "tests/test_v13_regressions.py"
+      ],
+      "phase_selectors": [
+        "tests/test_phase2a*.py",
+        "tests/test_phase2b*.py",
+        "tests/test_phase2c*.py",
+        "tests/test_phase3a*.py",
+        "tests/test_phase3c*.py",
+        "tests/test_phase3cb1*.py",
+        "tests/test_phase3d*.py",
+        "tests/test_state_machine.py",
+        "tests/test_events.py",
+        "tests/test_gates.py",
+        "tests/test_idempotency.py",
+        "tests/test_context_snapshot.py",
+        "tests/test_v12_regressions.py",
+        "tests/test_v13_regressions.py"
+      ]
+    },
+    "SUPERVISOR": {
+      "phase": "B",
+      "module_selectors": [
+        "tests/test_phase_b1*.py",
+        "tests/test_phase_b2*.py",
+        "tests/test_phase_b3*.py",
+        "tests/test_phase_b4*.py"
+      ],
+      "phase_selectors": ["tests/test_phase_b*.py"]
+    },
+    "RESOURCE": {
+      "phase": "C",
+      "module_selectors": [
+        "tests/test_phase_c1*.py",
+        "tests/test_phase_c2*.py",
+        "tests/test_phase_c3*.py"
+      ],
+      "phase_selectors": ["tests/test_phase_c*.py"]
+    },
+    "CONTEXT": {
+      "phase": "D",
+      "module_selectors": [
+        "tests/test_phase_d1*.py",
+        "tests/test_phase_d2*.py",
+        "tests/test_phase_d3*.py"
+      ],
+      "phase_selectors": ["tests/test_phase_d*.py"]
+    },
+    "MODEL_ROUTING": {
+      "phase": "E",
+      "module_selectors": [
+        "tests/test_phase_e1*.py",
+        "tests/test_phase_e2*.py",
+        "tests/test_phase_e3*.py"
+      ],
+      "phase_selectors": ["tests/test_phase_e*.py"]
+    },
+    "SECURITY": {
+      "phase": null,
+      "module_selectors": [
+        "tests/test_trust.py",
+        "tests/test_roles.py",
+        "tests/test_security_hardening.py",
+        "tests/test_sandbox_runner.py",
+        "tests/test_workspace_broker.py",
+        "tests/test_phase_b4_security.py",
+        "tests/test_phase_c2_security.py",
+        "tests/test_phase_e1_security.py"
+      ],
+      "phase_selectors": [
+        "tests/test_trust.py",
+        "tests/test_roles.py",
+        "tests/test_security_hardening.py",
+        "tests/test_sandbox_runner.py",
+        "tests/test_workspace_broker.py",
+        "tests/test_phase_b4_security.py",
+        "tests/test_phase_c2_security.py",
+        "tests/test_phase_e1_security.py"
+      ]
+    },
+    "PERSISTENCE": {
+      "phase": null,
+      "module_selectors": [
+        "tests/test_persistence.py",
+        "tests/test_phase_b4_migration.py",
+        "tests/test_phase_c3_migration.py"
+      ],
+      "phase_selectors": ["tests/test_phase_b*.py"]
+    },
+    "TEST_INFRA": {
+      "phase": null,
+      "module_selectors": [
+        "tests/test_phase_f1*.py",
+        "e2e-fixture/tests/test_*.py"
+      ],
+      "phase_selectors": []
+    },
+    "DOCUMENTATION": {
+      "phase": null,
+      "module_selectors": [],
+      "phase_selectors": []
+    }
+  },
+  "targeted_tests": {
+    "core.py": ["tests/test_phase2a_workflow.py", "tests/test_v12_regressions.py"],
+    "models.py": ["tests/test_v12_regressions.py"],
+    "state_machine.py": ["tests/test_state_machine.py"],
+    "gates.py": ["tests/test_gates.py", "tests/test_phase2a_gates.py"],
+    "events.py": ["tests/test_events.py", "tests/test_phase2a_events.py"],
+    "outputs.py": ["tests/test_phase2a_outputs.py"],
+    "workflow.py": ["tests/test_phase2a_workflow.py"],
+    "notifications.py": ["tests/test_phase3a_notifications.py"],
+    "visualizer_snapshot.py": ["tests/test_phase3d_visualizer_snapshot.py"],
+    "supervisor.py": ["tests/test_phase2c_supervisor.py"],
+    "scheduler.py": ["tests/test_phase_b2_scheduler_recovery.py", "tests/test_phase_b2_fix_round.py"],
+    "job_state.py": ["tests/test_phase_b1_queue_leases.py"],
+    "recovery.py": ["tests/test_phase_b2_scheduler_recovery.py"],
+    "external_wait.py": ["tests/test_phase_b3_external_wait.py"],
+    "process_registry.py": ["tests/test_phase_b3_process_worktree.py"],
+    "resource_policy.py": ["tests/test_phase_c1_policy.py"],
+    "host_snapshot.py": ["tests/test_phase_c1_snapshot.py"],
+    "resource_governor.py": ["tests/test_phase_c1_admission.py"],
+    "execution_scope.py": ["tests/test_phase_c2_scope.py"],
+    "scope_enforcer.py": ["tests/test_phase_c2_spawn_gate.py"],
+    "resource_failure.py": ["tests/test_phase_c2_timeout.py"],
+    "resource_recovery.py": ["tests/test_phase_c3_classification.py"],
+    "context.py": ["tests/test_phase2a_context.py", "tests/test_context_snapshot.py"],
+    "context_pack.py": ["tests/test_phase_d1_context_pack.py"],
+    "handoff.py": ["tests/test_phase_d2_handoff.py"],
+    "retrieval.py": ["tests/test_phase_d2_retrieval.py"],
+    "checkpoint.py": ["tests/test_phase_d2_checkpoint.py"],
+    "artifact_refs.py": ["tests/test_phase_d3_artifact_refs.py"],
+    "context_handoff_integration.py": ["tests/test_phase_d2_integration.py"],
+    "model_registry.py": ["tests/test_phase_e1_registry.py"],
+    "model_router.py": ["tests/test_phase_e2_router.py", "tests/test_phase_e3_router.py"],
+    "evidence_registry.py": ["tests/test_phase_e3_router.py", "tests/test_phase_e3_fix_round.py"],
+    "routing.py": ["tests/test_phase2a_routing.py", "tests/test_phase_e2_router.py"],
+    "trust.py": ["tests/test_trust.py"],
+    "roles.py": ["tests/test_roles.py"],
+    "workspace_broker.py": ["tests/test_workspace_broker.py"],
+    "sandbox_runner.py": ["tests/test_sandbox_runner.py"],
+    "approval_core.py": ["tests/test_phase3c_approval_core.py"],
+    "approval_processor.py": ["tests/test_phase3c_approval_processor.py"],
+    "telegram_approval_adapter.py": ["tests/test_phase3cb1_adapter.py"],
+    "store.py": ["tests/test_persistence.py", "tests/test_phase_b4_migration.py"],
+    "worktree.py": ["tests/test_phase_b3_process_worktree.py"],
+    "parser.py": ["e2e-fixture/tests/test_parser.py"],
+    "service.py": ["e2e-fixture/tests/test_parser.py"]
+  },
+  "manual_suites": {
+    "smoke/": "manuelle Smoke-Runs (bwrap/echte systemd-Scopes), nicht-autoritativ; keine automatischen Selektoren"
+  },
+  "full_suite_selector": "tests/"
+}
