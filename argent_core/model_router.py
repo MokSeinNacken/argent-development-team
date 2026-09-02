@@ -42,10 +42,12 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Dict, FrozenSet, Optional, Sequence, Tuple
 
+from . import evidence_registry
 from .job_state import ErrorClass
 from .model_registry import (
     CAPABILITY_FLOOR_UNMET,
     MODEL_CONFIG_INVALID,
+    AvailabilityState,
     Capability,
     CapabilityRequirements,
     Independence,
@@ -62,7 +64,7 @@ from .models import ArgentError, DispatchStatus, RiskClass, Role
 # Version / bounded codes
 # ---------------------------------------------------------------------------
 
-ROUTING_POLICY_VERSION = "1"
+ROUTING_POLICY_VERSION = "2"
 
 # Bounded escalation levels (owner-spec §10).
 LEVEL_ROUTINE = 0
@@ -112,6 +114,8 @@ class RoutingReasonCode(str, Enum):
     MISSING_REQUIRED_EXTERNAL_INFO = "MISSING_REQUIRED_EXTERNAL_INFO"
     OWNER_GATE = "OWNER_GATE"
     NO_ELIGIBLE_CANDIDATE = "NO_ELIGIBLE_CANDIDATE"
+    VALIDATED_FALLBACK = "VALIDATED_FALLBACK"
+    NO_VALID_FALLBACK = "NO_VALID_FALLBACK"
 
 
 #: Reason codes that ARE capability escalations (raise the level).
@@ -129,9 +133,21 @@ _CAPABILITY_TRIGGER_CODES: FrozenSet[str] = frozenset({
 
 #: Reason codes that are provider/model/failure-side (never a capability failure,
 #: never a capability escalation — they route through the existing WAIT/backoff).
+#: ``VALIDATED_FALLBACK`` is a validated availability fallback (same escalation
+#: level, never raises or lowers it); it never counts as a capability escalation.
 _NON_CAPABILITY_CODES: FrozenSet[str] = frozenset({
     RoutingReasonCode.PROVIDER_FAILURE.value,
     RoutingReasonCode.MODEL_FAILURE.value,
+    RoutingReasonCode.VALIDATED_FALLBACK.value,
+})
+
+#: Reason codes that are TERMINAL no-dispatch outcomes (no candidate / owner
+#: gate / no valid fallback).  The supervisor maps each to its existing
+#: fail-closed/backoff mechanism.
+_TERMINAL_REASON_CODES: FrozenSet[str] = frozenset({
+    RoutingReasonCode.OWNER_GATE.value,
+    RoutingReasonCode.NO_ELIGIBLE_CANDIDATE.value,
+    RoutingReasonCode.NO_VALID_FALLBACK.value,
 })
 
 #: Bounded attempt outcome classes (derived by the controller from trusted DB
@@ -203,11 +219,27 @@ def thinking_to_reasoning(tier: Optional[str]) -> Optional[str]:
     return _THINKING_TIER_TO_REASONING.get(tier.strip().lower())
 
 
+#: Bounded provider-side error codes that map to a HARD unavailability
+#: (``ATTEMPT_OUTCOME_PROVIDER``) — the availability snapshot reads ONLY this
+#: outcome.  Mirror the registry codes ``PROVIDER_UNAVAILABLE``/``MODEL_UNAVAILABLE``.
+_PROVIDER_OUTCOME_CODES: FrozenSet[str] = frozenset({
+    "PROVIDER_UNAVAILABLE", "MODEL_UNAVAILABLE",
+})
+
+#: Bounded transient provider-side error codes (rate limit / request timeout)
+#: that map to ``ATTEMPT_OUTCOME_TRANSIENT`` — a backoff/WAIT signal, never a
+#: fallback trigger (matches E2: rate-limit -> backoff, not a weaker model).
+_TRANSIENT_OUTCOME_CODES: FrozenSet[str] = frozenset({
+    "RATE_LIMIT", "REQUEST_TIMEOUT",
+})
+
+
 def classify_attempt(
     dispatch_status: Optional[str],
     error_class: Optional[str],
     tests_red: bool,
     reviewer_rejected: bool,
+    error_code: Optional[str] = None,
 ) -> str:
     """Classify one prior dispatch attempt into a bounded outcome class.
 
@@ -216,6 +248,9 @@ def classify_attempt(
     transport / resource / context / security / owner signal is NEVER a
     capability gap, and only a capability gap can drive capability escalation.
 
+    * ``error_code`` PROVIDER_UNAVAILABLE / MODEL_UNAVAILABLE →
+      ``ATTEMPT_OUTCOME_PROVIDER`` (hard unavailability); RATE_LIMIT /
+      REQUEST_TIMEOUT → ``ATTEMPT_OUTCOME_TRANSIENT`` (F2/E3 fix-round).
     * ``error_class`` EXTERNAL / PROVIDER / TRANSIENT (and registry-side
       PROVIDER codes) are provider/transport signals → their own non-capability
       outcome (never ``CAPABILITY``).
@@ -227,6 +262,11 @@ def classify_attempt(
       no transport signal is a code gap ⇒ ``CAPABILITY``.  An incomplete
       attempt (pending/running/recovery/quarantined) ⇒ ``OTHER``.
     """
+    code = (error_code or "").strip().upper()
+    if code in _PROVIDER_OUTCOME_CODES:
+        return ATTEMPT_OUTCOME_PROVIDER
+    if code in _TRANSIENT_OUTCOME_CODES:
+        return ATTEMPT_OUTCOME_TRANSIENT
     ec = (error_class or "").strip().upper()
     if ec == ErrorClass.TRANSIENT.value:
         return ATTEMPT_OUTCOME_TRANSIENT
@@ -259,6 +299,7 @@ _POLICY_DOC_KEYS: FrozenSet[str] = frozenset({
     "policy_version", "bootstrap", "benchmark_required_for_new_models",
     "escalation", "reasoning", "level_min_tiers", "model_tiers", "profiles",
     "escalation_profiles", "cost_order", "latency_order",
+    "evidence_requirements", "fallback",
 })
 _PROFILE_KEYS: FrozenSet[str] = frozenset({
     "roles", "required_capabilities", "minimum_reasoning_level", "entry_level",
@@ -268,6 +309,13 @@ _ESCALATION_KEYS: FrozenSet[str] = frozenset({
     "max_automatic_level", "owner_level", "level_names",
 })
 _REASONING_KEYS: FrozenSet[str] = frozenset({"level_defaults", "level_ceilings"})
+_EVIDENCE_REQUIREMENTS_KEYS: FrozenSet[str] = frozenset({"minimum_status"})
+_FALLBACK_KEYS: FrozenSet[str] = frozenset({"enabled", "trigger_states", "allow_rate_limit_fallback"})
+
+#: Bounded availability states that may trigger a validated fallback (default).
+_DEFAULT_FALLBACK_TRIGGER_STATES: FrozenSet[str] = frozenset({
+    AvailabilityState.UNAVAILABLE.value,
+})
 
 _REASONING_RANK: Dict[str, int] = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
 _TIER_RANK: Dict[int, int] = {0: 0, 1: 1, 2: 2}
@@ -315,6 +363,19 @@ class AttemptEvidence:
     escalation_level: int = 0
     failure_code: Optional[str] = None
 
+    def canonical(self) -> Dict[str, Any]:
+        """Deterministic canonical form for provenance hashing (F3)."""
+        return {
+            "attempt_no": self.attempt_no,
+            "model_id": self.model_id,
+            "reasoning_level": self.reasoning_level,
+            "outcome_class": self.outcome_class,
+            "status": self.status,
+            "sequence_kind": self.sequence_kind,
+            "escalation_level": self.escalation_level,
+            "failure_code": self.failure_code,
+        }
+
 
 @dataclass(frozen=True)
 class RoutingEvidence:
@@ -327,6 +388,90 @@ class RoutingEvidence:
     confirmed_finding: bool = False
     security_relevant: bool = False
     concurrency_relevant: bool = False
+
+    def canonical(self) -> Dict[str, Any]:
+        """Deterministic canonical form for provenance hashing (F3).
+
+        Captures the FULL bounded evidence (not just ``attempt:<no>`` refs) so
+        a change to any evidence field changes the decision's ``inputs_hash``.
+        """
+        return {
+            "prior_attempts": [a.canonical() for a in self.prior_attempts],
+            "test_results": list(self.test_results),
+            "reviewer_verdicts": list(self.reviewer_verdicts),
+            "open_findings_count": self.open_findings_count,
+            "confirmed_finding": self.confirmed_finding,
+            "security_relevant": self.security_relevant,
+            "concurrency_relevant": self.concurrency_relevant,
+        }
+
+
+#: Bounded availability states a snapshot may assert (the AvailabilityState
+#: vocabulary — never agent prose, never an invented state).
+_AVAILABILITY_STATES: FrozenSet[str] = frozenset(s.value for s in AvailabilityState)
+
+#: Availability severity rank (lower = worse).  Used to combine the registry
+#: default with the snapshot override: the snapshot can only LOWER availability
+#: (never raise a registry-UNAVAILABLE model back to AVAILABLE).
+_AVAILABILITY_RANK: Dict[str, int] = {
+    AvailabilityState.DISABLED.value: 0,
+    AvailabilityState.UNAVAILABLE.value: 1,
+    AvailabilityState.UNKNOWN.value: 2,
+    AvailabilityState.DEGRADED.value: 3,
+    AvailabilityState.AVAILABLE.value: 4,
+}
+
+
+def _worse_availability(a: str, b: str) -> str:
+    """Return the worse (lower-rank) of two availability states."""
+    return a if _AVAILABILITY_RANK.get(a, 0) <= _AVAILABILITY_RANK.get(b, 0) else b
+
+#: Max entries a snapshot may carry (bounded, fail-closed on overflow).
+_AVAILABILITY_SNAPSHOT_MAX_PROVIDERS = 64
+_AVAILABILITY_SNAPSHOT_MAX_MODELS = 128
+
+
+@dataclass(frozen=True)
+class AvailabilitySnapshot:
+    """Deterministic availability override for the router (trusted, bounded).
+
+    Built by the controller from trusted job/attempt facts (registry default +
+    observed deviations).  A key present here OVERRIDES the E1 registry default
+    for that provider/model; an absent key means "use the registry default".
+    Only ``AvailabilityState`` values are accepted — never an invented state.
+
+    This is a pure data input: it carries no secrets, no agent prose, and no
+    decision.  It is hashed into the decision's provenance (inputs hash).
+    """
+
+    provider_states: Dict[str, str] = field(default_factory=dict)
+    model_states: Dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        ps = dict(self.provider_states or {})
+        ms = dict(self.model_states or {})
+        if len(ps) > _AVAILABILITY_SNAPSHOT_MAX_PROVIDERS:
+            raise RoutingError(ROUTING_REQUEST_INVALID, "availability snapshot has too many provider entries")
+        if len(ms) > _AVAILABILITY_SNAPSHOT_MAX_MODELS:
+            raise RoutingError(ROUTING_REQUEST_INVALID, "availability snapshot has too many model entries")
+        for label, raw in (("provider_states", ps), ("model_states", ms)):
+            for key, state in raw.items():
+                if not isinstance(key, str) or not key:
+                    raise RoutingError(ROUTING_REQUEST_INVALID, f"{label} key must be a non-empty string")
+                if state not in _AVAILABILITY_STATES:
+                    raise RoutingError(
+                        ROUTING_REQUEST_INVALID,
+                        f"{label}[{key!r}] has unknown state {state!r}",
+                    )
+        object.__setattr__(self, "provider_states", MappingProxyType(ps))
+        object.__setattr__(self, "model_states", MappingProxyType(ms))
+
+    def canonical(self) -> Dict[str, Any]:
+        """Deterministic canonical form for provenance hashing."""
+        return {
+            "provider_states": dict(sorted(self.provider_states.items())),
+            "model_states": dict(sorted(self.model_states.items())),
+        }
 
 
 @dataclass(frozen=True)
@@ -343,6 +488,7 @@ class RoutingRequest:
     evidence: RoutingEvidence = RoutingEvidence()
     current_escalation_level: int = LEVEL_ROUTINE
     policy_version: str = ROUTING_POLICY_VERSION
+    availability_snapshot: Optional[AvailabilitySnapshot] = None
 
 
 @dataclass(frozen=True)
@@ -368,6 +514,12 @@ class RoutingDecision:
     requirements_hash: str
     decision_reason_code: str
     policy_version: str
+    registry_version: str
+    evidence_version: str
+    policy_hash: str
+    registry_hash: str
+    evidence_hash: str
+    inputs_hash: str
     evidence_refs: Tuple[str, ...]
     reference_model_id: Optional[str]
     independence_requirement: Optional[str]
@@ -381,10 +533,7 @@ class RoutingDecision:
             self.provider is None
             or self.model is None
             or self.escalation_level >= LEVEL_OWNER
-            or self.decision_reason_code in (
-                RoutingReasonCode.OWNER_GATE.value,
-                RoutingReasonCode.NO_ELIGIBLE_CANDIDATE.value,
-            )
+            or self.decision_reason_code in _TERMINAL_REASON_CODES
         )
 
     @property
@@ -581,10 +730,54 @@ class RoutingPolicy:
         self._cost_order = _require_class_order(raw.get("cost_order"), "cost_order")
         self._latency_order = _require_class_order(raw.get("latency_order"), "latency_order")
 
+        # E3: evidence requirements (optional; default minimum status PROVISIONAL).
+        ev_req = raw.get("evidence_requirements", {})
+        if ev_req is None:
+            ev_req = {}
+        if not isinstance(ev_req, dict):
+            raise RoutingError(ROUTING_POLICY_INVALID, "evidence_requirements must be an object")
+        _reject_unknown(ev_req, _EVIDENCE_REQUIREMENTS_KEYS, "evidence_requirements")
+        min_status = ev_req.get("minimum_status", evidence_registry.EvidenceStatus.PROVISIONAL.value)
+        _require_enum_str(min_status, evidence_registry.EvidenceStatus, "evidence_requirements.minimum_status")
+        if evidence_registry.evidence_status_rank(min_status) <= 0:
+            # A minimum of UNKNOWN/REJECTED would make the evidence gate vacuous.
+            raise RoutingError(ROUTING_POLICY_INVALID, "evidence_requirements.minimum_status must be PROVISIONAL or VERIFIED")
+        self._evidence_minimum_status = evidence_registry.EvidenceStatus(min_status).value
+
+        # E3: fallback rules (optional; fallback disabled unless the policy
+        # explicitly enables it — preserving E2 behaviour when absent).
+        fb = raw.get("fallback", {})
+        if fb is None:
+            fb = {}
+        if not isinstance(fb, dict):
+            raise RoutingError(ROUTING_POLICY_INVALID, "fallback must be an object")
+        _reject_unknown(fb, _FALLBACK_KEYS, "fallback")
+        fb_enabled = fb.get("enabled", False)
+        if not isinstance(fb_enabled, bool):
+            raise RoutingError(ROUTING_POLICY_INVALID, "fallback.enabled must be a bool")
+        fb_trigger = fb.get("trigger_states", sorted(_DEFAULT_FALLBACK_TRIGGER_STATES))
+        if not isinstance(fb_trigger, list) or not fb_trigger:
+            raise RoutingError(ROUTING_POLICY_INVALID, "fallback.trigger_states must be a non-empty list")
+        trigger_states = tuple(_require_enum_str(s, AvailabilityState, "fallback.trigger_states") for s in fb_trigger)
+        if len(trigger_states) != len(set(trigger_states)):
+            raise RoutingError(ROUTING_POLICY_INVALID, "fallback.trigger_states must not contain duplicates")
+        allow_rate_limit = fb.get("allow_rate_limit_fallback", False)
+        if not isinstance(allow_rate_limit, bool):
+            raise RoutingError(ROUTING_POLICY_INVALID, "fallback.allow_rate_limit_fallback must be a bool")
+        self._fallback_enabled = fb_enabled
+        self._fallback_trigger_states = frozenset(trigger_states)
+        self._allow_rate_limit_fallback = allow_rate_limit
+
         self._bootstrap = bootstrap
         self._benchmark_required = bench
         self._max_automatic_level = max_auto
         self._owner_level = owner_lvl
+        # F3: the immutable content digest of the policy document (sha256 of
+        # the canonical file content).  Binds the decision provenance to the
+        # EXACT document bytes, not just the version label.
+        self._content_hash = hashlib.sha256(
+            _canonical_json(raw).encode("utf-8")
+        ).hexdigest()
 
     # -- parse helpers ------------------------------------------------------
 
@@ -653,6 +846,11 @@ class RoutingPolicy:
         return ROUTING_POLICY_VERSION
 
     @property
+    def content_hash(self) -> str:
+        """sha256 of the canonical policy document content (F3 provenance)."""
+        return self._content_hash
+
+    @property
     def max_automatic_level(self) -> int:
         return self._max_automatic_level
 
@@ -667,6 +865,22 @@ class RoutingPolicy:
     @property
     def benchmark_required_for_new_models(self) -> bool:
         return self._benchmark_required
+
+    @property
+    def evidence_minimum_status(self) -> str:
+        return self._evidence_minimum_status
+
+    @property
+    def fallback_enabled(self) -> bool:
+        return self._fallback_enabled
+
+    @property
+    def fallback_trigger_states(self) -> FrozenSet[str]:
+        return self._fallback_trigger_states
+
+    @property
+    def allow_rate_limit_fallback(self) -> bool:
+        return self._allow_rate_limit_fallback
 
     def reasoning_default(self, level: int) -> str:
         return self._reasoning_defaults[level]
@@ -997,15 +1211,22 @@ class ModelRouter:
         self,
         registry: Optional[ModelRegistry] = None,
         policy: Optional[RoutingPolicy] = None,
+        evidence: Optional[evidence_registry.EvidenceRegistry] = None,
     ):
         self._registry = registry
         self._policy = policy
+        self._evidence = evidence
 
     def _reg(self) -> ModelRegistry:
         return self._registry if self._registry is not None else get_default_registry()
 
     def _pol(self) -> RoutingPolicy:
         return self._policy if self._policy is not None else get_default_policy()
+
+    def _ev(self) -> evidence_registry.EvidenceRegistry:
+        if self._evidence is not None:
+            return self._evidence
+        return evidence_registry.get_default_evidence_registry()
 
     # -- public -------------------------------------------------------------
 
@@ -1112,31 +1333,55 @@ class ModelRouter:
         if _REASONING_RANK[reasoning_level] > _REASONING_RANK[ceiling]:
             reasoning_level = ceiling
 
-        # 5. Eligibility filter (floor + policy authorisation + independence).
+        # 5. Eligibility filter (floor + policy authorisation + independence +
+        #    evidence).  The independent E3 evidence gate is applied HERE, AFTER
+        #    the floor/policy/independence filters, as a final hard filter.
         requirements = CapabilityRequirements(
             required_capabilities=tuple(required_caps),
             minimum_reasoning_level=min_reason,
             independence_requirement=independence,
         )
+        evidence = self._ev()
         candidates = self._eligible_candidates(
             registry, policy, requirements, allowed,
             level, reasoning_level, request.reference_model_id,
+            evidence, policy.evidence_minimum_status,
         )
 
-        # 6. Ranking (minimum sufficient; cost/latency only as tiebreakers).
-        chosen = self._rank_minimum(candidates, policy, registry)
+        # 6. Ranking + validated fallback (minimum sufficient; cost/latency only
+        #    as tiebreakers).  Fallback is deterministic and only triggered by
+        #    provider/model unavailability (the AvailabilitySnapshot), never by
+        #    code failures / bad output / unknown root cause.
+        chosen, used_fallback = self._select(
+            candidates, policy, registry, request.availability_snapshot,
+        )
 
         if chosen is None:
+            # Distinguish "no candidate at all" (floor/policy/evidence) from
+            # "candidates exist but all unavailable" (provider failure).
+            if candidates:
+                return self._terminal(
+                    request, tuple(required_caps),
+                    RoutingReasonCode.NO_VALID_FALLBACK.value,
+                    level, independence, policy, created_at,
+                    candidates=candidates,
+                )
             return self._terminal(
                 request, tuple(required_caps), RoutingReasonCode.NO_ELIGIBLE_CANDIDATE.value,
                 level, independence, policy, created_at,
+                candidates=candidates,
             )
 
-        reason_code = self._decision_reason(triggers, level, role_entry_level)
+        reason_code = (
+            RoutingReasonCode.VALIDATED_FALLBACK.value
+            if used_fallback
+            else self._decision_reason(triggers, level, role_entry_level)
+        )
 
         return self._build_decision(
             request, chosen, level, reasoning_level,
             tuple(required_caps), reason_code, independence, policy, created_at,
+            candidates=candidates,
         )
 
     # -- internal -----------------------------------------------------------
@@ -1169,9 +1414,11 @@ class ModelRouter:
         level: int,
         reasoning_level: str,
         reference_model_id: Optional[str],
+        evidence: evidence_registry.EvidenceRegistry,
+        min_status: str,
     ) -> Tuple[ModelDescriptor, ...]:
         """Candidate set: registry valid + policy-authorised + tier floor +
-        capability floor + reasoning floor + independence."""
+        capability floor + reasoning floor + independence + evidence (E3)."""
         min_tier = policy.min_tier_for_level(level)
         allowed_set = set(allowed)
         reference = None
@@ -1184,7 +1431,7 @@ class ModelRouter:
             tier = policy.tier_of(model.model_id)
             if tier is None or tier < min_tier:
                 continue
-            if not _model_enabled_available(registry, model):
+            if not _model_registry_enabled(registry, model):
                 continue
             if not registry.satisfies_floor(model, requirements):
                 continue
@@ -1192,18 +1439,26 @@ class ModelRouter:
                 continue
             if not _independence_ok(model, reference, requirements):
                 continue
+            # E3 evidence gate (independent of floor/policy): a model with
+            # UNKNOWN/REJECTED evidence for a required capability's category is
+            # never eligible (fail-closed on absence).
+            if not evidence_registry.satisfies_evidence(
+                evidence, model.model_id, requirements.required_capabilities,
+                min_status,
+            ):
+                continue
             out.append(model)
         return tuple(out)
 
-    def _rank_minimum(
+    def _rank_all(
         self,
         candidates: Sequence[ModelDescriptor],
         policy: RoutingPolicy,
         registry: ModelRegistry,
-    ) -> Optional[ModelDescriptor]:
+    ) -> Tuple[ModelDescriptor, ...]:
         if not candidates:
-            return None
-        ordered = sorted(
+            return ()
+        return tuple(sorted(
             candidates,
             key=lambda m: (
                 policy.tier_of(m.model_id) if policy.tier_of(m.model_id) is not None else 99,
@@ -1211,8 +1466,85 @@ class ModelRouter:
                 policy.latency_rank(m.latency_class),
                 m.model_id,
             ),
+        ))
+
+    def _rank_minimum(
+        self,
+        candidates: Sequence[ModelDescriptor],
+        policy: RoutingPolicy,
+        registry: ModelRegistry,
+    ) -> Optional[ModelDescriptor]:
+        ordered = self._rank_all(candidates, policy, registry)
+        return ordered[0] if ordered else None
+
+    def _effective_availability(
+        self,
+        model: ModelDescriptor,
+        snapshot: Optional[AvailabilitySnapshot],
+    ) -> str:
+        """Effective availability: registry default, then snapshot can only lower.
+
+        F2 (E3 fix-round): the REGISTRY default (provider ``availability_state``)
+        is the baseline — a registry-UNAVAILABLE provider/model is NOT filtered
+        out of the candidate set before the fallback search; it is simply
+        unusable here and the router falls back over the remaining valid models
+        (CASE 5/7/24).  The snapshot override can only REDUCE availability
+        (UNAVAILABLE/DEGRADED/…), never raise it.
+        """
+        provider = self._reg().get_provider(model.provider_id)
+        registry_default = (
+            provider.availability_state if provider is not None
+            else AvailabilityState.UNKNOWN.value
         )
-        return ordered[0]
+        if snapshot is None:
+            return registry_default
+        state = snapshot.model_states.get(model.model_id)
+        if state is None:
+            state = snapshot.provider_states.get(model.provider_id)
+        if state is None:
+            return registry_default
+        return _worse_availability(registry_default, state)
+
+    def _is_usable(
+        self,
+        model: ModelDescriptor,
+        snapshot: Optional[AvailabilitySnapshot],
+    ) -> bool:
+        state = self._effective_availability(model, snapshot)
+        return state in (AvailabilityState.AVAILABLE.value, AvailabilityState.DEGRADED.value)
+
+    def _select(
+        self,
+        candidates: Sequence[ModelDescriptor],
+        policy: RoutingPolicy,
+        registry: ModelRegistry,
+        snapshot: Optional[AvailabilitySnapshot],
+    ) -> Tuple[Optional[ModelDescriptor], bool]:
+        """Rank minimum-sufficient and select the primary, applying a validated
+        availability fallback when the primary is unavailable.
+
+        Returns ``(chosen, used_fallback)``.  ``used_fallback`` is True only when
+        a snapshot-declared unavailable primary was replaced by a validated
+        fallback (same escalation level, never a cheaper under-floor model).
+        """
+        ordered = self._rank_all(candidates, policy, registry)
+        if not ordered:
+            return None, False
+        primary = ordered[0]
+        if self._is_usable(primary, snapshot):
+            return primary, False
+        # Primary unavailable.  If fallback is disabled, or the primary's
+        # unavailable state is not a policy-permitted fallback trigger, fail
+        # closed (NO_VALID_FALLBACK) — never a silent weaker substitution.
+        if not policy.fallback_enabled:
+            return None, True
+        state = self._effective_availability(primary, snapshot)
+        if state not in policy.fallback_trigger_states:
+            return None, True
+        for candidate in ordered[1:]:
+            if self._is_usable(candidate, snapshot):
+                return candidate, True
+        return None, True
 
     def _decision_reason(self, triggers: FrozenSet[str], level: int, base_level: int) -> str:
         if level > base_level:
@@ -1246,10 +1578,11 @@ class ModelRouter:
         independence: str,
         policy: RoutingPolicy,
         created_at: str,
+        candidates: Sequence[ModelDescriptor] = (),
     ) -> RoutingDecision:
         return self._build_decision(
             request, None, level, None, tuple(required_caps), reason_code,
-            independence, policy, created_at,
+            independence, policy, created_at, candidates=candidates,
         )
 
     def _build_decision(
@@ -1263,7 +1596,19 @@ class ModelRouter:
         independence: str,
         policy: RoutingPolicy,
         created_at: str,
+        candidates: Sequence[ModelDescriptor] = (),
     ) -> RoutingDecision:
+        registry = self._reg()
+        evidence = self._ev()
+        registry_version = registry.version
+        evidence_version = evidence.version
+        # F3: immutable content digests of the three documents the decision is
+        # computed from (policy / model-registry / evidence-registry).  These
+        # bind the provenance to the exact canonical document bytes, not just
+        # the version labels.
+        policy_hash = policy.content_hash
+        registry_hash = getattr(registry, "content_hash", "") or ""
+        evidence_hash = getattr(evidence, "content_hash", "") or ""
         if chosen is not None:
             provider = chosen.provider_id
             model = chosen.model_id
@@ -1277,6 +1622,40 @@ class ModelRouter:
         evidence_refs = tuple(
             f"attempt:{a.attempt_no}" for a in request.evidence.prior_attempts
         )
+        snapshot_canonical = (
+            request.availability_snapshot.canonical()
+            if request.availability_snapshot is not None else None
+        )
+        # F3: the evidence entries actually consulted per candidate/floor (the
+        # bounded evidence-gate inputs, independent of the full document hash).
+        evidence_gate = _evidence_gate_canonical(evidence, candidates, required_caps)
+
+        inputs_canonical_obj = {
+            "policy_hash": policy_hash,
+            "registry_hash": registry_hash,
+            "evidence_hash": evidence_hash,
+            "policy_version": policy.version,
+            "registry_version": registry_version,
+            "evidence_version": evidence_version,
+            "role": request.role,
+            "risk_class": request.risk_class,
+            "required_capabilities": sorted(required_caps),
+            "reasoning_level": reasoning_level,
+            "independence_requirement": independence,
+            "reference_model_id": request.reference_model_id,
+            "current_escalation_level": request.current_escalation_level,
+            "evidence_minimum_status": policy.evidence_minimum_status,
+            "evidence": request.evidence.canonical(),
+            "evidence_refs": list(evidence_refs),
+            "evidence_gate": evidence_gate,
+            "availability_snapshot": snapshot_canonical,
+        }
+        inputs_hash = hashlib.sha256(
+            _canonical_json(inputs_canonical_obj).encode("utf-8")
+        ).hexdigest()
+        # F3: inputs_hash is part of the decision's canonical binding — every
+        # input change (including the three content digests) changes decision_id
+        # and sha256.
         canonical = _canonical_json({
             "job_id": request.job_id,
             "task_id": request.task_id,
@@ -1291,6 +1670,13 @@ class ModelRouter:
             "required_capabilities": sorted(required_caps),
             "reason_code": reason_code,
             "policy_version": policy.version,
+            "registry_version": registry_version,
+            "evidence_version": evidence_version,
+            "policy_hash": policy_hash,
+            "registry_hash": registry_hash,
+            "evidence_hash": evidence_hash,
+            "inputs_hash": inputs_hash,
+            "availability_snapshot": snapshot_canonical,
             "evidence_refs": list(evidence_refs),
         })
         decision_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
@@ -1317,6 +1703,12 @@ class ModelRouter:
             requirements_hash=requirements_hash,
             decision_reason_code=reason_code,
             policy_version=policy.version,
+            registry_version=registry_version,
+            evidence_version=evidence_version,
+            policy_hash=policy_hash,
+            registry_hash=registry_hash,
+            evidence_hash=evidence_hash,
+            inputs_hash=inputs_hash,
             evidence_refs=evidence_refs,
             reference_model_id=request.reference_model_id,
             independence_requirement=independence,
@@ -1354,6 +1746,33 @@ def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _evidence_gate_canonical(
+    evidence: "evidence_registry.EvidenceRegistry",
+    candidates: Sequence[ModelDescriptor],
+    required_caps: Sequence[str],
+) -> list:
+    """Bounded canonical of the evidence entries actually consulted (F3).
+
+    For each candidate (sorted by model_id) record the evidence status of every
+    required capability's mapped category.  This binds ``inputs_hash`` to the
+    EXACT evidence entries the gate read, independently of the full document
+    hash.  Empty candidates -> empty list (terminal no-candidate decisions).
+    """
+    categories = sorted({
+        evidence_registry.capability_category(c) for c in required_caps
+    })
+    out = []
+    for m in sorted(candidates, key=lambda mm: mm.model_id):
+        out.append({
+            "model_id": m.model_id,
+            "statuses": {
+                cat: evidence.get_status(m.model_id, cat)
+                for cat in categories
+            },
+        })
+    return out
+
+
 def _entry_level(profile: Dict[str, Any], risk_class: str) -> int:
     low_entry = profile.get("low_risk_entry_level")
     if low_entry is not None and risk_class == RiskClass.LOW.value:
@@ -1385,7 +1804,14 @@ def _max_reason(a: str, b: str) -> str:
     return a if _REASONING_RANK[a] >= _REASONING_RANK[b] else b
 
 
-def _model_enabled_available(registry: ModelRegistry, model: ModelDescriptor) -> bool:
+def _model_registry_enabled(registry: ModelRegistry, model: ModelDescriptor) -> bool:
+    """Model is registry-valid and enabled (does NOT gate on availability).
+
+    Availability (``provider.availability_state``) is the REGISTRY DEFAULT used
+    as the baseline in ``_effective_availability``; it must NOT filter a model
+    out of the candidate set before the fallback search (F2/E3 fix-round).
+    Only disabled/unknown models are excluded here.
+    """
     if not model.enabled:
         return False
     if model.lifecycle_state != "ACTIVE":
@@ -1393,7 +1819,7 @@ def _model_enabled_available(registry: ModelRegistry, model: ModelDescriptor) ->
     provider = registry.get_provider(model.provider_id)
     if provider is None or not provider.enabled:
         return False
-    return provider.availability_state in ("AVAILABLE", "DEGRADED")
+    return True
 
 
 def _reasoning_level_supported(model: ModelDescriptor, level: str) -> bool:

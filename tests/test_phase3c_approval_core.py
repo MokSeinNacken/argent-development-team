@@ -145,7 +145,8 @@ def _column_names(core, table):
 # ---------------------------------------------------------------------------
 
 def test_schema_version_is_15():
-    assert SCHEMA_VERSION == "15"
+    # E3 (Phase E): schema 15 -> 16 (additive routing_decisions provenance).
+    assert SCHEMA_VERSION == "16"
 
 
 def test_fresh_db_has_v6_tables_and_version(db_path, core):

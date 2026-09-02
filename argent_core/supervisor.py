@@ -94,6 +94,12 @@ MISSING_UNBOUND_SPAWN_CONFIRMATIONS = 15
 MAX_DISPATCH_ATTEMPTS_PER_STEP = 3
 AGENT_TIMEOUT_SECONDS = 900
 
+# E3 (fix-round F2): bounded validity window for a provider-availability
+# observation.  A persisted ``attempt_outcome == PROVIDER`` only marks a model
+# UNAVAILABLE for this many seconds; after expiry (or a later AVAILABLE/SUCCESS
+# observation) the model becomes eligible again — never poisoned forever.
+AVAILABILITY_OBSERVATION_TTL_SECONDS = 1800
+
 # Cross-controller apply fence (R14-F1, SPEC V2C §17 exactly-once write
 # pre-effects): a bounded interprocess lock around the broker critical section.
 APPLY_LOCK_TIMEOUT_SECONDS = 30.0
@@ -1082,6 +1088,13 @@ class TrajectoryRunStatusProvider:
             s, finished_at, session_dir
         )
 
+        # F2 (E3 fix-round): thread a bounded provider-side error code from the
+        # terminal row into the observation, so a provider failure can persist
+        # ATTEMPT_OUTCOME_PROVIDER (never CAPABILITY) in the real path.
+        error_code = None
+        if matching_ended:
+            error_code = self._terminal_error_code(matching_ended[-1])
+
         return RunObservation(
             status=status,
             agent_id=agent_id,
@@ -1096,7 +1109,23 @@ class TrajectoryRunStatusProvider:
             result_hash=result_hash,
             authoritative_not_found=False,
             evidence_id=str(traj),
+            error_code=error_code,
         )
+
+    def _terminal_error_code(self, e: dict) -> Optional[str]:
+        """Bounded provider-side error code from a terminal row (F2, E3).
+
+        Reads ``data.errorCode`` (a non-empty string).  Anything else (missing,
+        non-string, non-dict ``data``) returns ``None`` — an error code is never
+        fabricated from malformed runtime data.
+        """
+        data = e.get("data")
+        if not isinstance(data, dict):
+            return None
+        code = data.get("errorCode")
+        if not isinstance(code, str) or not code.strip():
+            return None
+        return code.strip()
 
     def _terminal_status(self, e: dict) -> RunStatus:
         data = e.get("data")
@@ -3157,6 +3186,12 @@ class Supervisor:
             self._close_job(job, "BLOCKED", reason=exc.code)
             return ActionOutcome("CREATE_DISPATCH", "failed", exc.code)
         if routing_decision.is_terminal:
+            # E3: a NO_VALID_FALLBACK decision is provider/model unavailability
+            # (NOT a capability gap) — it must re-queue with bounded backoff,
+            # never become a permanent BLOCKED.  NO_ELIGIBLE_CANDIDATE (floor/
+            # evidence) and OWNER_GATE stay fail-closed BLOCKED.
+            if routing_decision.decision_reason_code == model_router.RoutingReasonCode.NO_VALID_FALLBACK.value:
+                return self._provider_unavailable_backoff(job)
             self._close_job(job, "BLOCKED", reason=routing_decision.decision_reason_code)
             return ActionOutcome("CREATE_DISPATCH", "failed",
                                  routing_decision.decision_reason_code)
@@ -3196,6 +3231,85 @@ class Supervisor:
                                  f"{type(exc).__name__}")
         self._finish_action(row["id"], "SUCCEEDED")
         return ActionOutcome("CREATE_DISPATCH", "executed", dispatch_id=d.id)
+
+    def _provider_unavailable_backoff(self, job) -> ActionOutcome:
+        """Bounded backoff for a NO_VALID_FALLBACK routing decision (E3).
+
+        Provider/model unavailability with no valid fallback is NOT a permanent
+        BLOCKED: it re-queues with the existing bounded retry budget (growing
+        ``backoff_seconds``), transitioning to a sticky PERSISTENT_ERROR once
+        the budget is exhausted.  Never a silent weaker-substitute dispatch.
+
+        F1 (E3 fix-round): the backoff write MUST transition ``primary_state``
+        atomically (RUNNING -> QUEUED) AND release the lease via the central
+        ``_transition_job`` primitive.  The previous ``_update_supervisor_job``
+        write left a leased job RUNNING + BACKOFF + owner-NULL + lease-NULL —
+        neither claimable (RUNNING is never claimable) nor recoverable (no
+        concrete expired lease) — an unrecoverable corpse.
+        """
+        now = self._now()
+        error_code = model_router.RoutingReasonCode.NO_VALID_FALLBACK.value
+        with self.core._store._transaction():
+            cur = self.core._store.get_supervisor_job(job["id"])
+            if cur is None or cur["terminal"] is not None:
+                return ActionOutcome("CREATE_DISPATCH", "skipped", "job_terminal")
+            # F1: a backoff write is an authoritative commit; fence a leased
+            # job to its current holder before mutating.
+            self._enforce_lease_fence(cur)
+            retry = cur["retry_count"] + 1
+            if retry >= MAX_RUNTIME_UNKNOWN:
+                # Sticky PERSISTENT_ERROR (consistent with ``_persist_error``):
+                # status=ERROR short-circuits ``_decide`` forever, so no
+                # RUNNING corpse is left in the *unclaimable* sense — the job
+                # is intentionally terminal-side and requires owner action.
+                self.core._store._update_supervisor_job(
+                    job["id"],
+                    status=SupervisorJobStatus.ERROR.value,
+                    recovery_state=RecoveryState.PERSISTENT_ERROR.value,
+                    last_error_code=error_code,
+                    next_action=ReconcileAction.NONE.value,
+                    next_wake_at=None,
+                    retry_count=retry,
+                    updated_at=self._now_iso(),
+                    facts_version=cur["facts_version"] + 1,
+                )
+                self._enqueue_persistent_error_notification(cur)
+                return ActionOutcome("CREATE_DISPATCH", "failed", error_code)
+            wake = _iso(now + timedelta(seconds=backoff_seconds(retry)))
+            owner = cur.get("owner_instance_id")
+            epoch = cur["lease_epoch"]
+            fields = {
+                "queue_reason": job_state.QueueReason.RETRY_BACKOFF.value,
+                "next_eligible_at": wake,
+                "last_error_code": error_code,
+                "next_action": ReconcileAction.WAIT.value,
+                "next_wake_at": wake,
+                "retry_count": retry,
+            }
+            if owner is not None:
+                # Fenced release: QUEUED + BACKOFF + lease release in ONE atomic
+                # transition (holder CAS), so the job is claimable again after
+                # ``next_eligible_at`` and never stranded as RUNNING.
+                self.core._store._transition_job(
+                    job["id"],
+                    to_primary_state=job_state.PrimaryState.QUEUED.value,
+                    to_status=SupervisorJobStatus.BACKOFF.value,
+                    fields={**fields, "owner_instance_id": None,
+                            "lease_expires_at": None},
+                    bump_facts_version=True,
+                    cas_owner_instance_id=owner,
+                    cas_lease_epoch=epoch,
+                    cas_lease_unexpired=True,
+                )
+            else:
+                self.core._store._transition_job(
+                    job["id"],
+                    to_primary_state=job_state.PrimaryState.QUEUED.value,
+                    to_status=SupervisorJobStatus.BACKOFF.value,
+                    fields=fields,
+                    bump_facts_version=True,
+                )
+        return ActionOutcome("CREATE_DISPATCH", "wait", error_code)
 
     # -- E2 routing helpers -------------------------------------------------
 
@@ -3237,7 +3351,75 @@ class Supervisor:
             independence_requirement=independence,
             evidence=evidence,
             current_escalation_level=current,
+            availability_snapshot=self._build_availability_snapshot(task_id),
         )
+
+    def _build_availability_snapshot(
+        self, task_id: str
+    ) -> model_router.AvailabilitySnapshot:
+        """Assemble the deterministic availability snapshot from trusted facts.
+
+        The snapshot is the registry default plus OBSERVED deviations: a prior
+        dispatch whose bounded ``attempt_outcome`` is ``PROVIDER`` (a provider/
+        model registry/validation failure, i.e. a HARD unavailability — never a
+        transient EXTERNAL/TRANSIENT) marks that specific model UNAVAILABLE.
+
+        Provider-wide unavailability remains expressible via ``provider_states``
+        (the router honours both); the bootstrap builder synthesises model-level
+        facts only, because a persisted PROVIDER outcome is attributed to the
+        specific model that failed validation.  Transient/rate-limit failures
+        map to the existing backoff/WAIT mechanism and are NEVER marked here.
+        """
+    def _build_availability_snapshot(
+        self, task_id: str
+    ) -> model_router.AvailabilitySnapshot:
+        """Assemble the deterministic availability snapshot from trusted facts.
+
+        The snapshot is the registry default plus OBSERVED deviations: a prior
+        dispatch whose bounded ``attempt_outcome`` is ``PROVIDER`` (a provider/
+        model registry/validation failure, i.e. a HARD unavailability — never a
+        transient EXTERNAL/TRANSIENT) marks that specific model UNAVAILABLE.
+
+        F2 (E3 fix-round): the observation is BOUNDED.  Only the MOST RECENT
+        outcome per model counts, and only within
+        ``AVAILABILITY_OBSERVATION_TTL_SECONDS``: an expired PROVIDER outcome,
+        or a later AVAILABLE/SUCCESS observation, leaves the model available
+        again (never poisoned forever).  The history scan is limited to the
+        current bounded window.
+
+        Provider-wide unavailability remains expressible via ``provider_states``
+        (the router honours both); the bootstrap builder synthesises model-level
+        facts only, because a persisted PROVIDER outcome is attributed to the
+        specific model that failed validation.  Transient/rate-limit failures
+        map to the existing backoff/WAIT mechanism and are NEVER marked here.
+        """
+        now_s = self._now().timestamp()
+        latest: dict = {}  # model_id -> (obs_s, outcome)
+        for d in self.core._store.list_dispatches(task_id):
+            if not d.expected_model_class:
+                continue
+            outcome = d.attempt_outcome
+            if outcome not in (
+                model_router.ATTEMPT_OUTCOME_PROVIDER,
+                model_router.ATTEMPT_OUTCOME_SUCCESS,
+            ):
+                continue
+            obs_iso = d.consumed_at or d.started_at or d.created_at
+            obs_s = _safe_parse_iso(obs_iso)
+            if obs_s is None:
+                continue
+            prev = latest.get(d.expected_model_class)
+            if prev is None or obs_s >= prev[0]:
+                latest[d.expected_model_class] = (obs_s, outcome)
+        model_states: dict = {}
+        for model_id, (obs_s, outcome) in latest.items():
+            age_s = now_s - obs_s
+            if (
+                outcome == model_router.ATTEMPT_OUTCOME_PROVIDER
+                and 0 <= age_s <= AVAILABILITY_OBSERVATION_TTL_SECONDS
+            ):
+                model_states[model_id] = "UNAVAILABLE"
+        return model_router.AvailabilitySnapshot(model_states=model_states)
 
     def _current_escalation_level(self, task_id, role) -> int:
         """Max persisted escalation level among prior dispatches for this role.
@@ -4893,11 +5075,19 @@ class Supervisor:
         d = self.core._store.get_dispatch(dispatch_id)
         if d is None:
             return ActionOutcome("MARK_RUN_FAILED", "skipped", "dispatch_missing")
+        # F2 (E3 fix-round): derive the provider/transport signal from the
+        # observed run so a provider failure persists ATTEMPT_OUTCOME_PROVIDER
+        # (never CAPABILITY).  A missing/unreadable observation -> no signal
+        # (plain code failure -> CAPABILITY).
+        error_code = None
+        obs = self._guarded_observe(self._build_lookup(d))
+        if obs is not None:
+            error_code = obs.error_code
         run_id = d.openclaw_run_id or "unknown"
         key = f"supervisor:dispatch:{dispatch_id}:fail:{run_id}"
         args_hash = _sha256(_canonical_json({
             "dispatch_id": dispatch_id, "reason": "run_failed",
-            "source": self.controller_source}))
+            "source": self.controller_source, "error_code": error_code}))
         row, outcome = self._begin_action(
             key, "MARK_RUN_FAILED", job, dispatch_id, args_hash)
         if outcome == "succeeded":
@@ -4915,7 +5105,8 @@ class Supervisor:
         try:
             self.core.mark_agent_failed(dispatch_id, "run_failed",
                                         self.controller_source,
-                                        idempotency_key=key)
+                                        idempotency_key=key,
+                                        error_code=error_code)
         except ArgentError as exc:
             self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
             return ActionOutcome("MARK_RUN_FAILED", "failed",

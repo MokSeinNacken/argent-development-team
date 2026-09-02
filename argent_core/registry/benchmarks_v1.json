@@ -1,0 +1,116 @@
+{
+  "evidence_version": "1",
+  "models": [
+    {
+      "model_id": "deepseek-v4-flash",
+      "categories": {
+        "coordination_basic_reasoning": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "routing.py: implementer/qa LOW -> deepseek-v4-flash (COORDINATION, SIMPLE_ANALYSIS)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "repository_coding": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "architecture §11: Flash = mechanische Mini-Fixes (CODE_IMPLEMENTATION)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "debugging_root_cause": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "routing.py: implementer/qa LOW (DEBUGGING)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "tool_agent": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "local-config openclaw.json: tool_capabilities code_edit/shell_exec/file_access (TOOL_USE, STRUCTURED_OUTPUT)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "long_context": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "local-config openclaw.json: contextWindow 1000000, maxTokens 384000 (LONG_CONTEXT)",
+          "version": "1",
+          "benchmarked": false
+        }
+      }
+    },
+    {
+      "model_id": "deepseek-v4-pro",
+      "categories": {
+        "coordination_basic_reasoning": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "routing.py: analyst/implementer/qa -> deepseek-v4-pro (SIMPLE_ANALYSIS)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "repository_coding": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "routing.py: analyst/implementer/qa (REPOSITORY_REASONING, CODE_IMPLEMENTATION, COMPLEX_CODE_IMPLEMENTATION)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "debugging_root_cause": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "routing.py: implementer/qa (DEBUGGING)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "tool_agent": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "local-config openclaw.json: tool_capabilities code_edit/shell_exec/file_access (TOOL_USE, STRUCTURED_OUTPUT)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "long_context": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "local-config openclaw.json: contextWindow 1000000, maxTokens 384000 (LONG_CONTEXT)",
+          "version": "1",
+          "benchmarked": false
+        }
+      }
+    },
+    {
+      "model_id": "gpt-5.6-sol",
+      "categories": {
+        "coordination_basic_reasoning": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "routing.py: lead/reviewer -> openai/gpt-5.6-sol (COORDINATION)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "repository_coding": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "routing.py: lead/reviewer (REPOSITORY_REASONING)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "debugging_root_cause": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "routing.py: root-cause analysis escalation (ROOT_CAUSE_ANALYSIS)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "architecture": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "architecture §11: Sol = Architektur/Review (ARCHITECTURE)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "security_review": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "routing.py: reviewer/security escalation (CODE_REVIEW, SECURITY_REVIEW)",
+          "version": "1",
+          "benchmarked": false
+        },
+        "tool_agent": {
+          "status": "PROVISIONAL",
+          "evidence_ref": "local-config openclaw.json: openai provider via plugin (STRUCTURED_OUTPUT)",
+          "version": "1",
+          "benchmarked": false
+        }
+      }
+    }
+  ]
+}

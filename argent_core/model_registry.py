@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import json
 import re
+import hashlib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -886,6 +887,19 @@ def _parse_provenance(raw: Any) -> ClaimProvenance:
 # ---------------------------------------------------------------------------
 
 
+def _registry_content_hash(providers: Sequence[Dict[str, Any]], models: Sequence[Dict[str, Any]]) -> str:
+    """sha256 of the canonical registry document content (providers + models).
+
+    Deterministic over the raw payload lists (F3 provenance): a change to any
+    provider/model entry changes the registry content digest.
+    """
+    canonical = json.dumps(
+        {"providers": list(providers), "models": list(models)},
+        sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class ModelRegistry:
     """Immutable, fail-closed registry of providers + models.
 
@@ -900,6 +914,7 @@ class ModelRegistry:
         providers: Dict[str, ProviderDescriptor],
         models: Dict[str, ModelDescriptor],
         version: str = REGISTRY_VERSION,
+        content_hash: str = "",
     ):
         # Version consistency: the registry version is bounded (REGISTRY_VERSION).
         if version != REGISTRY_VERSION:
@@ -954,6 +969,9 @@ class ModelRegistry:
         self._version = version
         self._providers = MappingProxyType(dict(providers))
         self._models = MappingProxyType(dict(models))
+        # F3: sha256 of the canonical registry document content (providers +
+        # models).  Binds the decision provenance to the exact document bytes.
+        self._content_hash = content_hash
         self._validate_cross_references()
 
     # -- construction -------------------------------------------------------
@@ -1002,7 +1020,8 @@ class ModelRegistry:
                 )
             parsed_models[md.model_id] = md
 
-        return cls(parsed_providers, parsed_models, version=version)
+        return cls(parsed_providers, parsed_models, version=version,
+                   content_hash=_registry_content_hash(providers, models))
 
     @classmethod
     def load_files(cls, base_dir: Optional[str] = None) -> "ModelRegistry":
@@ -1104,6 +1123,11 @@ class ModelRegistry:
     @property
     def version(self) -> str:
         return self._version
+
+    @property
+    def content_hash(self) -> str:
+        """sha256 of the canonical registry document content (F3 provenance)."""
+        return self._content_hash
 
     def get_provider(self, provider_id: str) -> Optional[ProviderDescriptor]:
         return self._providers.get(provider_id)

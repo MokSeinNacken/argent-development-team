@@ -140,10 +140,10 @@ def test_regression_retrieval_bounds(tmp_path):
             authorized_root=str(root), reference="../etc/passwd"))
 
 
-# Schema: still version 15 (E2 fix-round additive columns); additive tables present
+# Schema: version 16 (E3 additive routing_decisions provenance columns); additive tables present
 def test_regression_schema_version(db_path):
     core = Core(db_path)
-    assert SCHEMA_VERSION == "15"
+    assert SCHEMA_VERSION == "16"
     tables = {r[0] for r in core._store._conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     for t in ("context_packs", "handoffs_v2", "checkpoints"):

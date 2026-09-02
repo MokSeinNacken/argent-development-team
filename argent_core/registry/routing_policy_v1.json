@@ -1,5 +1,5 @@
 {
-  "policy_version": "1",
+  "policy_version": "2",
   "bootstrap": true,
   "benchmark_required_for_new_models": true,
   "escalation": {
@@ -102,5 +102,13 @@
     }
   },
   "cost_order": ["LOW", "MEDIUM", "HIGH", "UNKNOWN"],
-  "latency_order": ["LOW", "MEDIUM", "HIGH", "UNKNOWN"]
+  "latency_order": ["LOW", "MEDIUM", "HIGH", "UNKNOWN"],
+  "evidence_requirements": {
+    "minimum_status": "PROVISIONAL"
+  },
+  "fallback": {
+    "enabled": true,
+    "trigger_states": ["UNAVAILABLE"],
+    "allow_rate_limit_fallback": false
+  }
 }

@@ -491,7 +491,7 @@ def test_router_decision_reason_code_is_bounded():
 
 def test_policy_load_valid():
     pol = mr.load_routing_policy()
-    assert pol.version == "1"
+    assert pol.version == "2"
     assert pol.max_automatic_level == 3
     assert pol.owner_level == 4
     assert pol.bootstrap is True

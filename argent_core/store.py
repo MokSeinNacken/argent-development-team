@@ -91,7 +91,7 @@ from .handoff import HANDOFF_VERSION as HANDOFF_RECORD_VERSION
 # metadata on agent_dispatches (additive).
 # E2 fix-round (F2/F4): provenance marker (source_class) on findings/test_runs/
 # reviews + attempt_outcome on agent_dispatches (additive).
-SCHEMA_VERSION = "15"
+SCHEMA_VERSION = "16"
 
 # D2 (Phase D): bounded JSON column budget enforced at the persistence gate.
 # Each handoff/checkpoint JSON column (result/artifacts/evidence/next-step/
@@ -489,6 +489,12 @@ _SCHEMA: tuple[str, ...] = (
         requirements_hash     TEXT NOT NULL,
         evidence_refs_json    TEXT NOT NULL,
         decision_sha256       TEXT NOT NULL,
+        registry_version      TEXT,
+        evidence_version      TEXT,
+        policy_hash           TEXT,
+        registry_hash         TEXT,
+        evidence_hash         TEXT,
+        inputs_hash           TEXT,
         created_at            TEXT NOT NULL
     )
     """,
@@ -1038,6 +1044,30 @@ class Store:
                     f"CHECK (source_class IS NULL OR source_class IN "
                     f"('{_ROUTING_SOURCE_CLASSES}'))"
                 )
+
+        # E3 (Phase E): decision provenance on routing_decisions (additive).
+        # ``registry_version``/``evidence_version`` pin the exact registry and
+        # evidence documents the decision was computed from; ``inputs_hash`` is
+        # the canonical sha256 of the decision's versioned inputs (CASE 16/17).
+        rdcols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(routing_decisions)")
+        }
+        for col, ddl in (
+            ("registry_version",
+             "ALTER TABLE routing_decisions ADD COLUMN registry_version TEXT"),
+            ("evidence_version",
+             "ALTER TABLE routing_decisions ADD COLUMN evidence_version TEXT"),
+            ("inputs_hash",
+             "ALTER TABLE routing_decisions ADD COLUMN inputs_hash TEXT"),
+            ("policy_hash",
+             "ALTER TABLE routing_decisions ADD COLUMN policy_hash TEXT"),
+            ("registry_hash",
+             "ALTER TABLE routing_decisions ADD COLUMN registry_hash TEXT"),
+            ("evidence_hash",
+             "ALTER TABLE routing_decisions ADD COLUMN evidence_hash TEXT"),
+        ):
+            if col not in rdcols:
+                self._conn.execute(ddl)
 
         # --- V4: owner-gate closure/binding fields (SPEC V2C §4.3) ---------
         # Additive columns only.  SQLite cannot reliably add a NOT NULL column
@@ -2339,6 +2369,8 @@ class Store:
                 "job_id", "provider", "model", "reasoning_level",
                 "escalation_level", "decision_reason_code", "policy_version",
                 "requirements_hash", "evidence_refs_json", "decision_sha256",
+                "registry_version", "evidence_version", "inputs_hash",
+                "policy_hash", "registry_hash", "evidence_hash",
             ):
                 if existing.get(field) != rec.get(field):
                     raise DispatchError(
@@ -2350,8 +2382,10 @@ class Store:
             "INSERT INTO routing_decisions (decision_id, job_id, "
             "provider, model, reasoning_level, escalation_level, "
             "decision_reason_code, policy_version, requirements_hash, "
-            "evidence_refs_json, decision_sha256, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "evidence_refs_json, decision_sha256, registry_version, "
+            "evidence_version, policy_hash, registry_hash, evidence_hash, "
+            "inputs_hash, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 rec["decision_id"],
                 rec["job_id"],
@@ -2364,6 +2398,12 @@ class Store:
                 rec["requirements_hash"],
                 rec["evidence_refs_json"],
                 rec["decision_sha256"],
+                rec.get("registry_version"),
+                rec.get("evidence_version"),
+                rec.get("policy_hash"),
+                rec.get("registry_hash"),
+                rec.get("evidence_hash"),
+                rec.get("inputs_hash"),
                 rec["created_at"],
             ),
         )

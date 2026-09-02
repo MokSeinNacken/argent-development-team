@@ -111,20 +111,77 @@ def _canonical_review_verdict(recommendation: str) -> str:
     return CANONICAL_VERDICT_REJECT
 
 
+def _is_sha256_hex(value) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdef" for c in value.lower())
+    )
+
+
 def _validate_routing_decision(decision, task_id: str, role: Role) -> None:
-    """F6: re-validate a RoutingDecision before it becomes the dispatch identity.
+    """F6/F3: re-validate a RoutingDecision before it becomes the dispatch identity.
 
     The router's decision is untrusted at the Core boundary; the Core
     recomputes its SHA and checks task/role/policy/level/reason-code
     consistency.  Any mismatch is a fail-closed :class:`RolePolicyViolation`
     (never a silent model_choice precedence).
+
+    F3 (E3 fix-round): the decision is bound to its canonical JSON in full —
+    every decision field must match the canonical content (so a tampered field,
+    even a well-formed one, is refused), and ``inputs_hash`` must be a real
+    64-hex digest that is itself part of the canonical binding.
     """
     from . import model_router
+    # 1. SHA binding: recompute + decision_id consistency.
     recomputed = hashlib.sha256(decision.canonical_json.encode("utf-8")).hexdigest()
     if recomputed != decision.sha256:
         raise RolePolicyViolation("routing_decision sha256 mismatch")
     if decision.decision_id != decision.sha256[:32]:
         raise RolePolicyViolation("routing_decision decision_id/sha256 mismatch")
+    # 2. Field binding against canonical_json (F3(d)): every decision field is
+    #    bound to the canonical content; a tampered field (even a well-formed
+    #    64-hex one) is refused because it no longer matches the canonical doc.
+    try:
+        canonical = json.loads(decision.canonical_json)
+    except (json.JSONDecodeError, TypeError):
+        raise RolePolicyViolation("routing_decision canonical_json is not valid JSON")
+    if not isinstance(canonical, dict):
+        raise RolePolicyViolation("routing_decision canonical_json is not an object")
+    field_checks = {
+        "job_id": decision.job_id,
+        "task_id": decision.task_id,
+        "role": decision.role,
+        "reference_model_id": decision.reference_model_id,
+        "independence_requirement": decision.independence_requirement,
+        "provider": decision.provider,
+        "model": decision.model,
+        "reasoning_level": decision.reasoning_level,
+        "escalation_level": decision.escalation_level,
+        "required_capabilities": sorted(decision.required_capabilities),
+        "reason_code": decision.decision_reason_code,
+        "policy_version": decision.policy_version,
+        "registry_version": decision.registry_version,
+        "evidence_version": decision.evidence_version,
+        "policy_hash": decision.policy_hash,
+        "registry_hash": decision.registry_hash,
+        "evidence_hash": decision.evidence_hash,
+        "inputs_hash": decision.inputs_hash,
+        "evidence_refs": list(decision.evidence_refs),
+    }
+    for field, expected in field_checks.items():
+        if canonical.get(field) != expected:
+            raise RolePolicyViolation(
+                f"routing_decision field {field!r} does not match canonical_json"
+            )
+    # 3. inputs_hash must be a real 64-hex digest.
+    if not _is_sha256_hex(decision.inputs_hash):
+        raise RolePolicyViolation("routing_decision inputs_hash is not a 64-hex digest")
+    # content digests must be 64-hex (present + bounded).
+    for fname in ("policy_hash", "registry_hash", "evidence_hash"):
+        if not _is_sha256_hex(getattr(decision, fname, None)):
+            raise RolePolicyViolation(f"routing_decision {fname} is not a 64-hex digest")
+    # 4. Bounded semantic checks.
     if decision.task_id != task_id:
         raise RolePolicyViolation(
             f"routing_decision task_id {decision.task_id!r} != {task_id!r}"
@@ -145,6 +202,17 @@ def _validate_routing_decision(decision, task_id: str, role: Role) -> None:
         raise RolePolicyViolation(
             f"routing_decision reason_code {decision.decision_reason_code!r} "
             "is not bounded"
+        )
+    from . import evidence_registry, model_registry
+    if decision.registry_version != model_registry.REGISTRY_VERSION:
+        raise RolePolicyViolation(
+            f"routing_decision registry_version {decision.registry_version!r} "
+            f"!= {model_registry.REGISTRY_VERSION!r}"
+        )
+    if decision.evidence_version != evidence_registry.EVIDENCE_REGISTRY_VERSION:
+        raise RolePolicyViolation(
+            f"routing_decision evidence_version {decision.evidence_version!r} "
+            f"!= {evidence_registry.EVIDENCE_REGISTRY_VERSION!r}"
         )
 
 # Map command name -> refetch kind (idempotent replay).
@@ -2031,6 +2099,12 @@ class Core:
                         list(routing_decision.evidence_refs), sort_keys=True
                     ),
                     "decision_sha256": routing_decision.sha256,
+                    "registry_version": routing_decision.registry_version,
+                    "evidence_version": routing_decision.evidence_version,
+                    "policy_hash": routing_decision.policy_hash,
+                    "registry_hash": routing_decision.registry_hash,
+                    "evidence_hash": routing_decision.evidence_hash,
+                    "inputs_hash": routing_decision.inputs_hash,
                     "created_at": self._store.now_iso(),
                 })
             did = str(uuid4())
@@ -2412,9 +2486,27 @@ class Core:
         reason: str,
         source: str,
         idempotency_key: Optional[str] = None,
+        error_class: Optional[str] = None,
+        error_code: Optional[str] = None,
     ) -> AgentDispatch:
         self._require_controller(source)
-        args = {"dispatch_id": dispatch_id, "reason": reason, "source": source}
+        # F2 (E3 fix-round): bounded failure signal.  A provider/transport
+        # failure (error_class PROVIDER/EXTERNAL/TRANSIENT, or a bounded
+        # provider-side error_code) persists a NON-CAPABILITY attempt outcome
+        # (PROVIDER/EXTERNAL/TRANSIENT) — the availability snapshot reads the
+        # PROVIDER outcome to mark a model UNAVAILABLE.  A plain code failure
+        # (no signal) remains CAPABILITY (E2 distinction).
+        if error_class is not None:
+            from . import job_state
+            valid = {e.value for e in job_state.ErrorClass}
+            if error_class not in valid:
+                raise DispatchError(f"invalid error_class {error_class!r}")
+        if error_code is not None and not isinstance(error_code, str):
+            raise DispatchError("error_code must be a string or None")
+        args = {
+            "dispatch_id": dispatch_id, "reason": reason, "source": source,
+            "error_class": error_class, "error_code": error_code,
+        }
 
         def work():
             d = self._store.get_dispatch(dispatch_id)
@@ -2432,9 +2524,14 @@ class Core:
             self._store._update_dispatch_status(
                 dispatch_id, DispatchStatus.FAILED, now
             )
-            # F4: a FAILED attempt with no transport signal is a deterministic
-            # code failure — persist its outcome at completion.
-            self._store._set_dispatch_attempt_outcome(dispatch_id, "CAPABILITY")
+            # F2 (E3 fix-round): classify the failure via the shared deterministic
+            # classifier (provider/transport signals are NEVER a capability gap).
+            from . import model_router
+            outcome = model_router.classify_attempt(
+                DispatchStatus.FAILED.value, error_class, False, False,
+                error_code=error_code,
+            )
+            self._store._set_dispatch_attempt_outcome(dispatch_id, outcome)
             active = self._store.get_active_role_run(d.task_id)
             if active is not None and active.role is d.role:
                 self._store._update_role_run_status(
