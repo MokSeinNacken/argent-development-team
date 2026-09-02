@@ -53,6 +53,7 @@
     "argent_core/test_inventory.py": "TEST_INFRA",
     "argent_core/change_impact.py": "TEST_INFRA",
     "argent_core/test_planning.py": "TEST_INFRA",
+    "argent_core/test_execution.py": "TEST_INFRA",
     "e2e-fixture/parser.py": "TEST_INFRA",
     "e2e-fixture/service.py": "TEST_INFRA"
   },

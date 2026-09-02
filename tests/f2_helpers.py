@@ -105,6 +105,9 @@ def mk_plan(
     )
     if plan_hash is None:
         plan = te.replace(plan, plan_hash=te.recompute_plan_hash(plan))
+    # F3 fix F1: sign the plan so execute_plan's plan-provenance check passes
+    # (mk_plan emulates the authoritative build_test_plan(mac_key=...) path).
+    plan = te.replace(plan, plan_mac=te.compute_plan_mac(plan, TEST_MAC_KEY))
     return plan
 
 
@@ -120,7 +123,7 @@ def stage(name, selectors, mandatory=()):
 def real_plan(*changed, **kw) -> TestPlan:
     inv = tp.load_inventory()
     pol = tp.load_policy()
-    return tp.build_test_plan(tp.ChangeEvidence(changed), pol, inv)
+    return tp.build_test_plan(tp.ChangeEvidence(changed), pol, inv, mac_key=TEST_MAC_KEY)
 
 
 def pass_record(selector, snapshot, plan) -> EvidenceRecord:
@@ -178,4 +181,5 @@ def exec_plan(
         resource_gate=resource_gate,
         store=store,
         project_root=project_root,
+        mac_key=TEST_MAC_KEY,
     )

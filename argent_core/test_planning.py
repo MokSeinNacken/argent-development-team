@@ -45,8 +45,9 @@ from __future__ import annotations
 
 import glob
 import hashlib
+import hmac
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -170,8 +171,29 @@ _PLANNER_OWNED_EXACT_PATHS: FrozenSet[str] = frozenset(
         "argent_core/test_planning.py",
         "argent_core/test_inventory.py",
         "argent_core/change_impact.py",
+        "argent_core/test_execution.py",
     }
 )
+
+#: Protected test-infra module basenames (F3 fix F4).  No ownership entry —
+#: whether by exact repo path or by bare basename — may map one of these to a
+#: non-TEST_INFRA subsystem.  This closes the basename-alias reclassification
+#: attack (removing the exact key and re-adding the bare basename as CORE).
+_TEST_INFRA_BASENAMES: FrozenSet[str] = frozenset(
+    {
+        "test_planning.py",
+        "test_inventory.py",
+        "change_impact.py",
+        "test_execution.py",
+        "test_inventory_v1.json",
+        "test_policy_v1.json",
+    }
+)
+
+#: The full-suite selector is a broad top-level CODE floor, not a configurable
+#: knob (F3 fix F5): it must name the entire test tree, never a single file or
+#: a narrower glob/directory.
+_FULL_SUITE_SELECTOR_FLOOR: str = "tests/"
 
 
 #: Bounded, known full-suite condition names referenced by the policy.  The
@@ -224,6 +246,47 @@ def canonical_bytes(obj: Any) -> bytes:
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def plan_content_payload(plan: "TestPlan") -> Dict[str, Any]:
+    """Canonical content of a :class:`TestPlan` — the single source of truth
+    for both ``plan_hash`` (unkeyed SHA-256) and ``plan_mac`` (keyed HMAC)."""
+    return {
+        "risk": plan.risk_level.value,
+        "full_suite_required": plan.full_suite_required,
+        "stages": [
+            {
+                "name": st.name,
+                "selectors": list(st.selectors),
+                "reasons": {s: list(r) for s, r in st.reasons.items()},
+                "mandatory": list(st.mandatory),
+            }
+            for st in plan.stages
+        ],
+        "policy_hash": plan.policy_hash,
+        "inventory_hash": plan.inventory_hash,
+        "change_set_hash": plan.change_set_hash,
+    }
+
+
+def recompute_plan_hash(plan: "TestPlan") -> str:
+    """Re-derive ``plan_hash`` from the authentic TestPlan content (F3)."""
+    return sha256_hex(canonical_bytes(plan_content_payload(plan)))
+
+
+def compute_plan_mac(plan: "TestPlan", key: bytes) -> str:
+    """HMAC-SHA256 over the canonical plan content (F3 fix F1: plan provenance).
+
+    ``plan_mac`` binds the plan to the F1 authority: only a plan authored by
+    :func:`build_test_plan` under the controller-held key carries a valid
+    ``plan_mac``.  ``execute_plan`` rejects any plan whose MAC does not verify
+    (fail-closed).  The MAC covers the same canonical fields as ``plan_hash``
+    plus the ``plan_hash`` itself.
+    """
+    payload = canonical_bytes(
+        {"plan_hash": plan.plan_hash, "content": plan_content_payload(plan)}
+    )
+    return hmac.new(bytes(key), payload, hashlib.sha256).hexdigest()
 
 
 def _no_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
@@ -451,6 +514,19 @@ class TestInventory:
                         f"inventory: planner-owned path {path!r} must be TEST_INFRA, got {sub!r}"
                     )
 
+        # F3 fix F4: protected test-infra basenames may not be reclassified via
+        # a bare-basename ownership key (basename-alias attack).  This covers
+        # both exact paths ("argent_core/test_execution.py") and bare keys
+        # ("test_execution.py").
+        for path, sub in ownership.items():
+            basename = path.rsplit("/", 1)[-1]
+            if basename in _TEST_INFRA_BASENAMES:
+                if sub != Subsystem.TEST_INFRA.value:
+                    raise InventoryError(
+                        f"inventory: protected test-infra basename {basename!r} "
+                        f"must be TEST_INFRA, got {sub!r} (path {path!r})"
+                    )
+
         # F9: reject ambiguous basenames (same basename -> different subsystems).
         basename_subsys: Dict[str, set] = {}
         for path, sub in ownership.items():
@@ -517,6 +593,14 @@ class TestInventory:
         if not isinstance(full_suite, str) or not full_suite:
             raise InventoryError("inventory: 'full_suite_selector' must be a non-empty string")
         _validate_selector(full_suite, InventoryError)
+        # F3 fix F5: the full suite is a broad top-level floor, never a single
+        # file or narrower selector (else inventory+policy could shrink the full
+        # suite to one test file and self-certify).
+        if full_suite != _FULL_SUITE_SELECTOR_FLOOR:
+            raise InventoryError(
+                f"inventory: full_suite_selector must be {_FULL_SUITE_SELECTOR_FLOOR!r} "
+                f"(broad top-level floor), got {full_suite!r}"
+            )
 
         return cls(
             version=version,
@@ -732,6 +816,13 @@ class TestPolicy:
                 raise PolicyError(f"policy: {name}.required_regression must be a list of strings")
             for sel in req:
                 _validate_selector(sel, PolicyError)
+            # F3 fix F5: the broad-regression floor for UNKNOWN / test-infra
+            # handling may not be emptied (else the required full suite could be
+            # the only selector and the mandatory breadth disappears).
+            if require_full_suite and not req:
+                raise PolicyError(
+                    f"policy: {name}.required_regression must be non-empty (broad regression floor)"
+                )
             fs = raw.get("full_suite", False)
             if not isinstance(fs, bool):
                 raise PolicyError(f"policy: {name}.full_suite must be bool")
@@ -805,6 +896,7 @@ class TestPlan:
     change_set_hash: str
     escalation_reasons: Tuple[str, ...]
     plan_hash: str
+    plan_mac: str = ""
 
     def all_selectors(self) -> Tuple[str, ...]:
         out: List[str] = []
@@ -967,10 +1059,15 @@ def build_test_plan(
     change_evidence: ChangeEvidence,
     policy: TestPolicy,
     inventory: TestInventory,
+    *,
+    mac_key: Optional[bytes] = None,
 ) -> TestPlan:
     """Deterministically build a staged, reproducible test plan.
 
     Same inputs -> same :class:`TestPlan` (including identical ``plan_hash``).
+    When ``mac_key`` is provided, the plan is additionally signed with
+    ``plan_mac`` (F3 fix F1): the controller passes the same key used for
+    evidence MACs, so only plans authored here carry valid provenance.
 
     Reasons are accumulated per selector (never lost to first-wins dedup), and
     every mandatory selector keeps an explicit mandatory marking (fix F8).
@@ -1091,28 +1188,7 @@ def build_test_plan(
         )
     )
 
-    plan_hash = sha256_hex(
-        canonical_bytes(
-            {
-                "risk": impact.risk_level.value,
-                "full_suite_required": full_required,
-                "stages": [
-                    {
-                        "name": st.name,
-                        "selectors": list(st.selectors),
-                        "reasons": {s: list(r) for s, r in st.reasons.items()},
-                        "mandatory": list(st.mandatory),
-                    }
-                    for st in stages
-                ],
-                "policy_hash": policy.content_hash,
-                "inventory_hash": inventory.content_hash,
-                "change_set_hash": change_set_hash,
-            }
-        )
-    )
-
-    return TestPlan(
+    plan = TestPlan(
         risk_level=impact.risk_level,
         documentation_only=impact.documentation_only,
         full_suite_required=full_required,
@@ -1123,8 +1199,13 @@ def build_test_plan(
         inventory_hash=inventory.content_hash,
         change_set_hash=change_set_hash,
         escalation_reasons=escalation,
-        plan_hash=plan_hash,
+        plan_hash="",
+        plan_mac="",
     )
+    plan = replace(plan, plan_hash=recompute_plan_hash(plan))
+    if mac_key is not None:
+        plan = replace(plan, plan_mac=compute_plan_mac(plan, mac_key))
+    return plan
 
 
 # ---------------------------------------------------------------------------

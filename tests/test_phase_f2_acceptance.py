@@ -19,6 +19,7 @@ from argent_core.test_execution import (
 )
 
 from f2_helpers import (
+    TEST_MAC_KEY,
     FakeGate,
     FakeRunner,
     exec_plan,
@@ -288,6 +289,7 @@ def test_case20_phase_closing_forces_full_suite():
         tp.ChangeEvidence(("docs/PHASE_F2_NOTES.md",), phase_closing=True),
         tp.load_policy(),
         tp.load_inventory(),
+        mac_key=TEST_MAC_KEY,
     )
     assert plan.full_suite_required
     runner = FakeRunner()

@@ -31,8 +31,18 @@ Fix-Round F1–F9 (see docs/PHASE_F2_NOTES.md § Fix-Round):
 - F9: snapshot scan excludes ``__pycache__``/``*.pyc``/``.pytest_cache``; store
   trims on load; summary/artifact_ref length limits enforced.
 
-This module is intentionally execution/evidence logic only.  F3 (adversarial
-acceptance + Phase-F closure) is out of scope here.
+This module is execution/evidence logic.  The F3 adversarial fix round added
+four code-enforced hardenings (see docs/PHASE_F3_ACCEPTANCE.md § Fix-Round):
+
+- F1: plan provenance via ``plan_mac`` (HMAC over the canonical plan content),
+  enforced in ``_validate_plan``; only ``build_test_plan`` can mint a valid MAC.
+- F2: when a real execution root is declared, ``execute_plan`` recomputes the
+  snapshot identity from the tree and verifies the caller's hashes.
+- F3: ``EvidenceStore`` single-writer fencing via a persisted ``store_generation``
+  (stale writes raise ``StaleWriteError``; per-instance ``.tmp`` + ``os.replace``).
+- F6: ``ExecutionReport.all_pass()`` requires an authoritative-origin binding;
+  a 0-stage plan yields BLOCKED, never DONE.
+- F7: MAC keys shorter than 16 bytes are rejected fail-closed.
 """
 
 from __future__ import annotations
@@ -46,7 +56,8 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, replace
+import uuid
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple
@@ -54,12 +65,20 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tupl
 from argent_core.test_planning import (
     TestPlan,
     canonical_bytes,
+    compute_plan_mac,
+    plan_content_payload,
+    recompute_plan_hash,
     sha256_hex,
     _ALLOWED_SELECTOR_ROOTS,
 )
 
 EXECUTOR_ID = "argent-test-executor-f2-v1"
 EVIDENCE_STORE_VERSION = "1"
+
+#: Minimum MAC key length in bytes (F3 fix F7): empty/whitespace/too-short keys
+#: are rejected fail-closed so no unkeyed or trivially guessable provenance can
+#: be minted.
+_MIN_MAC_KEY_BYTES = 16
 
 #: Environment variable that names a file holding the HMAC key (preferred).
 _MAC_KEY_FILE_ENV = "ARGENT_EVIDENCE_MAC_KEY_FILE"
@@ -619,31 +638,36 @@ def compute_evidence_mac(record: "EvidenceRecord", key: bytes) -> str:
 
 
 def _resolve_mac_key(mac_key: Optional[bytes]) -> bytes:
-    """Resolve the evidence MAC key, fail-closed (F4).
+    """Resolve the evidence MAC key, fail-closed (F4, F3 fix F7).
 
     Precedence: explicit ``mac_key`` argument -> ``ARGENT_EVIDENCE_MAC_KEY_FILE``
-    -> ``ARGENT_EVIDENCE_MAC_KEY``.  If none is available, raise ValueError —
-    the store must never silently downgrade to an unkeyed hash.
+    -> ``ARGENT_EVIDENCE_MAC_KEY``.  If none is available, or the resolved key
+    is shorter than ``_MIN_MAC_KEY_BYTES`` (empty/whitespace/too-short), raise
+    ``ValueError`` — the store must never silently downgrade to an unkeyed or
+    trivially guessable hash.
     """
     if mac_key is not None:
-        if isinstance(mac_key, str):
-            return mac_key.encode("utf-8")
-        return bytes(mac_key)
-    filepath = os.environ.get(_MAC_KEY_FILE_ENV)
-    if filepath:
-        raw = Path(filepath).read_bytes().strip()
-        if not raw:
-            raise ValueError("evidence MAC key file is empty")
-        return raw
-    raw = os.environ.get(_MAC_KEY_ENV)
-    if raw:
-        if not raw.strip():
-            raise ValueError("evidence MAC key is empty")
-        return raw.encode("utf-8")
-    raise ValueError(
-        "no evidence MAC key configured (set "
-        f"{_MAC_KEY_ENV} or {_MAC_KEY_FILE_ENV}); fail-closed"
-    )
+        key = mac_key.encode("utf-8") if isinstance(mac_key, str) else bytes(mac_key)
+    else:
+        filepath = os.environ.get(_MAC_KEY_FILE_ENV)
+        if filepath:
+            raw = Path(filepath).read_bytes().strip()
+            if not raw:
+                raise ValueError("evidence MAC key file is empty")
+            key = raw
+        else:
+            raw = os.environ.get(_MAC_KEY_ENV)
+            if not raw or not raw.strip():
+                raise ValueError(
+                    "no evidence MAC key configured (set "
+                    f"{_MAC_KEY_ENV} or {_MAC_KEY_FILE_ENV}); fail-closed"
+                )
+            key = raw.encode("utf-8")
+    if len(key) < _MIN_MAC_KEY_BYTES:
+        raise ValueError(
+            f"evidence MAC key too short ({len(key)} bytes < {_MIN_MAC_KEY_BYTES}); fail-closed"
+        )
+    return key
 
 
 @dataclass(frozen=True)
@@ -696,6 +720,12 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+class StaleWriteError(Exception):
+    """Raised when a store instance attempts to persist while a *different*
+    instance has already advanced the store generation (F3 fix F3: single-writer
+    fencing).  The stale instance is refused fail-closed; no silent overwrite."""
+
+
 class EvidenceStore:
     """Bounded, versioned, fail-closed, authenticated evidence store.
 
@@ -703,6 +733,12 @@ class EvidenceStore:
     Reuse looks up only exact-identity ``TEST_PASS`` records whose MAC still
     verifies under the store key.  The store trims to ``max_records`` on both
     add and load (F9).
+
+    Generation fencing (F3 fix F3): a monotonically increasing
+    ``store_generation`` is persisted; every ``add()``/``save()`` re-reads the
+    on-disk generation and refuses (``StaleWriteError``) if another instance
+    wrote in between.  Writes use a per-instance unique ``.tmp`` name + atomic
+    ``os.replace``, so a stale executor can never clobber a newer result.
     """
 
     def __init__(
@@ -718,6 +754,8 @@ class EvidenceStore:
         self._max_records = max_records
         self._now_fn = now_fn
         self._mac_key = _resolve_mac_key(mac_key)
+        self._instance_id = f"{os.getpid()}-{uuid.uuid4().hex}"
+        self._expected_generation = 0
         self._records: Dict[str, EvidenceRecord] = {}
         if self._path and self._path.exists():
             self._load()
@@ -756,6 +794,11 @@ class EvidenceStore:
         A record is reusable iff: classification == TEST_PASS, the identity
         fields all match, and the MAC verifies.  Anything else (FAIL, UNKNOWN,
         tampered, unknown provenance) returns ``None`` so the executor reruns.
+
+        Conflicting evidence is conservative: if a non-PASS record exists for
+        the *same* identity (e.g. a later FAIL on an otherwise identical
+        snapshot/selector/plan), the previously cached PASS is contradicted
+        and must NOT be trusted, so reuse is refused and the executor reruns.
         """
         want = {
             "selector": selector,
@@ -768,24 +811,47 @@ class EvidenceStore:
             "root": snapshot.root,
             "config_hash": snapshot.config_hash,
         }
+        pass_record: Optional[EvidenceRecord] = None
+        conflict = False
         for rec in self._records.values():
-            if rec.classification != ResultClass.TEST_PASS:
-                continue
             if rec.identity_fields() != want:
                 continue
-            if not self._verify_mac(rec):
-                continue
-            return rec
-        return None
+            if rec.classification == ResultClass.TEST_PASS:
+                if self._verify_mac(rec) and pass_record is None:
+                    pass_record = rec
+            else:
+                conflict = True
+        if conflict:
+            return None
+        return pass_record
 
     def records(self) -> Tuple[EvidenceRecord, ...]:
         return tuple(self._records.values())
 
     # -- persistence -----------------------------------------------------
+    def _read_disk_generation(self) -> int:
+        assert self._path is not None
+        try:
+            data = json.loads(self._path.read_text())
+        except (OSError, ValueError):
+            return 0  # absent/corrupt on-disk state -> treat as generation 0
+        gen = data.get("store_generation", 0)
+        if not isinstance(gen, int) or gen < 0:
+            return 0
+        return gen
+
     def _save(self) -> None:
         assert self._path is not None
+        on_disk = self._read_disk_generation()
+        if on_disk != self._expected_generation:
+            raise StaleWriteError(
+                f"evidence store advanced underneath this instance "
+                f"(expected generation {self._expected_generation}, on-disk {on_disk}); "
+                f"refusing stale write"
+            )
         payload = {
             "evidence_store_version": EVIDENCE_STORE_VERSION,
+            "store_generation": self._expected_generation + 1,
             "records": [
                 {
                     "selector": r.selector,
@@ -807,9 +873,10 @@ class EvidenceStore:
                 for r in self._records.values()
             ],
         }
-        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp = self._path.with_name(self._path.name + f".{self._instance_id}.tmp")
         tmp.write_text(json.dumps(payload, sort_keys=True, indent=1))
-        tmp.replace(self._path)
+        os.replace(str(tmp), str(self._path))
+        self._expected_generation += 1
 
     def _load(self) -> None:
         assert self._path is not None
@@ -823,6 +890,10 @@ class EvidenceStore:
             raise ValueError(f"evidence store unreadable/corrupt: {exc}") from exc
         if data.get("evidence_store_version") != EVIDENCE_STORE_VERSION:
             raise ValueError("evidence store version mismatch (fail-closed)")
+        gen = data.get("store_generation", 0)
+        if not isinstance(gen, int) or gen < 0:
+            raise ValueError("evidence store 'store_generation' must be a non-negative int")
+        self._expected_generation = gen
         recs = data.get("records")
         if not isinstance(recs, list):
             raise ValueError("evidence store 'records' must be a list")
@@ -903,52 +974,41 @@ class ExecutionReport:
     full_suite_avoided: bool = False
     wall_clock_seconds: float = 0.0
     total_tests: int = 0
+    #: Authoritative-origin binding (F3 fix F6): only ``execute_plan`` sets this
+    #: to True.  A directly constructed ``ExecutionReport(verdict=DONE, ...)``
+    #: therefore never satisfies ``all_pass()``.
+    _authoritative: bool = field(default=False, repr=False)
 
     def all_pass(self) -> bool:
-        return self.verdict == Verdict.DONE
+        return self.verdict == Verdict.DONE and self._authoritative
 
 
 # ---------------------------------------------------------------------------
-# Plan integrity (F3)
+# Plan integrity (F3) + plan provenance (F3 fix F1)
 # ---------------------------------------------------------------------------
+# ``recompute_plan_hash`` / ``compute_plan_mac`` / ``plan_content_payload`` are
+# imported from ``argent_core.test_planning`` (single source of truth for the
+# canonical plan content and its provenance bindings).
 
 
-def _plan_hash_payload(plan: TestPlan) -> Dict[str, Any]:
-    return {
-        "risk": plan.risk_level.value,
-        "full_suite_required": plan.full_suite_required,
-        "stages": [
-            {
-                "name": st.name,
-                "selectors": list(st.selectors),
-                "reasons": {s: list(r) for s, r in st.reasons.items()},
-                "mandatory": list(st.mandatory),
-            }
-            for st in plan.stages
-        ],
-        "policy_hash": plan.policy_hash,
-        "inventory_hash": plan.inventory_hash,
-        "change_set_hash": plan.change_set_hash,
-    }
-
-
-def recompute_plan_hash(plan: TestPlan) -> str:
-    """Re-derive ``plan_hash`` from the authentic TestPlan content (F3)."""
-    return sha256_hex(canonical_bytes(_plan_hash_payload(plan)))
-
-
-def _validate_plan(plan: TestPlan) -> None:
-    """Fail-closed plan integrity (F3).
+def _validate_plan(plan: TestPlan, mac_key: bytes) -> None:
+    """Fail-closed plan integrity (F3) + provenance (F3 fix F1).
 
     Rejects non-TestPlan (TypeError), a ``plan_hash`` that does not match the
-    authentic content, duplicated/unknown stage names, out-of-order stages,
-    empty stages/selectors, mandatory selectors not present in their stage, and
-    a missing ``full_suite`` stage when ``full_suite_required``.
+    authentic content, a missing/invalid ``plan_mac`` (plan not authored by the
+    F1 planner under the controller key), duplicated/unknown stage names,
+    out-of-order stages, empty stages/selectors, mandatory selectors not present
+    in their stage, and a missing ``full_suite`` stage when
+    ``full_suite_required``.
     """
     if not isinstance(plan, TestPlan):
         raise TypeError("execute_plan requires an F1 TestPlan")
     if plan.plan_hash != recompute_plan_hash(plan):
         raise ValueError("TestPlan.plan_hash does not match its content (tampered/malformed)")
+    if plan.plan_mac != compute_plan_mac(plan, mac_key):
+        raise ValueError(
+            "TestPlan.plan_mac is missing or invalid (plan not authored by the F1 planner); fail-closed"
+        )
     names = [st.name for st in plan.stages]
     if len(names) != len(set(names)):
         raise ValueError("TestPlan stage names must be unique")
@@ -1008,6 +1068,7 @@ def _blocked_no_gate(plan: TestPlan, snapshot: SnapshotIdentity) -> ExecutionRep
         first_failure_stage=plan.stages[0].name if plan.stages else None,
         first_failure_class=ResultClass.RESOURCE_FAILURE,
         stages_planned=len(plan.stages),
+        _authoritative=True,
     )
 
 
@@ -1019,14 +1080,20 @@ def execute_plan(
     resource_gate: Optional[ResourceGate] = None,
     store: Optional[EvidenceStore] = None,
     project_root: Optional[str] = None,
+    mac_key: Optional[bytes] = None,
 ) -> ExecutionReport:
     """Deterministically run the stages of an F1 TestPlan in order.
 
-    - Plan integrity is validated fail-closed at entry (F3).
+    - Plan integrity AND provenance are validated fail-closed at entry (F3 +
+      F1 fix): the plan must carry a valid ``plan_mac`` minted by
+      ``build_test_plan`` under the controller key.
+    - An empty plan (0 stages) yields BLOCKED, never DONE (F6 fix).
     - A missing resource gate is fail-closed (BLOCKED, RESOURCE_FAILURE); no
       silent AllowAll default (F6).  The gate is consulted before each stage.
-    - The snapshot root is validated against the execution root (F5); evidence
-      is bound to the canonical root + executor + config identity.
+    - The snapshot root is validated against the execution root (F5); when a
+      real root is declared, the snapshot identity is *recomputed* from the
+      actual tree and verified (F2 fix).  Evidence is bound to the canonical
+      root + executor + config identity.
     - Reuse: an exact-identity, MAC-verified PASS in ``store`` short-circuits.
     - A genuine TEST_FAILURE fails the stage and stops later stages (early
       failure stopping).  Other non-PASS outcomes BLOCK and stop.
@@ -1036,21 +1103,48 @@ def execute_plan(
     - The whole attempt is DONE only when every selector of every stage has
       valid PASS evidence (executed or exactly reused).
     """
-    _validate_plan(plan)
+    if not isinstance(plan, TestPlan):
+        raise TypeError("execute_plan requires an F1 TestPlan")
+    key = _resolve_mac_key(mac_key)
+    _validate_plan(plan, key)
+
+    # F3 fix F6: an empty plan (0 stages) can never produce a DONE verdict.
+    if not plan.stages:
+        return ExecutionReport(
+            plan_hash=plan.plan_hash,
+            snapshot=snapshot,
+            verdict=Verdict.BLOCKED,
+            stages=(),
+            stages_planned=0,
+            _authoritative=True,
+        )
 
     if resource_gate is None:
         return _blocked_no_gate(plan, snapshot)
     gate = resource_gate
 
-    # Root binding (F5): the snapshot must be computed from the same root the
-    # runner executes in.  Unbound snapshots (root == "") are allowed only when
-    # no execution root is declared (offline unit tests).
+    # Root binding (F5) + snapshot recompute (F3 fix F2): when a real execution
+    # root is declared, the snapshot identity is *recomputed* from the actual
+    # tree (source/test/config hashes) and compared — the caller's hashes are
+    # never trusted on faith.  Unbound snapshots (root == "") are only allowed
+    # when no execution root is declared (offline unit tests); that caller-
+    # promise is documented as OPERATIONALLY REQUIRED.
     declared_root = project_root or getattr(runner, "project_root", None)
     if declared_root is not None:
         canon = str(Path(declared_root).resolve())
         if snapshot.root and snapshot.root != canon:
             raise ValueError(
                 "snapshot root does not match the execution root (fail-closed)"
+            )
+        computed = compute_snapshot_identity(canon)
+        if (
+            snapshot.source_hash != computed.source_hash
+            or snapshot.test_definition_hash != computed.test_definition_hash
+            or snapshot.config_hash != computed.config_hash
+            or snapshot.executor_id != computed.executor_id
+        ):
+            raise ValueError(
+                "snapshot identity does not match the actual project root (fail-closed)"
             )
 
     start = time.monotonic()
@@ -1252,6 +1346,7 @@ def execute_plan(
         full_suite_avoided=full_suite_avoided,
         wall_clock_seconds=time.monotonic() - start,
         total_tests=total_tests,
+        _authoritative=True,
     )
 
 

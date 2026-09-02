@@ -155,7 +155,7 @@ def test_f3_plan_hash_tamper_rejected():
     plan = mk_plan([stage("targeted", ["tests/a.py"])])
     tampered = te.replace(plan, stages=(stage("targeted", ["tests/DIFFERENT.py"]),))
     with pytest.raises(ValueError):
-        te.execute_plan(tampered, FakeRunner(), snapshot=snap(), resource_gate=FakeGate())
+        te.execute_plan(tampered, FakeRunner(), snapshot=snap(), resource_gate=FakeGate(), mac_key=TEST_MAC_KEY)
 
 
 def test_f3_duplicate_stage_names_rejected():
@@ -163,13 +163,13 @@ def test_f3_duplicate_stage_names_rejected():
         [stage("targeted", ["tests/a.py"]), stage("targeted", ["tests/b.py"])]
     )
     with pytest.raises(ValueError):
-        te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=FakeGate())
+        te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=FakeGate(), mac_key=TEST_MAC_KEY)
 
 
 def test_f3_empty_stage_rejected():
     plan = mk_plan([stage("targeted", [])])
     with pytest.raises(ValueError):
-        te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=FakeGate())
+        te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=FakeGate(), mac_key=TEST_MAC_KEY)
 
 
 def test_f3_out_of_order_rejected():
@@ -177,13 +177,13 @@ def test_f3_out_of_order_rejected():
         [stage("full_suite", ["tests/"]), stage("targeted", ["tests/a.py"])]
     )
     with pytest.raises(ValueError):
-        te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=FakeGate())
+        te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=FakeGate(), mac_key=TEST_MAC_KEY)
 
 
 def test_f3_full_suite_missing_when_required():
     plan = mk_plan([stage("targeted", ["tests/a.py"])], full_suite_required=True)
     with pytest.raises(ValueError):
-        te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=FakeGate())
+        te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=FakeGate(), mac_key=TEST_MAC_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +227,7 @@ def test_f4_different_key_rejects(tmp_path):
     s = EvidenceStore(path=p, mac_key=TEST_MAC_KEY)
     s.add(pass_record("tests/a.py", snap(), plan))
     with pytest.raises(ValueError):
-        EvidenceStore(path=p, mac_key=b"a-different-key")
+        EvidenceStore(path=p, mac_key=b"a-different-key-0000000000000000")
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +278,7 @@ def test_f5_evidence_binds_root():
 
 def test_f6_no_gate_fails_closed():
     plan = mk_plan([stage("targeted", ["tests/a.py"])])
-    rep = te.execute_plan(plan, FakeRunner(), snapshot=snap())
+    rep = te.execute_plan(plan, FakeRunner(), snapshot=snap(), mac_key=TEST_MAC_KEY)
     assert rep.verdict == Verdict.BLOCKED
     assert rep.first_failure_class == ResultClass.RESOURCE_FAILURE
     assert rep.stages[0].state == StageState.BLOCKED
@@ -287,11 +287,11 @@ def test_f6_no_gate_fails_closed():
 def test_f6_resource_governor_gate_bridge():
     plan = mk_plan([stage("targeted", ["tests/a.py"])])
     allow = ResourceGovernorGate(lambda: _Decision("ALLOW"))
-    rep = te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=allow)
+    rep = te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=allow, mac_key=TEST_MAC_KEY)
     assert rep.verdict == Verdict.DONE
 
     deny = ResourceGovernorGate(lambda: _Decision("DENY_LOCAL", "DISK_LOW"))
-    rep2 = te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=deny)
+    rep2 = te.execute_plan(plan, FakeRunner(), snapshot=snap(), resource_gate=deny, mac_key=TEST_MAC_KEY)
     assert rep2.verdict == Verdict.BLOCKED
     assert rep2.first_failure_class == ResultClass.RESOURCE_FAILURE
 
