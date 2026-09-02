@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Callable, Optional, Protocol
 
 from . import job_state, notifications, outputs, workflow
+from . import model_router
 from .core import ReceiveResult
 from .notifications import NotificationStatus, NotificationType
 from .resource_policy import RESOURCE_CLASS_VALUES, ResourceClass
@@ -1517,6 +1518,9 @@ class Supervisor:
         retriever=None,
         checkpoint_store=None,
         handoff_builder=None,
+        # E2: optional router injection (tests pass a deterministic router or a
+        # custom policy; default = ModelRouter over the core's registry).
+        router=None,
     ):
         self.core = core
         self.controller_source = controller_source
@@ -1587,6 +1591,8 @@ class Supervisor:
         self._retriever = retriever
         self._checkpoint_store = checkpoint_store
         self._handoff_builder = handoff_builder
+        # E2: adaptive model router (default = ModelRouter over the core's registry).
+        self._router = router
 
     # ---------------------------------------------------------------- utils
 
@@ -3138,11 +3144,34 @@ class Supervisor:
         cycle, pos, attempt = self._frontier_attempt(task_id, f)
         key = (f"supervisor:{job['id']}:cycle:{cycle}:pos:{pos}:"
                f"attempt:{attempt}:create-dispatch")
+
+        # E2: compute the adaptive routing decision from trusted facts (never
+        # agent prose).  A terminal decision (no candidate / owner gate) is
+        # fail-closed into the existing BLOCKED mechanism.
+        router = self._routing_engine()
+        routing_decision = None
+        try:
+            request = self._build_routing_request(job, task_id, role, cycle, pos, attempt)
+            routing_decision = router.route(request, now_iso=self._now_iso())
+        except model_router.RoutingError as exc:
+            self._close_job(job, "BLOCKED", reason=exc.code)
+            return ActionOutcome("CREATE_DISPATCH", "failed", exc.code)
+        if routing_decision.is_terminal:
+            self._close_job(job, "BLOCKED", reason=routing_decision.decision_reason_code)
+            return ActionOutcome("CREATE_DISPATCH", "failed",
+                                 routing_decision.decision_reason_code)
+        # F6(c): the decision must be bound to THIS job (the Core verifies
+        # task/role/policy/level/reason/SHA; the job binding is supervisor-side).
+        if routing_decision.job_id != job["id"]:
+            self._close_job(job, "BLOCKED", reason="ROUTING_DECISION_JOB_MISMATCH")
+            return ActionOutcome("CREATE_DISPATCH", "failed", "job_mismatch")
+
         args_hash = _sha256(_canonical_json({
             "task_id": task_id, "task_run_id": task_run.id, "role": role.value,
             "position": pos, "cycle_no": cycle,
             "sequence_kind": f.sequence_kind.value, "model_choice": None,
             "source": self.controller_source, "parent_dispatch_id": None,
+            "routing_decision": routing_decision.sha256,
         }))
         row, outcome = self._begin_action(key, "CREATE_DISPATCH", job, None, args_hash)
         if outcome == "succeeded":
@@ -3159,6 +3188,7 @@ class Supervisor:
             d = self.core.create_dispatch(
                 task_id, task_run.id, role, pos, cycle, f.sequence_kind, None,
                 self.controller_source, idempotency_key=key,
+                routing_decision=routing_decision,
             )
         except ArgentError as exc:
             self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
@@ -3166,6 +3196,134 @@ class Supervisor:
                                  f"{type(exc).__name__}")
         self._finish_action(row["id"], "SUCCEEDED")
         return ActionOutcome("CREATE_DISPATCH", "executed", dispatch_id=d.id)
+
+    # -- E2 routing helpers -------------------------------------------------
+
+    def _routing_engine(self):
+        """Lazily build the adaptive model router over the core's registry."""
+        if self._router is None:
+            self._router = model_router.ModelRouter(
+                registry=self.core._model_registry(),
+            )
+        return self._router
+
+    def _build_routing_request(self, job, task_id, role, cycle, pos, attempt):
+        task = self.core._store.get_task(task_id)
+        risk_class = task.risk_class.value if task is not None else "NORMAL"
+        evidence = self._build_routing_evidence(task_id, job, role)
+
+        reference_model_id = None
+        independence = None
+        if role is Role.REVIEWER:
+            # F1: a closing review is ALWAYS writer-independent (bootstrap
+            # semantics).  The hard constraint is set unconditionally; when the
+            # task has no valid writer reference, the router fails closed
+            # (terminal NO_ELIGIBLE_CANDIDATE -> BLOCKED), never a same-model
+            # fallback.
+            independence = "DIFFERENT_MODEL_REQUIRED"
+            writer_id = job.get("writer_dispatch_id")
+            if writer_id:
+                writer = self.core._store.get_dispatch(writer_id)
+                if writer is not None and writer.expected_model_class:
+                    reference_model_id = writer.expected_model_class
+
+        current = self._current_escalation_level(task_id, role)
+        return model_router.RoutingRequest(
+            job_id=job["id"],
+            task_id=task_id,
+            role=role.value,
+            risk_class=risk_class,
+            reference_model_id=reference_model_id,
+            independence_requirement=independence,
+            evidence=evidence,
+            current_escalation_level=current,
+        )
+
+    def _current_escalation_level(self, task_id, role) -> int:
+        """Max persisted escalation level among prior dispatches for this role.
+
+        (CASE 14: a reopen continues on the reached level, never resets to 0.)
+        """
+        levels = [
+            d.escalation_level
+            for d in self.core._store.list_dispatches(task_id)
+            if d.role is role
+        ]
+        return max(levels, default=0)
+
+    def _build_routing_evidence(self, task_id, job, role):
+        from .models import SOURCE_CLASS_CONTROLLER
+        dispatches = self.core._store.list_dispatches(task_id)
+        test_runs = self.core._store.list_test_runs(task_id)
+        reviews = self.core._store.list_reviews(task_id)
+        findings = self.core._store.list_findings(task_id)
+
+        # F2(b): only controller-persisted test outcomes (the supervisor's
+        # RUN_SANDBOX_TESTS -> record_test_run) are controlled test evidence.
+        # Agent-written QA test_runs never drive routing triggers.
+        controlled_tests = tuple(
+            t for t in test_runs if t.source_class == SOURCE_CLASS_CONTROLLER
+        )
+        tests = tuple(
+            (t.result.value if hasattr(t.result, "value") else str(t.result))
+            for t in controlled_tests
+        )
+        # F2(a): reviews carry ONLY canonical verdicts (core canonicalises at
+        # persist); the canonical reject is the bounded reviewer signal.
+        verdicts = tuple(r.verdict for r in reviews)
+        tests_red = bool(tests and tests[-1] == "failed")
+        reviewer_rejected = any(v == "reject" for v in verdicts)
+        error_class = job.get("error_class") or "NONE"
+
+        prior = []
+        for d in dispatches:
+            if d.role is not role:
+                continue
+            # F4: use the outcome persisted at attempt completion; fall back to
+            # the deterministic classifier only for legacy/unclassified attempts.
+            outcome_class = d.attempt_outcome
+            if outcome_class is None:
+                outcome_class = model_router.classify_attempt(
+                    d.status.value, error_class, tests_red, reviewer_rejected,
+                )
+            prior.append(model_router.AttemptEvidence(
+                attempt_no=d.attempt_no,
+                model_id=d.expected_model_class,
+                reasoning_level=model_router.thinking_to_reasoning(
+                    d.expected_thinking_tier),
+                outcome_class=outcome_class,
+                status=d.status.value,
+                sequence_kind=d.sequence_kind.value,
+                escalation_level=d.escalation_level,
+            ))
+        prior = tuple(sorted(prior, key=lambda a: (a.attempt_no, a.model_id or "")))
+
+        # F2(c): findings influence routing only when controller-confirmed.
+        controlled_findings = tuple(
+            f for f in findings if f.source_class == SOURCE_CLASS_CONTROLLER
+        )
+        open_findings = sum(1 for f in controlled_findings if f.status.value == "open")
+        confirmed = any(f.status.value == "resolved" for f in controlled_findings)
+        task = self.core._store.get_task(task_id)
+        risk_high = task.risk_class.value == "HIGH" if task is not None else False
+        # security_relevant only from controller facts: task HIGH risk, OR an
+        # already-reached escalation level >= 2, OR a controller-confirmed
+        # high/critical finding.  Agent severity claims never influence it.
+        reached_escalation = self._current_escalation_level(task_id, role) >= 2
+        controller_severity = any(
+            (f.severity or "").lower() in {"high", "critical"}
+            for f in controlled_findings
+        )
+        security_relevant = risk_high or reached_escalation or controller_severity
+
+        return model_router.RoutingEvidence(
+            prior_attempts=prior,
+            test_results=tests,
+            reviewer_verdicts=verdicts,
+            open_findings_count=open_findings,
+            confirmed_finding=confirmed,
+            security_relevant=security_relevant,
+        )
 
     def _perform_spawn_run(self, decision, job):
         dispatch_id = decision.dispatch_id
@@ -4613,6 +4771,13 @@ class Supervisor:
             self.core.record_test_run(
                 d.task_id, result, role_source, detail="supervisor sandbox run",
                 idempotency_key=key,
+            )
+            # F4: bind the controlled sandbox test outcome to the attempt NOW
+            # (then-valid facts) — the code either passed or failed.  This is
+            # the only authoritative outcome; it is never re-derived later.
+            self.core._store._set_dispatch_attempt_outcome(
+                dispatch_id,
+                "SUCCESS" if result == "passed" else "CAPABILITY",
             )
         except ArgentError as exc:
             self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")

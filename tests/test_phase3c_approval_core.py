@@ -144,8 +144,8 @@ def _column_names(core, table):
 # Schema V6
 # ---------------------------------------------------------------------------
 
-def test_schema_version_is_13():
-    assert SCHEMA_VERSION == "13"
+def test_schema_version_is_15():
+    assert SCHEMA_VERSION == "15"
 
 
 def test_fresh_db_has_v6_tables_and_version(db_path, core):

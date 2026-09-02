@@ -288,6 +288,15 @@ class Handoff:
     created_at: str
 
 
+# Provenance of routing-relevant evidence rows (F2).  ``controller`` rows are
+# authoritative (written by Core public APIs / Supervisor controlled actions);
+# ``agent`` rows are derived from validated-but-untrusted agent output and must
+# never by themselves drive routing escalation.  ``None`` (legacy) is treated as
+# NOT-controller when the routing evidence collector filters provenance.
+SOURCE_CLASS_CONTROLLER = "controller"
+SOURCE_CLASS_AGENT = "agent"
+
+
 @dataclass(frozen=True)
 class Finding:
     id: str
@@ -297,6 +306,7 @@ class Finding:
     status: FindingStatus
     created_at: str
     resolved_at: Optional[str] = None
+    source_class: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -306,6 +316,7 @@ class TestRun:
     result: TestResult
     detail: Optional[str]
     created_at: str
+    source_class: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -315,6 +326,7 @@ class Review:
     verdict: str
     detail: Optional[str]
     created_at: str
+    source_class: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -401,6 +413,13 @@ class AgentDispatch:
     created_at: str
     started_at: Optional[str]
     consumed_at: Optional[str]
+    routing_decision_id: Optional[str] = None
+    escalation_level: int = 0
+    routing_reason_code: Optional[str] = None
+    # F4: bounded outcome class persisted by the controller WHEN the attempt
+    # terminally completes (then-valid facts), never re-derived later from
+    # global state.  ``None`` = not yet classified (legacy/injected).
+    attempt_outcome: Optional[str] = None
 
 
 @dataclass(frozen=True)

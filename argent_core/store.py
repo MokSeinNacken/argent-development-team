@@ -49,6 +49,7 @@ from .models import (
     AgentResultQuarantine,
     ApprovalStatus,
     Decision,
+    DispatchError,
     DispatchStatus,
     Event,
     ExternalActionsPolicy,
@@ -86,7 +87,11 @@ from .handoff import HANDOFF_VERSION as HANDOFF_RECORD_VERSION
 # D1 (Phase D): immutable context-pack metadata (context_packs table, additive).
 # D2 (Phase D): structured handoffs (handoffs_v2) + immutable checkpoints
 # (checkpoints) — additive, non-destructive (B4 migration pattern).
-SCHEMA_VERSION = "13"
+# E2 (Phase E): routing_decisions (INSERT-only decision ledger) + routing
+# metadata on agent_dispatches (additive).
+# E2 fix-round (F2/F4): provenance marker (source_class) on findings/test_runs/
+# reviews + attempt_outcome on agent_dispatches (additive).
+SCHEMA_VERSION = "15"
 
 # D2 (Phase D): bounded JSON column budget enforced at the persistence gate.
 # Each handoff/checkpoint JSON column (result/artifacts/evidence/next-step/
@@ -162,6 +167,7 @@ _ROLE_VALUES = "', '".join(r.value for r in Role)
 _ROLE_RUN_STATUSES = "', '".join(s.value for s in RoleRunStatus)
 _APPROVAL_STATUSES = "', '".join(s.value for s in ApprovalStatus)
 _SOURCE_CLASSES = "', '".join(s.value for s in SourceClass)
+_ROUTING_SOURCE_CLASSES = "', '".join(("controller", "agent"))
 _EXECUTION_STATUSES = "', '".join(s.value for s in ActionExecutionStatus)
 _RISK_CLASSES = "', '".join(r.value for r in RiskClass)
 _EXT_ACTION_POLICIES = "', '".join(p.value for p in ExternalActionsPolicy)
@@ -275,7 +281,7 @@ _SCHEMA: tuple[str, ...] = (
         idempotency_key TEXT UNIQUE
     )
     """,
-    """
+    f"""
     CREATE TABLE IF NOT EXISTS findings (
         id             TEXT PRIMARY KEY,
         task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -284,26 +290,29 @@ _SCHEMA: tuple[str, ...] = (
         status         TEXT NOT NULL,
         created_at     TEXT NOT NULL,
         resolved_at    TEXT,
+        source_class   TEXT CHECK (source_class IS NULL OR source_class IN ('{_ROUTING_SOURCE_CLASSES}')),
         idempotency_key TEXT UNIQUE
     )
     """,
-    """
+    f"""
     CREATE TABLE IF NOT EXISTS test_runs (
         id             TEXT PRIMARY KEY,
         task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         result         TEXT NOT NULL,
         detail         TEXT,
         created_at     TEXT NOT NULL,
+        source_class   TEXT CHECK (source_class IS NULL OR source_class IN ('{_ROUTING_SOURCE_CLASSES}')),
         idempotency_key TEXT UNIQUE
     )
     """,
-    """
+    f"""
     CREATE TABLE IF NOT EXISTS reviews (
         id             TEXT PRIMARY KEY,
         task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
         verdict        TEXT NOT NULL,
         detail         TEXT,
         created_at     TEXT NOT NULL,
+        source_class   TEXT CHECK (source_class IS NULL OR source_class IN ('{_ROUTING_SOURCE_CLASSES}')),
         idempotency_key TEXT UNIQUE
     )
     """,
@@ -398,6 +407,10 @@ _SCHEMA: tuple[str, ...] = (
         attempt_no          INTEGER NOT NULL DEFAULT 1,
         handoff_id          TEXT,
         result_json         TEXT,
+        routing_decision_id TEXT,
+        escalation_level    INTEGER NOT NULL DEFAULT 0 CHECK (escalation_level IN (0,1,2,3,4)),
+        routing_reason_code TEXT,
+        attempt_outcome     TEXT,
         created_at          TEXT NOT NULL,
         started_at          TEXT,
         consumed_at         TEXT
@@ -457,6 +470,26 @@ _SCHEMA: tuple[str, ...] = (
         expansion_reason  TEXT,
         artifact_location TEXT,
         created_at        TEXT NOT NULL
+    )
+    """,
+    # E2 (Phase E): INSERT-only routing-decision ledger.  A decision is a pure
+    # deterministic function of (registry, policy, request, evidence); the row
+    # is never mutated after insert (INSERT OR IGNORE by deterministic
+    # decision_id).  Bounded evidence refs only (never agent output).
+    """
+    CREATE TABLE IF NOT EXISTS routing_decisions (
+        decision_id           TEXT PRIMARY KEY,
+        job_id                TEXT NOT NULL,
+        provider              TEXT,
+        model                 TEXT,
+        reasoning_level       TEXT,
+        escalation_level      INTEGER NOT NULL CHECK (escalation_level IN (0,1,2,3,4)),
+        decision_reason_code  TEXT NOT NULL,
+        policy_version        TEXT NOT NULL,
+        requirements_hash     TEXT NOT NULL,
+        evidence_refs_json    TEXT NOT NULL,
+        decision_sha256       TEXT NOT NULL,
+        created_at            TEXT NOT NULL
     )
     """,
     # D2 (Phase D): structured handoff records (handoffs_v2).  Bounded JSON
@@ -970,6 +1003,41 @@ class Store:
                 "ALTER TABLE agent_dispatches ADD COLUMN "
                 "expected_thinking_tier TEXT NOT NULL DEFAULT 'medium'"
             )
+
+        # --- E2 (Phase E): routing metadata on agent_dispatches (additive) --
+        # ``routing_decision_id`` links to the INSERT-only routing_decisions
+        # ledger; ``escalation_level``/``routing_reason_code`` are denormalised
+        # for fast history reconstruction (CASE 14).  SQLite supports CHECK on
+        # ADD COLUMN (same pattern as the B1/C1 columns).
+        if "routing_decision_id" not in dcols:
+            self._conn.execute(
+                "ALTER TABLE agent_dispatches ADD COLUMN routing_decision_id TEXT"
+            )
+        if "escalation_level" not in dcols:
+            self._conn.execute(
+                "ALTER TABLE agent_dispatches ADD COLUMN escalation_level "
+                "INTEGER NOT NULL DEFAULT 0 CHECK (escalation_level IN (0,1,2,3,4))"
+            )
+        if "routing_reason_code" not in dcols:
+            self._conn.execute(
+                "ALTER TABLE agent_dispatches ADD COLUMN routing_reason_code TEXT"
+            )
+        # E2 fix-round (F4): bounded outcome class per attempt (additive).
+        if "attempt_outcome" not in dcols:
+            self._conn.execute(
+                "ALTER TABLE agent_dispatches ADD COLUMN attempt_outcome TEXT"
+            )
+
+        # E2 fix-round (F2): provenance marker on evidence rows (additive).
+        for table in ("findings", "test_runs", "reviews"):
+            tcols = {r[1] for r in self._conn.execute(
+                f"PRAGMA table_info({table})")}
+            if "source_class" not in tcols:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN source_class TEXT "
+                    f"CHECK (source_class IS NULL OR source_class IN "
+                    f"('{_ROUTING_SOURCE_CLASSES}'))"
+                )
 
         # --- V4: owner-gate closure/binding fields (SPEC V2C §4.3) ---------
         # Additive columns only.  SQLite cannot reliably add a NOT NULL column
@@ -1710,7 +1778,8 @@ class Store:
     def _insert_finding(self, f: Finding) -> None:
         self._conn.execute(
             "INSERT INTO findings (id, task_id, severity, description, status, "
-            "created_at, resolved_at, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "created_at, resolved_at, source_class, idempotency_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 f.id,
                 f.task_id,
@@ -1719,6 +1788,7 @@ class Store:
                 f.status.value,
                 f.created_at,
                 f.resolved_at,
+                f.source_class,
                 None,
             ),
         )
@@ -1737,6 +1807,7 @@ class Store:
             status=FindingStatus(row["status"]),
             created_at=row["created_at"],
             resolved_at=row["resolved_at"],
+            source_class=row["source_class"],
         )
 
     def _update_finding_status(
@@ -1763,6 +1834,7 @@ class Store:
                 status=FindingStatus(r["status"]),
                 created_at=r["created_at"],
                 resolved_at=r["resolved_at"],
+                source_class=r["source_class"],
             )
             for r in rows
         ]
@@ -1772,8 +1844,9 @@ class Store:
     def _insert_test_run(self, tr: TestRun) -> None:
         self._conn.execute(
             "INSERT INTO test_runs (id, task_id, result, detail, created_at, "
-            "idempotency_key) VALUES (?, ?, ?, ?, ?, ?)",
-            (tr.id, tr.task_id, tr.result.value, tr.detail, tr.created_at, None),
+            "source_class, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tr.id, tr.task_id, tr.result.value, tr.detail, tr.created_at,
+             tr.source_class, None),
         )
 
     def get_test_run(self, run_id: str) -> Optional[TestRun]:
@@ -1788,6 +1861,7 @@ class Store:
             result=TestResult(row["result"]),
             detail=row["detail"],
             created_at=row["created_at"],
+            source_class=row["source_class"],
         )
 
     def list_test_runs(self, task_id: Optional[str] = None) -> list[TestRun]:
@@ -1804,6 +1878,7 @@ class Store:
                 result=TestResult(r["result"]),
                 detail=r["detail"],
                 created_at=r["created_at"],
+                source_class=r["source_class"],
             )
             for r in rows
         ]
@@ -1813,8 +1888,9 @@ class Store:
     def _insert_review(self, rev) -> None:
         self._conn.execute(
             "INSERT INTO reviews (id, task_id, verdict, detail, created_at, "
-            "idempotency_key) VALUES (?, ?, ?, ?, ?, ?)",
-            (rev.id, rev.task_id, rev.verdict, rev.detail, rev.created_at, None),
+            "source_class, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (rev.id, rev.task_id, rev.verdict, rev.detail, rev.created_at,
+             rev.source_class, None),
         )
 
     def get_review(self, review_id: str):
@@ -1831,6 +1907,7 @@ class Store:
             verdict=row["verdict"],
             detail=row["detail"],
             created_at=row["created_at"],
+            source_class=row["source_class"],
         )
 
     # -- decisions -----------------------------------------------------------
@@ -1892,6 +1969,7 @@ class Store:
                 verdict=r["verdict"],
                 detail=r["detail"],
                 created_at=r["created_at"],
+                source_class=r["source_class"],
             )
             for r in rows
         ]
@@ -2150,9 +2228,10 @@ class Store:
             "expected_thinking_tier, child_session_id, openclaw_run_id, "
             "actual_provider, actual_model, thinking_tier, status, cycle_no, "
             "position, sequence_kind, attempt_no, handoff_id, result_json, "
-            "created_at, started_at, consumed_at) "
+            "routing_decision_id, escalation_level, routing_reason_code, "
+            "attempt_outcome, created_at, started_at, consumed_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, ?, ?)",
+            "?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 d.id,
                 d.task_id,
@@ -2174,6 +2253,10 @@ class Store:
                 d.attempt_no,
                 d.handoff_id,
                 d.result_json,
+                d.routing_decision_id,
+                d.escalation_level,
+                d.routing_reason_code,
+                d.attempt_outcome,
                 d.created_at,
                 d.started_at,
                 d.consumed_at,
@@ -2211,6 +2294,10 @@ class Store:
             attempt_no=row["attempt_no"],
             handoff_id=row["handoff_id"],
             result_json=row["result_json"],
+            routing_decision_id=row["routing_decision_id"],
+            escalation_level=row["escalation_level"],
+            routing_reason_code=row["routing_reason_code"],
+            attempt_outcome=row["attempt_outcome"],
             created_at=row["created_at"],
             started_at=row["started_at"],
             consumed_at=row["consumed_at"],
@@ -2235,6 +2322,67 @@ class Store:
         q += " ORDER BY cycle_no, position, attempt_no"
         rows = self._conn.execute(q, params).fetchall()
         return [self._row_to_dispatch(r) for r in rows]
+
+    # -- routing decisions (E2, INSERT-only) -------------------------------
+
+    def _insert_routing_decision(self, rec: dict) -> None:
+        """Insert a routing decision, fail-closed on a decision_id conflict (F6).
+
+        The decision is a pure function of its inputs; a repeat insert of the
+        IDENTICAL decision (same content) is a no-op.  A decision_id collision
+        with DIFFERENT content (a different ``decision_sha256``) is an error —
+        never a silent keep-the-first-evidence ``INSERT OR IGNORE``.
+        """
+        existing = self.get_routing_decision(rec["decision_id"])
+        if existing is not None:
+            for field in (
+                "job_id", "provider", "model", "reasoning_level",
+                "escalation_level", "decision_reason_code", "policy_version",
+                "requirements_hash", "evidence_refs_json", "decision_sha256",
+            ):
+                if existing.get(field) != rec.get(field):
+                    raise DispatchError(
+                        f"routing_decision {rec['decision_id']!r} collision: "
+                        f"field {field!r} differs from the persisted decision"
+                    )
+            return
+        self._conn.execute(
+            "INSERT INTO routing_decisions (decision_id, job_id, "
+            "provider, model, reasoning_level, escalation_level, "
+            "decision_reason_code, policy_version, requirements_hash, "
+            "evidence_refs_json, decision_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                rec["decision_id"],
+                rec["job_id"],
+                rec.get("provider"),
+                rec.get("model"),
+                rec.get("reasoning_level"),
+                rec["escalation_level"],
+                rec["decision_reason_code"],
+                rec["policy_version"],
+                rec["requirements_hash"],
+                rec["evidence_refs_json"],
+                rec["decision_sha256"],
+                rec["created_at"],
+            ),
+        )
+
+    def get_routing_decision(self, decision_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM routing_decisions WHERE decision_id = ?", (decision_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_routing_decisions(self, job_id: Optional[str] = None) -> list[dict]:
+        q = "SELECT * FROM routing_decisions"
+        params: list = []
+        if job_id is not None:
+            q += " WHERE job_id = ?"
+            params.append(job_id)
+        q += " ORDER BY created_at, decision_id"
+        rows = self._conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
 
     def _update_dispatch_bind(
         self,
@@ -2284,6 +2432,26 @@ class Store:
         cur = self._conn.execute(
             "UPDATE agent_dispatches SET status = ? WHERE id = ?",
             (status.value, dispatch_id),
+        )
+        return cur.rowcount
+
+    def _set_dispatch_attempt_outcome(
+        self, dispatch_id: str, attempt_outcome: str
+    ) -> int:
+        """Persist the bounded outcome class for a terminally-completed attempt.
+
+        F4: the controller records the outcome ONCE at completion (then-valid
+        facts); it is never re-derived later from global state.  The value must
+        be one of the bounded ``model_router._ATTEMPT_OUTCOMES`` vocabulary.
+        """
+        from . import model_router
+        if attempt_outcome not in model_router._ATTEMPT_OUTCOMES:
+            raise ValueError(
+                f"invalid attempt_outcome {attempt_outcome!r}"
+            )
+        cur = self._conn.execute(
+            "UPDATE agent_dispatches SET attempt_outcome = ? WHERE id = ?",
+            (attempt_outcome, dispatch_id),
         )
         return cur.rowcount
 

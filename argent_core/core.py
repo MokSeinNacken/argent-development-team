@@ -76,6 +76,8 @@ from .models import (
     UntrustedSource,
     Event,
     Review,
+    SOURCE_CLASS_CONTROLLER,
+    SOURCE_CLASS_AGENT,
 )
 from .roles import DEFAULT_NEXT_ROLE
 from .state_machine import PAUSE_STATES, TERMINAL_STATES, is_actionable, is_valid_resume_target
@@ -83,6 +85,67 @@ from .store import Queries, Store, utcnow
 from .trust import role_source
 
 APPROVAL_TTL_SECONDS = 3600
+
+# F2: canonical bounded reviewer verdicts.  Free-text agent recommendation is
+# mapped to one of these two values at persistence; the raw text is NEVER a
+# verdict (it lands in the untrusted ``detail`` column).  Unknown/unrecognized
+# recommendations fail closed (→ reject, never approve).
+CANONICAL_VERDICT_APPROVE = "approve"
+CANONICAL_VERDICT_REJECT = "reject"
+_REVIEWER_REJECT_RECOMMENDATIONS = frozenset({
+    "reject", "rejected", "request_changes", "changes_requested",
+    "fail", "failed", "revise", "rework", "no",
+})
+_REVIEWER_APPROVE_RECOMMENDATIONS = frozenset({
+    "approve", "approved", "accept", "accepted", "pass", "passed", "yes", "ok",
+})
+
+
+def _canonical_review_verdict(recommendation: str) -> str:
+    """Map a free-text reviewer recommendation to a bounded canonical verdict."""
+    v = (recommendation or "").strip().lower()
+    if v in _REVIEWER_REJECT_RECOMMENDATIONS:
+        return CANONICAL_VERDICT_REJECT
+    if v in _REVIEWER_APPROVE_RECOMMENDATIONS:
+        return CANONICAL_VERDICT_APPROVE
+    return CANONICAL_VERDICT_REJECT
+
+
+def _validate_routing_decision(decision, task_id: str, role: Role) -> None:
+    """F6: re-validate a RoutingDecision before it becomes the dispatch identity.
+
+    The router's decision is untrusted at the Core boundary; the Core
+    recomputes its SHA and checks task/role/policy/level/reason-code
+    consistency.  Any mismatch is a fail-closed :class:`RolePolicyViolation`
+    (never a silent model_choice precedence).
+    """
+    from . import model_router
+    recomputed = hashlib.sha256(decision.canonical_json.encode("utf-8")).hexdigest()
+    if recomputed != decision.sha256:
+        raise RolePolicyViolation("routing_decision sha256 mismatch")
+    if decision.decision_id != decision.sha256[:32]:
+        raise RolePolicyViolation("routing_decision decision_id/sha256 mismatch")
+    if decision.task_id != task_id:
+        raise RolePolicyViolation(
+            f"routing_decision task_id {decision.task_id!r} != {task_id!r}"
+        )
+    if decision.role != role.value:
+        raise RolePolicyViolation(
+            f"routing_decision role {decision.role!r} != {role.value!r}"
+        )
+    if decision.policy_version != model_router.ROUTING_POLICY_VERSION:
+        raise RolePolicyViolation(
+            f"routing_decision policy_version {decision.policy_version!r} "
+            f"!= {model_router.ROUTING_POLICY_VERSION!r}"
+        )
+    if not (0 <= decision.escalation_level <= 4):
+        raise RolePolicyViolation("routing_decision escalation_level out of range")
+    bounded = {c.value for c in model_router.RoutingReasonCode}
+    if decision.decision_reason_code not in bounded:
+        raise RolePolicyViolation(
+            f"routing_decision reason_code {decision.decision_reason_code!r} "
+            "is not bounded"
+        )
 
 # Map command name -> refetch kind (idempotent replay).
 _REPLAY_KIND: dict[str, str] = {
@@ -1250,7 +1313,8 @@ class Core:
             fid = str(uuid4())
             f = Finding(id=fid, task_id=task_id, severity=severity,
                         description=description, status=FindingStatus.OPEN,
-                        created_at=self._store.now_iso())
+                        created_at=self._store.now_iso(),
+                        source_class=SOURCE_CLASS_CONTROLLER)
             self._store._insert_finding(f)
             self._emit("finding.created", task_id=task_id,
                        payload={"finding_id": fid, "severity": severity})
@@ -1305,7 +1369,8 @@ class Core:
             self._require_active_role_in(task_id, (Role.QA, Role.IMPLEMENTER), source)
             rid = str(uuid4())
             tr = TestRun(id=rid, task_id=task_id, result=result, detail=detail,
-                         created_at=self._store.now_iso())
+                         created_at=self._store.now_iso(),
+                         source_class=SOURCE_CLASS_CONTROLLER)
             self._store._insert_test_run(tr)
             self._emit("test.started", task_id=task_id,
                        payload={"test_run_id": rid})
@@ -1333,13 +1398,17 @@ class Core:
                 raise NotFound(f"task {task_id!r} not found")
             self._require_active_role_in(task_id, (Role.REVIEWER,), source)
             rid = str(uuid4())
-            rv = Review(id=rid, task_id=task_id, verdict=verdict, detail=detail,
-                        created_at=self._store.now_iso())
+            rv = Review(id=rid, task_id=task_id,
+                        verdict=_canonical_review_verdict(verdict),
+                        detail=detail,
+                        created_at=self._store.now_iso(),
+                        source_class=SOURCE_CLASS_CONTROLLER)
             self._store._insert_review(rv)
             self._emit("review.started", task_id=task_id,
                        payload={"review_id": rid})
             self._emit("review.completed", task_id=task_id,
-                       payload={"review_id": rid, "verdict": verdict})
+                       payload={"review_id": rid,
+                                "verdict": _canonical_review_verdict(verdict)})
             return rv, rid
 
         return self._idempotent(idempotency_key, "record_review", args, work,
@@ -1539,6 +1608,7 @@ class Core:
                     description=description,
                     status=FindingStatus.OPEN,
                     created_at=now,
+                    source_class=SOURCE_CLASS_AGENT,
                 )
             )
             self._emit("finding.created", task_id=d.task_id,
@@ -1599,6 +1669,7 @@ class Core:
                     result=self._coerce_result(result),
                     detail=name or None,
                     created_at=now,
+                    source_class=SOURCE_CLASS_AGENT,
                 )
                 self._store._insert_test_run(tr)
                 self._emit("test.started", task_id=d.task_id,
@@ -1607,7 +1678,10 @@ class Core:
                            payload={"test_run_id": tr.id, "result": tr.result.value})
         elif d.role is Role.REVIEWER:
             rid = str(uuid4())
-            verdict = str(validated.get("recommendation", ""))
+            recommendation = str(validated.get("recommendation", ""))
+            verdict = _canonical_review_verdict(recommendation)
+            # F2: the free-text recommendation is UNTRUSTED detail only; the
+            # bounded canonical verdict is the only value that may drive routing.
             detail = json.dumps(
                 {
                     "severity": validated.get("severity", ""),
@@ -1615,6 +1689,7 @@ class Core:
                     "architecture_findings": validated.get(
                         "architecture_findings", []
                     ),
+                    "recommendation": recommendation,
                 },
                 sort_keys=True,
             )
@@ -1625,6 +1700,7 @@ class Core:
                     verdict=verdict,
                     detail=detail,
                     created_at=now,
+                    source_class=SOURCE_CLASS_AGENT,
                 )
             )
             self._emit("review.started", task_id=d.task_id,
@@ -1771,9 +1847,34 @@ class Core:
         source: str,
         parent_dispatch_id: Optional[str] = None,
         idempotency_key: Optional[str] = None,
+        routing_decision=None,
     ) -> AgentDispatch:
         self._require_controller(source)
         role = self._coerce_role(role)
+        # F6: the routing decision must be a real RoutingDecision, and it is
+        # mutually exclusive with an explicit model_choice (no silent
+        # model_choice precedence).
+        if routing_decision is not None:
+            from . import model_router
+            if not isinstance(routing_decision, model_router.RoutingDecision):
+                self._emit(
+                    "policy.role_violation",
+                    task_id=task_id, role=role.value,
+                    payload={"reason": "routing_decision_type"},
+                )
+                raise RolePolicyViolation(
+                    "routing_decision must be a RoutingDecision instance"
+                )
+            if model_choice is not None:
+                self._emit(
+                    "policy.role_violation",
+                    task_id=task_id, role=role.value,
+                    payload={"reason": "model_choice_and_decision"},
+                )
+                raise RolePolicyViolation(
+                    "model_choice and routing_decision are mutually exclusive"
+                )
+            _validate_routing_decision(routing_decision, task_id, role)
         sequence_kind = (
             sequence_kind
             if isinstance(sequence_kind, SequenceKind)
@@ -1789,6 +1890,10 @@ class Core:
             "model_choice": model_choice,
             "source": source,
             "parent_dispatch_id": parent_dispatch_id,
+            "routing_decision_id": (
+                routing_decision.decision_id
+                if routing_decision is not None else None
+            ),
         }
 
         # Resolve/validate the model choice up front (outside the idempotent
@@ -1798,12 +1903,32 @@ class Core:
         if task0 is None:
             raise NotFound(f"task {task_id!r} not found")
         if model_choice is None:
-            provider, model, thinking = routing.resolve_model(role, task0.risk_class)
+            if routing_decision is not None:
+                # Phase E2 (router-authorized): the RoutingDecision IS the
+                # identity authority (provider/model/reasoning).  The role-policy
+                # check below is replaced by decision consistency + registry
+                # identity (validated in ``work()``).  A terminal/empty decision
+                # must never be dispatched.
+                provider = routing_decision.provider
+                model = routing_decision.model
+                thinking = routing_decision.thinking_tier()
+                if provider is None or model is None or thinking is None:
+                    self._emit(
+                        "policy.role_violation",
+                        task_id=task_id,
+                        role=role.value,
+                        payload={"reason": "router_decision_terminal"},
+                    )
+                    raise RolePolicyViolation(
+                        f"router decision for {role.value} has no dispatch identity"
+                    )
+            else:
+                provider, model, thinking = routing.resolve_model(role, task0.risk_class)
         else:
             provider = model_choice.get("provider")
             model = model_choice.get("model")
             thinking = model_choice.get("thinking_tier")
-        if not routing.validate_model_choice(
+        if routing_decision is None and not routing.validate_model_choice(
             role, provider, model, thinking, task0.risk_class
         ):
             self._emit(
@@ -1885,6 +2010,29 @@ class Core:
             # unavailable identity raises a bounded ModelRegistryError and NO
             # dispatch is created.
             self._model_registry().validate_identity(provider, model, thinking)
+            routing_decision_id = None
+            escalation_level = 0
+            routing_reason_code = None
+            if routing_decision is not None:
+                routing_decision_id = routing_decision.decision_id
+                escalation_level = routing_decision.escalation_level
+                routing_reason_code = routing_decision.decision_reason_code
+                self._store._insert_routing_decision({
+                    "decision_id": routing_decision.decision_id,
+                    "job_id": routing_decision.job_id,
+                    "provider": provider,
+                    "model": model,
+                    "reasoning_level": routing_decision.reasoning_level,
+                    "escalation_level": escalation_level,
+                    "decision_reason_code": routing_reason_code,
+                    "policy_version": routing_decision.policy_version,
+                    "requirements_hash": routing_decision.requirements_hash,
+                    "evidence_refs_json": json.dumps(
+                        list(routing_decision.evidence_refs), sort_keys=True
+                    ),
+                    "decision_sha256": routing_decision.sha256,
+                    "created_at": self._store.now_iso(),
+                })
             did = str(uuid4())
             d = AgentDispatch(
                 id=did,
@@ -1907,6 +2055,9 @@ class Core:
                 attempt_no=attempt_no,
                 handoff_id=handoff_id,
                 result_json=None,
+                routing_decision_id=routing_decision_id,
+                escalation_level=escalation_level,
+                routing_reason_code=routing_reason_code,
                 created_at=self._store.now_iso(),
                 started_at=None,
                 consumed_at=None,
@@ -1990,10 +2141,17 @@ class Core:
             task = self._store.get_task(d.task_id)
             # V2.2 (F4): exact equality of every spawn value with the expected
             # values, ADDITIONALLY to the role policy (validate_model_choice).
-            policy_ok = routing.validate_model_choice(
-                d.role, actual_provider, actual_model, thinking_tier,
-                task.risk_class,
-            )
+            # E2: a router-authorized dispatch (has a routing_decision_id) is
+            # exempt from the ROLE-bound policy (the router already authorised
+            # the identity, e.g. implementer->sol on objective escalation) but
+            # the exact-equality check still applies below.
+            if d.routing_decision_id is not None:
+                policy_ok = True
+            else:
+                policy_ok = routing.validate_model_choice(
+                    d.role, actual_provider, actual_model, thinking_tier,
+                    task.risk_class,
+                )
             exact_ok = (
                 actual_provider == d.expected_agent_class
                 and actual_model == d.expected_model_class
@@ -2216,6 +2374,12 @@ class Core:
             )
             return ReceiveResult(dispatch_id, "duplicate")
 
+        # F4: the attempt produced a valid, consumed result — persist its
+        # outcome (SUCCESS) at completion.  A later controlled test/reviewer
+        # signal may refine the WRITER attempt's outcome separately; this
+        # attempt's own outcome is fixed here, never re-derived later.
+        self._store._set_dispatch_attempt_outcome(dispatch_id, "SUCCESS")
+
         self._emit(
             "agent.result_received",
             task_id=d.task_id,
@@ -2268,6 +2432,9 @@ class Core:
             self._store._update_dispatch_status(
                 dispatch_id, DispatchStatus.FAILED, now
             )
+            # F4: a FAILED attempt with no transport signal is a deterministic
+            # code failure — persist its outcome at completion.
+            self._store._set_dispatch_attempt_outcome(dispatch_id, "CAPABILITY")
             active = self._store.get_active_role_run(d.task_id)
             if active is not None and active.role is d.role:
                 self._store._update_role_run_status(

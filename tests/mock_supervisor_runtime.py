@@ -226,6 +226,22 @@ class AutoRunStatusProvider:
                 dispatch_id=lookup.dispatch_id, role=Role.LEAD,
                 status=RunStatus.NOT_FOUND, authoritative_not_found=True,
             )
+        # E2 F1: the closing review is ALWAYS writer-independent.  Once the QA
+        # step completes (the last write step before the reviewer), bind the
+        # job's writer to the last implementer dispatch so the happy-path
+        # reviewer can dispatch a DIFFERENT model (offline test infra for the
+        # external writer-binding concern).
+        if d.role is Role.QA and d.child_session_id is not None:
+            writers = [
+                x for x in self.core.queries.list_dispatches(d.task_id)
+                if x.role is Role.IMPLEMENTER
+            ]
+            if writers:
+                self.core._store._conn.execute(
+                    "UPDATE supervisor_jobs SET writer_dispatch_id = ? "
+                    "WHERE task_id = ?",
+                    (writers[-1].id, d.task_id),
+                )
         provider, model, thinking, session = canonical_binding(d)
         if d.child_session_id is None:
             return make_run_observation(

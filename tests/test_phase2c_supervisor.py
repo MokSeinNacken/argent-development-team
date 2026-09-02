@@ -209,8 +209,29 @@ def bind_running(env, role):
     return d, session
 
 
+def _bind_writer(env):
+    """Bind the job's writer to the last implementer dispatch (test infra).
+
+    E2 F1: the closing review is ALWAYS writer-independent.  Real writer binding
+    is an external (Phase B3/I) concern; the offline test harness binds the last
+    implementer dispatch so the happy-path reviewer can dispatch a DIFFERENT
+    model.  Tests that exercise the no-writer fail-closed path do NOT call this.
+    """
+    writers = [
+        d for d in env.core.queries.list_dispatches(env.task.id)
+        if d.role is Role.IMPLEMENTER
+    ]
+    if writers:
+        env.core._store._conn.execute(
+            "UPDATE supervisor_jobs SET writer_dispatch_id = ? WHERE id = ?",
+            (writers[-1].id, env.job.supervisor_job_id),
+        )
+
+
 def drive_frontier(env, role, result_fn=None):
     """Drive START_ROLE -> CREATE_DISPATCH -> BIND -> (write preconds) -> CONSUME."""
+    if role is Role.REVIEWER:
+        _bind_writer(env)
     advance(env, ReconcileAction.START_ROLE)
     advance(env, ReconcileAction.CREATE_DISPATCH)
     dispatch = env.core.queries.list_dispatches(env.task.id)[-1]
@@ -3273,6 +3294,8 @@ def _drive_to_role_dispatch(env, role):
         if r is role:
             break
         drive_frontier(env, r)
+    if role is Role.REVIEWER:
+        _bind_writer(env)
     advance(env, ReconcileAction.START_ROLE)
     advance(env, ReconcileAction.CREATE_DISPATCH)
     d = env.core.queries.list_dispatches(env.task.id)[-1]

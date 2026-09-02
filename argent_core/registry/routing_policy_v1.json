@@ -1,0 +1,106 @@
+{
+  "policy_version": "1",
+  "bootstrap": true,
+  "benchmark_required_for_new_models": true,
+  "escalation": {
+    "max_automatic_level": 3,
+    "owner_level": 4,
+    "level_names": {
+      "0": "ROUTINE",
+      "1": "IMPLEMENTATION",
+      "2": "DEEP_REASONING",
+      "3": "MAX_APPROVED",
+      "4": "OWNER"
+    }
+  },
+  "reasoning": {
+    "level_defaults": {
+      "0": "MEDIUM",
+      "1": "MEDIUM",
+      "2": "HIGH",
+      "3": "HIGH"
+    },
+    "level_ceilings": {
+      "0": "MEDIUM",
+      "1": "MEDIUM",
+      "2": "HIGH",
+      "3": "HIGH"
+    }
+  },
+  "level_min_tiers": {
+    "0": 0,
+    "1": 1,
+    "2": 2,
+    "3": 2
+  },
+  "model_tiers": {
+    "deepseek-v4-flash": 0,
+    "deepseek-v4-pro": 1,
+    "gpt-5.6-sol": 2
+  },
+  "profiles": {
+    "lead": {
+      "roles": ["lead"],
+      "required_capabilities": ["COORDINATION"],
+      "minimum_reasoning_level": "HIGH",
+      "entry_level": 2,
+      "allowed_models": ["gpt-5.6-sol"]
+    },
+    "analyst": {
+      "roles": ["analyst"],
+      "required_capabilities": ["SIMPLE_ANALYSIS", "REPOSITORY_REASONING"],
+      "minimum_reasoning_level": "MEDIUM",
+      "entry_level": 1,
+      "allowed_models": ["deepseek-v4-pro", "gpt-5.6-sol"]
+    },
+    "implementer": {
+      "roles": ["implementer"],
+      "required_capabilities": ["CODE_IMPLEMENTATION"],
+      "minimum_reasoning_level": "MEDIUM",
+      "entry_level": 1,
+      "low_risk_entry_level": 0,
+      "allowed_models": ["deepseek-v4-flash", "deepseek-v4-pro", "gpt-5.6-sol"]
+    },
+    "qa": {
+      "roles": ["qa"],
+      "required_capabilities": ["CODE_IMPLEMENTATION"],
+      "minimum_reasoning_level": "MEDIUM",
+      "entry_level": 1,
+      "low_risk_entry_level": 0,
+      "allowed_models": ["deepseek-v4-flash", "deepseek-v4-pro", "gpt-5.6-sol"]
+    },
+    "reviewer": {
+      "roles": ["reviewer"],
+      "required_capabilities": ["CODE_REVIEW", "REPOSITORY_REASONING"],
+      "minimum_reasoning_level": "HIGH",
+      "entry_level": 2,
+      "allowed_models": ["gpt-5.6-sol"],
+      "independence": "DIFFERENT_MODEL_REQUIRED"
+    }
+  },
+  "escalation_profiles": {
+    "security_review": {
+      "roles": ["reviewer"],
+      "required_capabilities": ["SECURITY_REVIEW", "REPOSITORY_REASONING"],
+      "minimum_reasoning_level": "HIGH",
+      "entry_level": 2,
+      "allowed_models": ["gpt-5.6-sol"]
+    },
+    "deep_analysis": {
+      "roles": ["analyst"],
+      "required_capabilities": ["REPOSITORY_REASONING"],
+      "minimum_reasoning_level": "HIGH",
+      "entry_level": 2,
+      "allowed_models": ["gpt-5.6-sol"]
+    },
+    "root_cause_analysis": {
+      "roles": ["implementer", "qa"],
+      "required_capabilities": ["ROOT_CAUSE_ANALYSIS", "REPOSITORY_REASONING"],
+      "minimum_reasoning_level": "HIGH",
+      "entry_level": 2,
+      "allowed_models": ["gpt-5.6-sol"]
+    }
+  },
+  "cost_order": ["LOW", "MEDIUM", "HIGH", "UNKNOWN"],
+  "latency_order": ["LOW", "MEDIUM", "HIGH", "UNKNOWN"]
+}

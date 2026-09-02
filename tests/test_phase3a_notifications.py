@@ -144,7 +144,22 @@ def _bind_and_succeed(env, dispatch_id, role, result):
     return session, run_id
 
 
+def _bind_writer(env):
+    """Bind the job's writer to the last implementer dispatch (test infra)."""
+    writers = [
+        d for d in env.core.queries.list_dispatches(env.task.id)
+        if d.role is Role.IMPLEMENTER
+    ]
+    if writers:
+        env.core._store._conn.execute(
+            "UPDATE supervisor_jobs SET writer_dispatch_id = ? WHERE id = ?",
+            (writers[-1].id, env.job.supervisor_job_id),
+        )
+
+
 def drive_frontier(env, role, result_fn=None):
+    if role is Role.REVIEWER:
+        _bind_writer(env)
     advance(env, ReconcileAction.START_ROLE)
     advance(env, ReconcileAction.CREATE_DISPATCH)
     dispatch = env.core.queries.list_dispatches(env.task.id)[-1]
