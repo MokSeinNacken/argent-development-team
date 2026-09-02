@@ -548,6 +548,12 @@ class CheckpointStore:
         handoff ids + known pack id → content_hash).  Missing facts are left as
         empty defaults so :func:`checkpoint_references_valid` fails closed on
         them — never guessed.
+
+        D3: ``artifact_hashes`` is now populated (best effort, bounded) for the
+        artifact refs declared by the LATEST checkpoint, so a handoff's
+        content-hashed artifact refs can be verified across a restart.  A
+        missing/unreadable/oversized file is omitted (no hash) — which
+        :func:`checkpoint_references_valid` treats as stale (fail-closed).
         """
         job = self._store.get_supervisor_job(job_id) or {}
         worktree_path = job.get("canonical_worktree_path") or ""
@@ -569,16 +575,42 @@ class CheckpointStore:
         for row in self._store.list_context_packs(job_id):
             known_packs[row["context_pack_id"]] = row["content_hash"]
 
+        # D3: bounded file hashes for the checkpoint's declared artifact refs.
+        artifact_hashes = self._artifact_hashes(job_id, worktree_path)
+
         return {
             "job_id": job_id,
             "worktree_path": worktree_path,
             "repo_identity": repo_identity,
             "base_commit": base_commit,
             "head_commit": head_commit,
-            "artifact_hashes": {},
+            "artifact_hashes": artifact_hashes,
             "known_handoff_ids": known_handoff_ids,
             "known_packs": known_packs,
         }
+
+    def _artifact_hashes(self, job_id: str, worktree_path: str) -> dict:
+        """Bounded best-effort ``{ref: sha256}`` for the latest checkpoint's refs."""
+        from .artifact_refs import resolve_ref_within, sha256_file
+
+        if not worktree_path:
+            return {}
+        latest = None
+        try:
+            latest = self.latest_checkpoint(job_id)
+        except Exception:
+            latest = None
+        if latest is None:
+            return {}
+        out: dict = {}
+        for ref, _expected in latest.context.selected_artifact_refs:
+            path = resolve_ref_within(worktree_path, ref)
+            if path is None:
+                continue
+            digest = sha256_file(path)
+            if digest is not None:
+                out[ref] = digest
+        return out
 
 
 # ---------------------------------------------------------------------------

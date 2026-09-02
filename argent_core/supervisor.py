@@ -3545,13 +3545,86 @@ class Supervisor:
 
     # -- D2: structured handoff + checkpoint persistence --------------------
 
+    def _write_scope_paths(self, dispatch_id: str) -> frozenset:
+        """Authoritative broker write paths for a dispatch (patch_set_json).
+
+        The dispatch's committed APPLY_PATCH_SET rows carry the persisted
+        ``patch_set_json`` of the writes the broker actually applied.  Their
+        ``path`` fields are the ONLY broker-authoritative write scope for this
+        dispatch (never agent prose).  Empty on any parse failure (fail-closed).
+        """
+        paths = set()
+        for a in self._committed_apply_intents(dispatch_id):
+            raw = a.get("patch_set_json")
+            if not raw:
+                continue
+            try:
+                patch_set = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(patch_set, list):
+                continue
+            for patch in patch_set:
+                if isinstance(patch, dict):
+                    p = patch.get("path")
+                    if isinstance(p, str) and p:
+                        paths.add(p)
+        return frozenset(paths)
+
+    def _artifact_write_scope(self, d, job) -> frozenset:
+        """Authoritative write/diff scope (broker evidence + git diff) for F1.
+
+        The union of the dispatch's broker write paths and the job worktree's
+        ``git diff --name-only HEAD`` (bounded).  A declared ``changed_files``
+        path is only accepted as an artifact ref when it is confirmed here.
+        """
+        scope = set(self._write_scope_paths(d.id))
+        worktree = job.get("canonical_worktree_path") or ""
+        git = self._git_provenance_provider
+        if worktree and git is not None:
+            try:
+                scope.update(git.changed_paths(worktree))
+            except Exception:
+                pass
+        return frozenset(scope)
+
+    @staticmethod
+    def _in_test_scope(ref) -> bool:
+        """True if a declared ``tests_run`` ref belongs to the allowed test scope.
+
+        A test path is under a ``tests/`` (or ``test/``) directory, or named
+        ``test_*.py`` / ``*_test.py``.  Anything else is NOT test scope and is
+        dropped (an agent cannot smuggle arbitrary files through ``tests_run``).
+        """
+        if not isinstance(ref, str) or not ref.strip():
+            return False
+        norm = ref.replace("\\", "/")
+        parts = [p for p in norm.split("/") if p not in ("", ".")]
+        if not parts:
+            return False
+        base = parts[-1].lower()
+        dirs = {p.lower() for p in parts[:-1]}
+        if "tests" in dirs or "test" in dirs:
+            return True
+        if base.startswith("test_") and base.endswith(".py"):
+            return True
+        if base.endswith("_test.py"):
+            return True
+        return False
+
     def _default_handoff_record(self, d, job, envelope):
         """Build a bounded HandoffRecord from a validated envelope (best effort).
 
-        Extracts only bounded text fields (status/proposal/own_assessment/
-        findings/decision/recommendation/blockers).  Artifact refs WITH hashes
-        are intentionally NOT synthesized here (that needs git/artifact hashing,
-        wired in D3); the record therefore carries zero filesystem reads.
+        Extracts bounded text fields (status/proposal/own_assessment/findings/
+        decision/recommendation/blockers) AND — wired in D3 — bounded
+        artifact/diff refs WITH full-file sha256 content hashes + git revision
+        (via ``GitProvenanceProvider``) for the files the envelope declares.
+        A declared ref is embedded ONLY when it is authoritatively confirmed
+        (write/diff scope or allowed test scope — F1) and passes the
+        secret/forbidden-path deny-list.  Only refs + hashes + bounded excerpts
+        are embedded (never whole files, never secrets).  Unconfirmed/missing/
+        unreadable/foreign files are skipped and the handoff stays valid (best
+        effort, never block).
         """
         def _bounded(v, limit):
             s = str(v or "")
@@ -3579,12 +3652,48 @@ class Supervisor:
             for v in (envelope.get(k) or [])[:8]:
                 unresolved.append(_bounded(v, 1024))
 
+        # D3 (F1): bounded artifact/diff refs WITH hashes + git revision.  The
+        # ref list comes from the envelope's declared changed files / tests, but
+        # a ref is ONLY accepted when it is confirmed by authoritative evidence
+        # — never agent prose alone:
+        #   * ``changed_files`` must be in the write/diff scope (broker write
+        #     evidence + ``git diff --name-only HEAD``);
+        #   * ``tests_run`` must belong to the allowed test scope.
+        # Everything is additionally filtered by the secret/forbidden-path
+        # deny-list inside ``build_bounded_artifact_refs``.  Unconfirmed paths
+        # are dropped; the handoff stays valid (best effort, never block).
+        worktree = job.get("canonical_worktree_path") or ""
+        revision = ""
+        try:
+            if worktree:
+                git = self._git_provenance_provider
+                revision = (git.head(worktree) if git is not None else "") or ""
+        except Exception:
+            revision = ""
+        revision = revision or job.get("current_head") or \
+            job.get("expected_head") or ""
+
+        changed_files = envelope.get("changed_files") or ()
+        tests_run = envelope.get("tests_run") or ()
+        write_scope = self._artifact_write_scope(d, job)
+        confirmed = []
+        for ref in changed_files:
+            if isinstance(ref, str) and ref in write_scope:
+                confirmed.append(ref)
+        for ref in tests_run:
+            if isinstance(ref, str) and self._in_test_scope(ref):
+                confirmed.append(ref)
+        artifacts = handoff_mod.build_bounded_artifact_refs(
+            confirmed, worktree_root=worktree or None, revision=revision)
+        commit_refs = (revision,) if revision else ()
+        diff_refs = tuple(sorted({a.ref for a in artifacts}))
+
         evidence = handoff_mod.HandoffEvidence(
             test_refs=tuple(_bounded(t, 512) for t in
                             (envelope.get("tests_run") or
                              envelope.get("tests") or [])[:16]),
-            commit_refs=(),
-            diff_refs=(),
+            commit_refs=commit_refs,
+            diff_refs=diff_refs,
             trusted_facts=(),
             observations=tuple(key_observations),
         )
@@ -3610,6 +3719,7 @@ class Supervisor:
                 decisions=tuple(decisions),
                 unresolved_questions=tuple(unresolved),
             ),
+            artifacts=artifacts,
             evidence=evidence,
             next_step=nxt,
             provenance=prov,
@@ -3664,7 +3774,8 @@ class Supervisor:
                     arts = json.loads(latest_ho.get("artifacts_json") or "[]")
                     artifact_refs = tuple(
                         (a.get("ref", ""), a.get("content_hash", ""))
-                        for a in arts if a.get("ref")
+                        for a in arts
+                        if a.get("ref") and a.get("content_hash")
                     )
                 except Exception:
                     artifact_refs = ()

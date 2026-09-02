@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import AbstractSet, Optional, Sequence
 
 from .models import ArgentError, Role
 from .context_pack import ContextError
@@ -45,6 +45,7 @@ MAX_QUESTION_LEN = 2048
 MAX_ARTIFACTS = 128
 MAX_ARTIFACT_REF_LEN = 512
 MAX_ARTIFACT_EXCERPT_LEN = 8192
+MAX_ARTIFACT_REVISION_LEN = 64
 MAX_EVIDENCE_REFS = 128
 MAX_EVIDENCE_REF_LEN = 512
 MAX_FACT_LEN = 2048
@@ -104,6 +105,7 @@ class HandoffArtifact:
     ref: str
     content_hash: str = ""
     excerpt: str = ""
+    revision: str = ""  # git HEAD revision at handoff time (bounded)
 
 
 @dataclass(frozen=True)
@@ -168,7 +170,8 @@ def _canonical_doc(rec: HandoffRecord) -> dict:
             "unresolved_questions": list(rec.result.unresolved_questions),
         },
         "artifacts": [
-            {"ref": a.ref, "content_hash": a.content_hash, "excerpt": a.excerpt}
+            {"ref": a.ref, "content_hash": a.content_hash, "excerpt": a.excerpt,
+             "revision": a.revision}
             for a in rec.artifacts
         ],
         "evidence": {
@@ -285,6 +288,9 @@ def validate_handoff_record(rec: HandoffRecord) -> None:
             raise ValueError(f"artifact excerpt exceeds {MAX_ARTIFACT_EXCERPT_LEN} chars")
         if a.content_hash and not _is_sha256_hex(a.content_hash):
             raise ValueError("artifact content_hash must be sha256 hex")
+        if len(a.revision) > MAX_ARTIFACT_REVISION_LEN:
+            raise ValueError(
+                f"artifact revision exceeds {MAX_ARTIFACT_REVISION_LEN} chars")
 
     ev = rec.evidence
     _bounded_tuple(ev.test_refs, "test_refs", MAX_EVIDENCE_REFS, MAX_EVIDENCE_REF_LEN)
@@ -406,7 +412,8 @@ def handoff_to_store_json(rec: HandoffRecord) -> dict:
             "unresolved_questions": list(rec.result.unresolved_questions),
         }),
         "artifacts_json": _stable_json([
-            {"ref": a.ref, "content_hash": a.content_hash, "excerpt": a.excerpt}
+            {"ref": a.ref, "content_hash": a.content_hash, "excerpt": a.excerpt,
+             "revision": a.revision}
             for a in rec.artifacts
         ]),
         "evidence_json": _stable_json({
@@ -464,7 +471,8 @@ def handoff_from_store_row(row: dict) -> HandoffRecord:
         artifacts=tuple(
             HandoffArtifact(ref=a.get("ref", ""),
                             content_hash=a.get("content_hash", ""),
-                            excerpt=a.get("excerpt", ""))
+                            excerpt=a.get("excerpt", ""),
+                            revision=a.get("revision", ""))
             for a in artifacts
         ),
         evidence=HandoffEvidence(
@@ -485,3 +493,83 @@ def handoff_from_store_row(row: dict) -> HandoffRecord:
         ),
         content_hash=row["content_hash"],
     )
+
+
+# ---------------------------------------------------------------------------
+# Bounded artifact-ref builder (Phase D3)
+# ---------------------------------------------------------------------------
+
+
+def build_bounded_artifact_refs(
+    refs: Sequence[str],
+    *,
+    worktree_root: Optional[str] = None,
+    revision: str = "",
+    max_refs: int = None,
+    max_excerpt_bytes: int = None,
+    allowed_refs: Optional[AbstractSet[str]] = None,
+) -> tuple:
+    """Build bounded :class:`HandoffArtifact` refs (path + hash + revision + excerpt).
+
+    Each input ``ref`` is a path RELATIVE to ``worktree_root`` (as supplied by
+    the agent envelope; it is NEVER trusted to be authoritative — it only
+    selects which bounded file to hash).  A ref is EMBEDDED only when ALL of:
+
+    * it is not a secret/forbidden path (``is_forbidden_ref`` — the same
+      bounded deny-list policy as Retrieval: ``.env``/``*.pem``/``*.key``/
+      ``credentials*``/``id_rsa``/``token*``/hidden dot-files/dot-dirs);
+    * it is confirmed by authoritative scope evidence when ``allowed_refs`` is
+      supplied (the caller's write/diff/test scope — the fail-closed F1 gate;
+      ``None`` means "no scope restriction", used only by the pure unit layer);
+    * it resolves INSIDE ``worktree_root`` (no traversal / symlink escape);
+    * it hashes successfully (``sha256_file`` → a FULL-FILE sha256).
+
+    For each surviving ref we compute ``content_hash`` (full-file sha256),
+    ``excerpt`` (bounded prefix ≤ ``max_excerpt_bytes``) and ``revision`` (git
+    HEAD at handoff time).  Unconfirmed / forbidden / missing / unreadable /
+    oversized / foreign files are SKIPPED entirely — a ref is NEVER emitted
+    without a valid full-file hash (F3: no empty-hash placeholder that would
+    later fabricate ``STALE_CONTEXT_REFERENCE``).  Deterministic order follows
+    the input order with de-duplication (first occurrence wins).
+    """
+    from .artifact_refs import (
+        MAX_ARTIFACT_REFS,
+        MAX_EXCERPT_BYTES,
+        _clamp_int,
+        bounded_excerpt,
+        is_forbidden_ref,
+        resolve_ref_within,
+        sha256_file,
+    )
+
+    cap_refs = _clamp_int(max_refs, MAX_ARTIFACT_REFS, MAX_ARTIFACT_REFS)
+    cap_excerpt = _clamp_int(max_excerpt_bytes, MAX_EXCERPT_BYTES,
+                             MAX_EXCERPT_BYTES)
+    revision = (revision or "")[:MAX_ARTIFACT_REVISION_LEN]
+
+    out: list = []
+    seen: set = set()
+    for ref in refs[:cap_refs]:
+        if not isinstance(ref, str) or not ref.strip():
+            continue
+        ref = ref[:MAX_ARTIFACT_REF_LEN]
+        if ref in seen:
+            continue
+        seen.add(ref)
+        if is_forbidden_ref(ref):
+            continue
+        if allowed_refs is not None and ref not in allowed_refs:
+            continue
+        path = resolve_ref_within(worktree_root, ref) if worktree_root else None
+        if path is None:
+            continue
+        content_hash = sha256_file(path)
+        if not content_hash:
+            # F3: only refs with a valid full-file hash are emitted.
+            continue
+        excerpt = bounded_excerpt(path, max_bytes=cap_excerpt)
+        out.append(HandoffArtifact(
+            ref=ref, content_hash=content_hash, excerpt=excerpt,
+            revision=revision,
+        ))
+    return tuple(out)

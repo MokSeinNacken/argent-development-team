@@ -148,6 +148,25 @@ class GitProvenanceProvider:
             return True  # unreadable -> fail-closed (never "clean")
         return bool(out)
 
+    def changed_paths(self, path: Optional[str] = None,
+                      max_paths: int = 32) -> tuple:
+        """Return bounded changed paths vs HEAD (``git diff --name-only HEAD``).
+
+        Read-only, fail-closed: any failure returns ``()`` (never a guess).
+        The result is capped at ``max_paths`` (bounded, no whole-repo scan).
+        Used as authoritative write/diff scope evidence for artifact refs (D3).
+        """
+        root = self._root(path)
+        if root is None:
+            return ()
+        out = _git(["diff", "--name-only", "HEAD"], root)
+        if out is None:
+            return ()
+        if not isinstance(max_paths, int) or max_paths <= 0:
+            max_paths = 32
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        return tuple(lines[:max_paths])
+
 
 def is_sha_like(value: str) -> bool:
     return (
