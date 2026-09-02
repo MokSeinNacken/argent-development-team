@@ -1,0 +1,94 @@
+{
+  "registry_version": "1",
+  "policy_version": "1",
+  "models": [
+    {
+      "model_id": "deepseek-v4-flash",
+      "provider_id": "deepseek",
+      "canonical_model_name": "DeepSeek V4 Flash",
+      "enabled": true,
+      "lifecycle_state": "ACTIVE",
+      "context_window_metadata": 1000000,
+      "output_limit_metadata": 384000,
+      "reasoning_levels_supported": ["MEDIUM"],
+      "tool_capabilities": ["code_edit", "shell_exec", "file_access"],
+      "abilities": {"vision": false, "coding": "implementation", "review": false},
+      "latency_class": "UNKNOWN",
+      "cost_class": "LOW",
+      "reliability_class": "UNKNOWN",
+      "capability_tags": [
+        "COORDINATION",
+        "SIMPLE_ANALYSIS",
+        "CODE_IMPLEMENTATION",
+        "DEBUGGING",
+        "TOOL_USE",
+        "STRUCTURED_OUTPUT",
+        "LONG_CONTEXT"
+      ],
+      "policy_version": "1",
+      "provenance": {
+        "source": "architecture §11: Flash = Supervisor/Queue/Status/Reconciliation/CI-Wait/Context-Pack/einfache Analyse/mechanische Mini-Fixes (COORDINATION, SIMPLE_ANALYSIS); routing.py: implementer/qa LOW -> deepseek-v4-flash (medium thinking); openclaw.json models.providers.deepseek (cost 0.14/0.28, contextWindow 1000000, maxTokens 384000)",
+        "benchmarked": false
+      }
+    },
+    {
+      "model_id": "deepseek-v4-pro",
+      "provider_id": "deepseek",
+      "canonical_model_name": "DeepSeek V4 Pro",
+      "enabled": true,
+      "lifecycle_state": "ACTIVE",
+      "context_window_metadata": 1000000,
+      "output_limit_metadata": 384000,
+      "reasoning_levels_supported": ["MEDIUM"],
+      "tool_capabilities": ["code_edit", "shell_exec", "file_access"],
+      "abilities": {"vision": false, "coding": "implementation", "review": false},
+      "latency_class": "UNKNOWN",
+      "cost_class": "MEDIUM",
+      "reliability_class": "UNKNOWN",
+      "capability_tags": [
+        "SIMPLE_ANALYSIS",
+        "REPOSITORY_REASONING",
+        "CODE_IMPLEMENTATION",
+        "COMPLEX_CODE_IMPLEMENTATION",
+        "DEBUGGING",
+        "TOOL_USE",
+        "STRUCTURED_OUTPUT",
+        "LONG_CONTEXT"
+      ],
+      "policy_version": "1",
+      "provenance": {
+        "source": "routing.py: analyst/implementer/qa -> deepseek-v4-pro (medium thinking); openclaw.json models.providers.deepseek (cost 1.74/3.48, contextWindow 1000000, maxTokens 384000)",
+        "benchmarked": false
+      }
+    },
+    {
+      "model_id": "gpt-5.6-sol",
+      "provider_id": "openai",
+      "canonical_model_name": "GPT-5.6 Sol",
+      "enabled": true,
+      "lifecycle_state": "ACTIVE",
+      "context_window_metadata": null,
+      "output_limit_metadata": null,
+      "reasoning_levels_supported": ["HIGH"],
+      "tool_capabilities": [],
+      "abilities": {"vision": null, "coding": "review", "review": true},
+      "latency_class": "UNKNOWN",
+      "cost_class": "UNKNOWN",
+      "reliability_class": "UNKNOWN",
+      "capability_tags": [
+        "COORDINATION",
+        "ARCHITECTURE",
+        "CODE_REVIEW",
+        "SECURITY_REVIEW",
+        "ROOT_CAUSE_ANALYSIS",
+        "REPOSITORY_REASONING",
+        "STRUCTURED_OUTPUT"
+      ],
+      "policy_version": "1",
+      "provenance": {
+        "source": "routing.py: lead/reviewer -> openai/gpt-5.6-sol (high thinking); openai provider via plugin (oauth), no models.providers block -> unknown fields are null/UNKNOWN",
+        "benchmarked": false
+      }
+    }
+  ]
+}

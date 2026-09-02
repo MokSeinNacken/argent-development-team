@@ -67,6 +67,11 @@ class ErrorClass(str, Enum):
     # D1 (Phase D): Context-Pack build failures are ORCHESTRATION errors
     # (distinct from DETERMINISTIC code failures and RESOURCE failures).
     CONTEXT = "CONTEXT"
+    # E1 (Phase E): provider/model registry validation failures are PROVIDER
+    # errors (distinct from CODE/RESOURCE/CONTEXT).  Laufzeit-Providerausfälle
+    # (Netz) bleiben job-seitig EXTERNAL/TRANSIENT (B/C); die Registry-Seite ist
+    # statisch.
+    PROVIDER = "PROVIDER"
 
 
 class WaitKind(str, Enum):

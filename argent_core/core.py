@@ -22,7 +22,19 @@ from datetime import datetime
 from typing import Callable, Optional
 from uuid import uuid4
 
-from . import context, events, gates, outputs, recovery, roles, routing, state_machine, trust, workflow
+from . import (
+    context,
+    events,
+    gates,
+    model_registry,
+    outputs,
+    recovery,
+    roles,
+    routing,
+    state_machine,
+    trust,
+    workflow,
+)
 from .models import (
     ActionClass,
     ActionExecution,
@@ -153,10 +165,27 @@ def _redact_event_value(value: str) -> str:
 class Core:
     """Deterministic team-control core over a SQLite store."""
 
-    def __init__(self, db_path: str, clock: Optional[Callable[[], datetime]] = None):
+    def __init__(
+        self,
+        db_path: str,
+        clock: Optional[Callable[[], datetime]] = None,
+        registry: Optional["model_registry.ModelRegistry"] = None,
+    ):
         self._clock = clock or utcnow
         self._store = Store(db_path, clock=self._clock)
         self._queries = Queries(self._store)
+        # Phase E1: injectable provider/model registry.  ``None`` -> the lazy
+        # process-wide default singleton loaded from the versioned repo files.
+        # Fail-closed: a non-ModelRegistry duck-typed object is refused (no
+        # duck-typed registry can be smuggled past the single integration point).
+        if registry is not None and not isinstance(
+            registry, model_registry.ModelRegistry
+        ):
+            raise model_registry.ModelRegistryError(
+                model_registry.MODEL_CONFIG_INVALID,
+                f"registry must be a ModelRegistry, got {type(registry).__name__!r}",
+            )
+        self._registry = registry
 
     # ------------------------------------------------------------------ utils
 
@@ -167,6 +196,12 @@ class Core:
 
     def close(self) -> None:
         self._store.close()
+
+    def _model_registry(self) -> "model_registry.ModelRegistry":
+        """Return the provider/model registry (default = repo-file singleton)."""
+        if self._registry is not None:
+            return self._registry
+        return model_registry.get_default_registry()
 
     def _check_source(self, source: str) -> SourceClass:
         cls = trust.classify_source(source)
@@ -1782,6 +1817,13 @@ class Core:
                 f"{provider}/{model}/{thinking}"
             )
 
+        # Phase E1 (single integration point, AFTER the unchanged role-policy
+        # check so existing semantics/tests stay byte-identical): the registry
+        # identity validation runs INSIDE ``work()`` (below), AFTER the
+        # idempotency / existing-dispatch replay and BEFORE the insert, so it
+        # gates only NEW dispatches — a replayed idempotent dispatch is returned
+        # unchanged even if the current registry would have rejected the model.
+
         def work():
             task = self._store.get_task(task_id)
             if task is None:
@@ -1837,6 +1879,12 @@ class Core:
             attempt_no = len(existing) + 1
             latest = self._store.get_latest_handoff(task_id)
             handoff_id = latest.id if latest is not None else None
+            # Phase E1: validate the resolved identity (provider/model) against
+            # the provider/model registry fail-closed — only for NEW dispatches
+            # (after idempotency replay, before insert).  An unknown/disabled/
+            # unavailable identity raises a bounded ModelRegistryError and NO
+            # dispatch is created.
+            self._model_registry().validate_identity(provider, model, thinking)
             did = str(uuid4())
             d = AgentDispatch(
                 id=did,

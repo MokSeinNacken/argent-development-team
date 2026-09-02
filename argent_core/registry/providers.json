@@ -1,0 +1,50 @@
+{
+  "registry_version": "1",
+  "policy_version": "1",
+  "providers": [
+    {
+      "provider_id": "deepseek",
+      "provider_type": "openai-completions",
+      "display_name": "DeepSeek",
+      "enabled": true,
+      "availability_state": "AVAILABLE",
+      "capabilities_supported": [
+        "COORDINATION",
+        "SIMPLE_ANALYSIS",
+        "REPOSITORY_REASONING",
+        "CODE_IMPLEMENTATION",
+        "COMPLEX_CODE_IMPLEMENTATION",
+        "DEBUGGING",
+        "TOOL_USE",
+        "STRUCTURED_OUTPUT",
+        "LONG_CONTEXT"
+      ],
+      "credential_ref": "openclaw:provider:deepseek",
+      "auth_mode": "api-key",
+      "endpoint_ref": "https://api.deepseek.com",
+      "profile_ref": null,
+      "policy_version": "1"
+    },
+    {
+      "provider_id": "openai",
+      "provider_type": "oauth-plugin",
+      "display_name": "OpenAI",
+      "enabled": true,
+      "availability_state": "AVAILABLE",
+      "capabilities_supported": [
+        "COORDINATION",
+        "ARCHITECTURE",
+        "CODE_REVIEW",
+        "SECURITY_REVIEW",
+        "ROOT_CAUSE_ANALYSIS",
+        "REPOSITORY_REASONING",
+        "STRUCTURED_OUTPUT"
+      ],
+      "credential_ref": "openclaw:auth:profiles:openai",
+      "auth_mode": "oauth",
+      "endpoint_ref": null,
+      "profile_ref": "openai",
+      "policy_version": "1"
+    }
+  ]
+}
