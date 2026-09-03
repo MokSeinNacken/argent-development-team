@@ -165,6 +165,50 @@ def _agent_id_from_command(command: Sequence[str]) -> Optional[str]:
     return None
 
 
+def resolve_credential_mask_paths(
+    *,
+    home: Optional[Path] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> tuple:
+    """Return the external-provider credential paths the sandbox must mask
+    (I3-A §31).
+
+    Closes a live defect: the agent-dispatch sandbox previously left
+    ``~/.config/gh`` (the authenticated GitHub credential home — ``hosts.yml``
+    mode 0600 holding the account token, plus ``config.yml``) VISIBLE read-only
+    inside the sandbox, because only ``~/.config/argent`` and
+    ``~/.local/state/argent`` were masked.  An untrusted same-UID role agent
+    could therefore read the authenticated GitHub credential material.  This
+    returns the ADDITIONAL locations to mask with empty tmpfs mounts (tmpfs
+    masks need no source), so untrusted role agents cannot read provider
+    credentials; the trusted broker/controller side (OUTSIDE the sandbox)
+    retains normal read access.
+
+    Always includes the GitHub credential directory ``<config>/gh`` (honoring
+    ``XDG_CONFIG_HOME`` like the rest of the service, else ``~/.config/gh``);
+    conditionally includes the legacy ``~/.git-credentials`` / ``~/.netrc``
+    files and a future ``~/.ssh`` directory when they exist (absent on the
+    current host — emitted only if present).  Pure: no filesystem side effects
+    beyond ``Path.exists`` probes.
+    """
+    if env is None:
+        env = os.environ
+    base_home = Path(home) if home is not None else Path.home()
+    explicit_cfg = env.get("XDG_CONFIG_HOME")
+    if explicit_cfg:
+        cfg = Path(str(explicit_cfg))
+        if not cfg.is_absolute():
+            cfg = base_home / cfg
+    else:
+        cfg = base_home / ".config"
+    paths: list = [cfg / "gh"]
+    for rel in (".git-credentials", ".netrc", ".ssh"):
+        p = base_home / rel
+        if p.exists():
+            paths.append(p)
+    return tuple(paths)
+
+
 def build_agent_sandbox_argv(
     command: Sequence[str],
     *,
@@ -173,9 +217,10 @@ def build_agent_sandbox_argv(
     openclaw_dir,
     cwd=None,
     writable_runtime_dirs: Sequence[Path] = (),
+    credential_dirs: Sequence[Path] = (),
     bwrap: str = BWRAP_CMD,
 ) -> list:
-    """Wrap ``command`` in a read-only-root bwrap namespace (G3-A trust model).
+    """Wrap ``command`` in a read-only-root bwrap namespace (G3-A + I3-A).
 
     The sandboxed child gets:
 
@@ -194,6 +239,15 @@ def build_agent_sandbox_argv(
       ``~/.config/argent``, ``state_dir`` = ``~/.local/state/argent``) so the
       real key/DB are ABSENT (a read raises ``FileNotFoundError``) and any
       write lands on an ephemeral tmpfs that vanishes;
+    * empty ``--tmpfs`` masks over each path in ``credential_dirs`` (I3-A §31:
+      the external-provider credential homes — ``~/.config/gh`` and, when
+      present, ``~/.git-credentials`` / ``~/.netrc`` — via
+      :func:`resolve_credential_mask_paths`).  This closes the credential-read
+      defect: an untrusted role agent can no longer read the authenticated
+      GitHub credential material, while the trusted broker/controller side
+      (outside the sandbox) retains read access.  A masked directory is empty
+      inside the sandbox (``hosts.yml``/``config.yml`` are ENOENT); a masked
+      file is replaced by an empty tmpfs directory (its content is unreadable);
     * ``--tmpfs /tmp`` (ephemeral), ``--dev /dev``, ``--proc /proc``;
     * NO ``--unshare-net`` (the agent needs provider network) and NO
       ``--unshare-pid`` (empirically, bwrap forwards SIGTERM/SIGKILL to the
@@ -207,13 +261,16 @@ def build_agent_sandbox_argv(
 
     Pure: no filesystem side effects (the caller ensures each bind source in
     ``writable_runtime_dirs`` exists so ``--bind`` cannot fail on a missing
-    source).
+    source).  ``credential_dirs`` defaults to empty (the production backend
+    resolves and passes the real credential homes); this keeps the function
+    injectable for deterministic offline tests without weakening the mask when
+    the backend supplies it.
     """
     # Order matters: the broad read-only root and the ephemeral /tmp tmpfs come
-    # FIRST, then the trusted-dir tmpfs masks, then the specific writable
-    # runtime-dir + cwd binds LAST so they override any enclosing read-only
-    # root/mask (this also makes the sandbox correct when the worktree/home
-    # live under a masked region, e.g. in tests).
+    # FIRST, then the trusted-dir + credential tmpfs masks, then the specific
+    # writable runtime-dir + cwd binds LAST so they override any enclosing
+    # read-only root/mask (this also makes the sandbox correct when the
+    # worktree/home live under a masked region, e.g. in tests).
     argv = [
         bwrap,
         "--ro-bind", "/", "/",
@@ -223,6 +280,8 @@ def build_agent_sandbox_argv(
         "--tmpfs", str(config_dir),
         "--tmpfs", str(state_dir),
     ]
+    for d in credential_dirs:
+        argv += ["--tmpfs", str(d)]
     for d in writable_runtime_dirs:
         argv += ["--bind", str(d), str(d)]
     if cwd is not None:
@@ -876,7 +935,10 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
         ``workdir`` is None the child is started with ``cwd="/"`` (read-only
         inside the sandbox) and no worktree bind is emitted.
         The trusted ``~/.config/argent`` and ``~/.local/state/argent`` dirs are
-        masked with empty tmpfs mounts (real key/DB absent), and the
+        masked with empty tmpfs mounts (real key/DB absent), the external-
+        provider credential homes (``~/.config/gh`` + ``~/.git-credentials`` /
+        ``~/.netrc`` when present) are ADDITIONALLY masked (I3-A §31) so an
+        untrusted role agent cannot read provider credentials, and the
         authoritative ``~/.openclaw`` config/credentials are READ-ONLY via the
         ro root.  Fail-closed: if ``bwrap`` is unavailable, no valid agent id
         can be derived, or the wrap cannot be built, a
@@ -951,6 +1013,7 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
                 openclaw_dir=dirs["openclaw_dir"],
                 bwrap=self._sandbox_bwrap,
                 writable_runtime_dirs=runtime_dirs,
+                credential_dirs=dirs.get("credential_dirs", ()),
                 cwd=workdir,
             )
         except (TypeError, ValueError) as exc:
@@ -961,13 +1024,14 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
 
         Production resolves the two TRUSTED dirs through the same canonical
         ``runtime_paths`` resolvers the rest of the service uses (so an env
-        override can never split them) and the ``~/.openclaw`` runtime dir
-        (used ONLY as the parent for the per-agent runtime dirs — it is no
-        longer whole-bind-mounted rw).  The dict has NO ``cwd`` key: the
-        writable workdir bind is derived SOLELY from the explicitly
-        authorized per-dispatch ``workdir``, never from the service's own
-        working directory.  Injected test dirs are returned unchanged (a test
-        seam that may still carry a ``cwd`` entry).
+        override can never split them), the ``~/.openclaw`` runtime dir (used
+        ONLY as the parent for the per-agent runtime dirs — it is no longer
+        whole-bind-mounted rw), and the external-provider credential homes via
+        :func:`resolve_credential_mask_paths` (I3-A §31).  The dict has NO
+        ``cwd`` key: the writable workdir bind is derived SOLELY from the
+        explicitly authorized per-dispatch ``workdir``, never from the
+        service's own working directory.  Injected test dirs are returned
+        unchanged (a test seam that may still carry a ``cwd`` entry).
         """
         if self._sandbox_dirs is not None:
             return dict(self._sandbox_dirs)
@@ -975,6 +1039,7 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
             "config_dir": runtime_paths.resolve_config_dir(),
             "state_dir": runtime_paths.resolve_state_dir(),
             "openclaw_dir": Path.home() / ".openclaw",
+            "credential_dirs": list(resolve_credential_mask_paths()),
         }
 
     def run_in_scope(

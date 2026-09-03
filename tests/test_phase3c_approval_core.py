@@ -148,8 +148,9 @@ def test_schema_version_is_15():
     # I1 (Phase I1): schema 18 -> 19 -> 20 (additive mutation-footprint +
     # dependency + action-lock columns + writer-worktree partial unique index +
     # action_locks FK on supervisor_jobs).  I2 (Phase I2): 20 -> 21 (additive
-    # integration_candidates merge-queue table).
-    assert SCHEMA_VERSION == "21"
+    # integration_candidates merge-queue table).  I3-A (Phase I3-A): 21 -> 22
+    # (additive external_action_requests + external_action_audit tables).
+    assert SCHEMA_VERSION == "22"
 
 
 def test_fresh_db_has_v6_tables_and_version(db_path, core):

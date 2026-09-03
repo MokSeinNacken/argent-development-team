@@ -1,4 +1,4 @@
-"""Phase I2 — schema migration 20 → 21 (additive integration_candidates table).
+"""Phase I2 — schema migration 20 → 22 (additive integration_candidates table; SCHEMA_VERSION now 22 after I3-A).
 
 Deterministic.  The ``integration_candidates`` table + indexes are additive;
 an existing V20 database gains them idempotently on reopen, existing rows are
@@ -42,7 +42,7 @@ def test_fresh_db_lands_on_v21(tmp_path):
     core = Core(str(tmp_path / "fresh.db"))
     try:
         assert _schema_version(core) == SCHEMA_VERSION
-        assert SCHEMA_VERSION == "21"
+        assert SCHEMA_VERSION == "22"
         assert "integration_candidates" in _tables(core)
     finally:
         core.close()

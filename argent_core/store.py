@@ -26,6 +26,7 @@ from typing import Callable, Iterator, Optional
 from . import events as events_mod
 from . import job_state
 from . import integration_candidate
+from . import external_action_broker
 from .gates import binding_hash
 from .resource_policy import RESOURCE_CLASS_VALUES, ResourceClass
 from .resource_failure import TERMINATION_CLASS_VALUES
@@ -105,7 +106,10 @@ from .handoff import HANDOFF_VERSION as HANDOFF_RECORD_VERSION
 # action_locks.holder_job_id -> supervisor_jobs(id).  Additive only.
 # I2 (Phase I2): integration_candidates table (additive) + the
 # one-INTEGRATING-per-(repository,target) partial unique index.
-SCHEMA_VERSION = "21"
+# I3-A (Phase I3-A): external_action_requests + external_action_audit tables
+# (additive) — the durable, secret-free external action request lifecycle
+# (provider-neutral).  SEPARATE state machine; no new supervisor_jobs states.
+SCHEMA_VERSION = "22"
 
 # D2 (Phase D): bounded JSON column budget enforced at the persistence gate.
 # Each handoff/checkpoint JSON column (result/artifacts/evidence/next-step/
@@ -189,6 +193,10 @@ _DISPATCH_STATUSES = "', '".join(s.value for s in DispatchStatus)
 _SEQUENCE_KINDS = "', '".join(k.value for k in SequenceKind)
 _PRIMARY_STATES = "', '".join(job_state.PRIMARY_STATE_VALUES)
 _CANDIDATE_STATES = "', '".join(integration_candidate.CANDIDATE_STATE_VALUES)
+_REQUEST_STATES = "', '".join(external_action_broker.REQUEST_STATE_VALUES)
+_AUDIT_EVENT_TYPES = "', '".join(sorted(external_action_broker.ALL_AUDIT_EVENT_TYPES))
+_ACTION_TAXONOMIES = "', '".join(sorted(t.value for t in external_action_broker.ActionTaxonomy))
+_FAILURE_CLASSES = "', '".join(sorted(external_action_broker.ALL_FAILURE_CLASSES))
 _TERMINATION_CLASSES = "', '".join(TERMINATION_CLASS_VALUES)
 _RESOURCE_CLASSES = "', '".join(RESOURCE_CLASS_VALUES)
 
@@ -1035,6 +1043,79 @@ _SCHEMA: tuple[str, ...] = (
         SELECT 1 FROM telegram_inbound_state
         WHERE stream_id = 'telegram-owner-approval-v1'
     )
+    """,
+    # I3-A (Phase I3-A): external action request lifecycle (additive).
+    # A SEPARATE durable state machine (NOT a supervisor_jobs state); the
+    # controller-authoritative request for an external (provider-neutral)
+    # write, its policy class, provenance, fencing fields (revision CAS +
+    # holder identity + lease epoch + action lock), provider-visible state for
+    # reconciliation, and bounded retry metadata.  NO secret columns (no
+    # credential/token/header/URL); parameters/provider_state are bounded
+    # redacted JSON.  idempotency_key is UNIQUE (at-most-one logical action).
+    f"""
+    CREATE TABLE IF NOT EXISTS external_action_requests (
+        request_id            TEXT PRIMARY KEY,
+        provider              TEXT NOT NULL,
+        account               TEXT NOT NULL,
+        action                TEXT NOT NULL,
+        policy_class          TEXT NOT NULL CHECK (policy_class IN
+                              ('{_ACTION_TAXONOMIES}')),
+        repository            TEXT NOT NULL,
+        resource_ref          TEXT NOT NULL,
+        source_job_id         TEXT NOT NULL,
+        source_candidate_id   TEXT NOT NULL,
+        requested_scope       TEXT NOT NULL,
+        parameters            TEXT NOT NULL,
+        expected_preconditions TEXT,
+        idempotency_key       TEXT NOT NULL,
+        provenance_version    INTEGER NOT NULL CHECK (provenance_version >= 0),
+        provenance_hash       TEXT NOT NULL CHECK (length(provenance_hash) = 64),
+        state                 TEXT NOT NULL DEFAULT 'PENDING' CHECK (state IN
+                              ('{_REQUEST_STATES}')),
+        authorization_state   TEXT,
+        revision              INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+        holder_owner_instance_id TEXT,
+        holder_lease_epoch    INTEGER NOT NULL DEFAULT 0
+                              CHECK (holder_lease_epoch >= 0),
+        action_lock_name      TEXT,
+        provider_state        TEXT,
+        provider_object_id    TEXT,
+        attempt_count         INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        next_attempt_at       TEXT,
+        last_failure_class    TEXT,
+        last_error_code       TEXT,
+        expires_at            TEXT,
+        created_at            TEXT NOT NULL,
+        updated_at            TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_external_action_requests_idem
+        ON external_action_requests(idempotency_key)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_external_action_requests_source_job
+        ON external_action_requests(source_job_id, created_at)
+    """,
+    # I3-A: secret-free external action audit (REQUESTED/AUTHORIZED/EXECUTED/
+    # RECONCILED).  No secret is ever persisted; failure_class is a bounded
+    # closed set (provider outage != code failure, rate limit != model failure).
+    f"""
+    CREATE TABLE IF NOT EXISTS external_action_audit (
+        audit_id       TEXT PRIMARY KEY,
+        request_id     TEXT NOT NULL,
+        event_type     TEXT NOT NULL CHECK (event_type IN
+                       ('{_AUDIT_EVENT_TYPES}')),
+        failure_class  TEXT CHECK (failure_class IS NULL OR failure_class IN
+                       ('{_FAILURE_CLASSES}')),
+        reason_code    TEXT,
+        detail         TEXT,
+        created_at     TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_external_action_audit_request
+        ON external_action_audit(request_id, created_at)
     """,
 )
 
@@ -4785,6 +4866,364 @@ class Store:
                 holder_lease_epoch=holder_lease_epoch, clear_holder=clear_holder,
                 fields=fields,
             )
+
+    # -- I3-A (Phase I3-A): external action request lifecycle ----------------
+
+    #: Columns a fenced request transition may write (bounded allowlist).
+    _EXTERNAL_ACTION_WRITABLE_FIELDS = frozenset({
+        "authorization_state", "provider_state", "provider_object_id",
+        "attempt_count", "next_attempt_at", "last_failure_class",
+        "last_error_code", "action_lock_name",
+    })
+
+    def _validate_request_state(self, state: str) -> None:
+        if state not in external_action_broker.REQUEST_STATE_VALUES:
+            raise ValueError(f"invalid request state {state!r}")
+
+    def create_external_action_request(
+        self,
+        *,
+        request_id: str,
+        provider: str,
+        account: str,
+        action: str,
+        policy_class: str,
+        repository: str,
+        resource_ref: str,
+        source_job_id: str,
+        source_candidate_id: str,
+        requested_scope: str,
+        parameters: str,
+        expected_preconditions: Optional[str],
+        idempotency_key: str,
+        provenance_version: int,
+        provenance_hash: str,
+        state: str = "PENDING",
+        expires_at: Optional[str] = None,
+    ):
+        """Create (idempotently) an external action request row.
+
+        Controller-authoritative: only trusted, pre-validated inputs reach
+        here (the broker validates provenance/parameters first).  The
+        ``idempotency_key`` UNIQUE index makes creation idempotent (at-most-one
+        logical Argent action).  A new request starts PENDING.
+
+        Returns ``(row, created)``.  On an idempotency-key collision the
+        existing row is returned ONLY if the new request is FULLY equivalent
+        (provider/account/repository/action/resource_ref/requested_scope/
+        parameters) — otherwise :class:`IdempotencyConflictError` is raised
+        (HIGH-6: never silently return the wrong row).
+        """
+        if not isinstance(request_id, str) or not request_id.startswith(
+                external_action_broker.REQUEST_ID_PREFIX):
+            raise ValueError("malformed request_id")
+        self._validate_request_state(state)
+        if not (isinstance(provenance_hash, str)
+                and len(provenance_hash) == 64):
+            raise ValueError("provenance_hash must be sha256 hex")
+        now_iso = self.now_iso()
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM external_action_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if row is not None:
+                return dict(row), False
+            existing = self._conn.execute(
+                "SELECT * FROM external_action_requests WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                existing = dict(existing)
+                if not self._external_request_equivalent(
+                    existing, provider=provider, account=account,
+                    action=action, repository=repository,
+                    resource_ref=resource_ref, requested_scope=requested_scope,
+                    parameters=parameters,
+                ):
+                    raise external_action_broker.IdempotencyConflictError(
+                        f"idempotency_key {idempotency_key!r} reused with a "
+                        f"non-equivalent request"
+                    )
+                return existing, False
+            self._conn.execute(
+                "INSERT INTO external_action_requests "
+                "(request_id, provider, account, action, policy_class, "
+                "repository, resource_ref, source_job_id, source_candidate_id, "
+                "requested_scope, parameters, expected_preconditions, "
+                "idempotency_key, provenance_version, provenance_hash, state, "
+                "revision, holder_lease_epoch, expires_at, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, 0, 0, ?, ?, ?)",
+                (request_id, provider, account, action, policy_class,
+                 repository, resource_ref, source_job_id, source_candidate_id,
+                 requested_scope, parameters, expected_preconditions,
+                 idempotency_key, provenance_version, provenance_hash, state,
+                 expires_at, now_iso, now_iso),
+            )
+            return self.get_external_action_request(request_id), True
+
+    @staticmethod
+    def _external_request_equivalent(existing: dict, *, provider, account,
+                                     action, repository, resource_ref,
+                                     requested_scope, parameters) -> bool:
+        """True iff an existing row is fully equivalent to a new request.
+
+        ``parameters`` is the canonical bounded JSON string (key-sorted), so a
+        byte-equal string comparison is the deterministic equivalence check.
+        """
+        return (
+            existing["provider"] == provider
+            and existing["account"] == account
+            and existing["action"] == action
+            and existing["repository"] == repository
+            and existing["resource_ref"] == resource_ref
+            and existing["requested_scope"] == requested_scope
+            and existing["parameters"] == parameters
+        )
+
+    def get_external_action_request(self, request_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM external_action_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_external_action_requests(
+        self,
+        *,
+        state: Optional[str] = None,
+        repository: Optional[str] = None,
+        source_job_id: Optional[str] = None,
+    ) -> list:
+        """List requests, optionally filtered (trusted store data only)."""
+        clauses = []
+        params = []
+        if state is not None:
+            self._validate_request_state(state)
+            clauses.append("state = ?")
+            params.append(state)
+        if repository is not None:
+            clauses.append("repository = ?")
+            params.append(repository)
+        if source_job_id is not None:
+            clauses.append("source_job_id = ?")
+            params.append(source_job_id)
+        q = "SELECT * FROM external_action_requests"
+        if clauses:
+            q += " WHERE " + " AND ".join(clauses)
+        q += " ORDER BY created_at, request_id"
+        rows = self._conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def _transition_request_locked(
+        self,
+        request_id: str,
+        *,
+        from_state: str,
+        to_state: str,
+        expected_revision: int,
+        now_iso: str,
+        holder_owner_instance_id: Optional[str],
+        holder_lease_epoch: Optional[int],
+        clear_holder: bool,
+        fields: dict,
+    ) -> dict:
+        """Shared revision-CAS request transition body (must hold a transaction)."""
+        row = self._conn.execute(
+            "SELECT * FROM external_action_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"external action request {request_id!r} not found")
+        if row["state"] != from_state:
+            raise external_action_broker.RequestRevisionError(
+                f"request {request_id!r} in state {row['state']!r}, "
+                f"expected {from_state!r}")
+        if row["revision"] != expected_revision:
+            raise external_action_broker.RequestRevisionError(
+                f"request {request_id!r} revision {row['revision']!r} != "
+                f"expected {expected_revision!r}")
+        # (HIGH-4) closed edge map: reject illegal edges and terminal
+        # immutability (a terminal request can never be reopened).
+        allowed = external_action_broker.REQUEST_TRANSITIONS.get(
+            row["state"], frozenset())
+        if to_state not in allowed:
+            raise external_action_broker.IllegalRequestTransition(
+                f"request {request_id!r}: illegal transition "
+                f"{row['state']!r} -> {to_state!r}")
+        updates = {"state": to_state, "revision": row["revision"] + 1,
+                   "updated_at": now_iso}
+        if clear_holder:
+            updates["holder_owner_instance_id"] = None
+            updates["holder_lease_epoch"] = 0
+        else:
+            if holder_owner_instance_id is not None:
+                updates["holder_owner_instance_id"] = holder_owner_instance_id
+            if holder_lease_epoch is not None:
+                updates["holder_lease_epoch"] = holder_lease_epoch
+        updates.update(fields)
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        self._conn.execute(
+            f"UPDATE external_action_requests SET {sets} WHERE request_id = ?",
+            (*updates.values(), request_id),
+        )
+        return self.get_external_action_request(request_id)
+
+    def transition_external_action_request(
+        self,
+        request_id: str,
+        *,
+        from_state: str,
+        to_state: str,
+        expected_revision: int,
+        holder_owner_instance_id: Optional[str] = None,
+        holder_lease_epoch: Optional[int] = None,
+        clear_holder: bool = False,
+        **fields,
+    ) -> dict:
+        """Fenced request transition (revision CAS, I3-A).
+
+        Fails closed unless the request is in ``from_state`` AND its
+        ``revision`` equals ``expected_revision``.  ``fields`` are bounded to
+        the request write allowlist.  Raises
+        :class:`~argent_core.external_action_broker.RequestRevisionError` on a
+        state/revision mismatch and :class:`NotFound` on a missing request.
+        """
+        self._validate_request_state(from_state)
+        self._validate_request_state(to_state)
+        if not isinstance(expected_revision, int) or expected_revision < 0:
+            raise ValueError("expected_revision must be a non-negative integer")
+        for key in fields:
+            if key not in self._EXTERNAL_ACTION_WRITABLE_FIELDS:
+                raise ValueError(f"request field {key!r} is not writable")
+        now_iso = self.now_iso()
+        with self._transaction():
+            return self._transition_request_locked(
+                request_id, from_state=from_state, to_state=to_state,
+                expected_revision=expected_revision, now_iso=now_iso,
+                holder_owner_instance_id=holder_owner_instance_id,
+                holder_lease_epoch=holder_lease_epoch, clear_holder=clear_holder,
+                fields=fields,
+            )
+
+    def transition_external_action_request_authoritative(
+        self,
+        request_id: str,
+        *,
+        lock_name: str,
+        holder_job_id: str,
+        holder_lease_epoch: int,
+        from_state: str,
+        to_state: str,
+        expected_revision: int,
+        holder_owner_instance_id: Optional[str] = None,
+        clear_holder: bool = False,
+        **fields,
+    ) -> dict:
+        """Holder-verified fenced request transition (I3-A, reuses I1/I2 fences).
+
+        Atomically (one transaction) re-verifies, before the write, that the
+        caller ``(holder_job_id, holder_lease_epoch)`` still holds BOTH a
+        current unexpired job lease AND the named action lock.  Any of the
+        following aborts (nothing is written) and raises
+        :class:`~argent_core.models.LeaseFencedError`: the holder's job lease
+        is stale/expired/terminal, or the action lock is no longer owned by
+        this exact holder (reclaimed/taken over).  A stale holder can never
+        finalize a request.
+        """
+        self._validate_request_state(from_state)
+        self._validate_request_state(to_state)
+        if not isinstance(expected_revision, int) or expected_revision < 0:
+            raise ValueError("expected_revision must be a non-negative integer")
+        if not isinstance(lock_name, str) or not lock_name.strip():
+            raise ValueError("lock_name must be a non-empty string")
+        if not isinstance(holder_job_id, str) or not holder_job_id.strip():
+            raise ValueError("holder_job_id must be a non-empty string")
+        if not isinstance(holder_lease_epoch, int) or holder_lease_epoch < 1:
+            raise ValueError("holder_lease_epoch must be a positive integer")
+        for key in fields:
+            if key not in self._EXTERNAL_ACTION_WRITABLE_FIELDS:
+                raise ValueError(f"request field {key!r} is not writable")
+        now_iso = self.now_iso()
+        with self._transaction():
+            if not self._job_holds_current_lease(
+                holder_job_id, holder_lease_epoch, now_iso,
+            ):
+                raise LeaseFencedError(
+                    f"external action transition: {holder_job_id!r} epoch "
+                    f"{holder_lease_epoch} is not the current unexpired "
+                    f"lease holder"
+                )
+            lrow = self._conn.execute(
+                "SELECT holder_job_id, holder_lease_epoch FROM action_locks "
+                "WHERE lock_name = ?", (lock_name,),
+            ).fetchone()
+            if lrow is None or lrow["holder_job_id"] != holder_job_id \
+                    or lrow["holder_lease_epoch"] != holder_lease_epoch:
+                raise LeaseFencedError(
+                    f"external action transition: action lock {lock_name!r} "
+                    f"is no longer owned by {holder_job_id!r} epoch "
+                    f"{holder_lease_epoch} (reclaimed/taken over)"
+                )
+            return self._transition_request_locked(
+                request_id, from_state=from_state, to_state=to_state,
+                expected_revision=expected_revision, now_iso=now_iso,
+                holder_owner_instance_id=holder_owner_instance_id,
+                holder_lease_epoch=holder_lease_epoch, clear_holder=clear_holder,
+                fields=fields,
+            )
+
+    def append_external_action_audit(
+        self,
+        request_id: str,
+        event_type: str,
+        *,
+        failure_class: Optional[str],
+        reason_code: Optional[str],
+        detail: Optional[str],
+    ) -> None:
+        """Append a secret-free audit row (bounded, no secrets).
+
+        ``event_type`` is a closed set (REQUESTED/AUTHORIZED/EXECUTED/
+        RECONCILED); ``failure_class`` (when set) is a closed set; the
+        ``detail``/``reason_code`` strings are bounded and NEVER carry
+        credentials/provider responses.
+        """
+        import uuid
+
+        if event_type not in external_action_broker.ALL_AUDIT_EVENT_TYPES:
+            raise ValueError(f"invalid audit event_type {event_type!r}")
+        if failure_class is not None and failure_class not in \
+                external_action_broker.ALL_FAILURE_CLASSES:
+            raise ValueError(f"invalid failure_class {failure_class!r}")
+        # (HIGH-6) no orphan audit rows: the referenced request must exist.
+        exists = self._conn.execute(
+            "SELECT 1 FROM external_action_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if exists is None:
+            raise NotFound(
+                f"cannot audit a non-existent request {request_id!r}")
+        now_iso = self.now_iso()
+        audit_id = "xa_" + uuid.uuid4().hex
+        self._conn.execute(
+            "INSERT INTO external_action_audit "
+            "(audit_id, request_id, event_type, failure_class, reason_code, "
+            "detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (audit_id, request_id, event_type, failure_class,
+             (reason_code or "")[:external_action_broker.MAX_REASON_CODE_LEN],
+             (detail or "")[:external_action_broker.MAX_AUDIT_DETAIL_LEN],
+             now_iso),
+        )
+
+    def list_external_action_audit(self, request_id: str) -> list:
+        rows = self._conn.execute(
+            "SELECT * FROM external_action_audit WHERE request_id = ? "
+            "ORDER BY created_at, audit_id",
+            (request_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     # -- F1 (Phase B2): in-transaction action fence ---------------------------
     #
