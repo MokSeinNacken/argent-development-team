@@ -248,8 +248,25 @@ def validate_branch_identity(branch: Optional[str]) -> Optional[str]:
         raise ValueError("branch_identity must be a non-empty string when set")
     if len(branch) > MAX_BRANCH_LEN:
         raise ValueError(f"branch_identity exceeds {MAX_BRANCH_LEN} chars")
-    if any(c in branch for c in ("\n", "\r", " ")):
+    if any(c in branch for c in ("\n", "\r", " ", "\t")):
         raise ValueError("branch_identity contains whitespace")
+    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in branch):
+        raise ValueError("branch_identity contains control characters")
+    # Ref-syntax hardening (I2 LOW-8): reject git option-like tokens and
+    # revision/glob syntax so a branch can never be smuggled into argv as an
+    # option or reach a rev-parse reflog/range path.
+    if branch.startswith("-"):
+        raise ValueError("branch_identity may not start with '-'")
+    if branch.startswith("/") or branch.endswith("/"):
+        raise ValueError("branch_identity may not start or end with '/'")
+    if branch.endswith(".") or branch.endswith(".lock"):
+        raise ValueError("branch_identity may not end with '.' or '.lock'")
+    if ".." in branch or "~" in branch or "^" in branch or ":" in branch:
+        raise ValueError("branch_identity contains a reserved revision token")
+    if "@{" in branch or "//" in branch or " " in branch:
+        raise ValueError("branch_identity contains a reserved revision token")
+    if any(c in branch for c in ("?", "*", "[", "\\")):
+        raise ValueError("branch_identity contains a reserved glob token")
     return branch
 
 

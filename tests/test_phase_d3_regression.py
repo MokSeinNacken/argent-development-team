@@ -144,7 +144,7 @@ def test_regression_retrieval_bounds(tmp_path):
 # + hard writer-worktree partial unique index + action_locks FK); additive tables present
 def test_regression_schema_version(db_path):
     core = Core(db_path)
-    assert SCHEMA_VERSION == "20"
+    assert SCHEMA_VERSION == "21"
     tables = {r[0] for r in core._store._conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     for t in ("context_packs", "handoffs_v2", "checkpoints", "action_locks"):

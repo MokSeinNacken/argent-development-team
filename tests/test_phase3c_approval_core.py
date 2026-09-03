@@ -147,8 +147,9 @@ def _column_names(core, table):
 def test_schema_version_is_15():
     # I1 (Phase I1): schema 18 -> 19 -> 20 (additive mutation-footprint +
     # dependency + action-lock columns + writer-worktree partial unique index +
-    # action_locks FK on supervisor_jobs).
-    assert SCHEMA_VERSION == "20"
+    # action_locks FK on supervisor_jobs).  I2 (Phase I2): 20 -> 21 (additive
+    # integration_candidates merge-queue table).
+    assert SCHEMA_VERSION == "21"
 
 
 def test_fresh_db_has_v6_tables_and_version(db_path, core):

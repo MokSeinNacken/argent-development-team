@@ -25,6 +25,7 @@ from typing import Callable, Iterator, Optional
 
 from . import events as events_mod
 from . import job_state
+from . import integration_candidate
 from .gates import binding_hash
 from .resource_policy import RESOURCE_CLASS_VALUES, ResourceClass
 from .resource_failure import TERMINATION_CLASS_VALUES
@@ -102,7 +103,9 @@ from .handoff import HANDOFF_VERSION as HANDOFF_RECORD_VERSION
 # I1 fix-round (Sol closing review F3/F5): hard ONE-worktree =
 # ONE-authoritative-writer-lease partial unique index + a FK on
 # action_locks.holder_job_id -> supervisor_jobs(id).  Additive only.
-SCHEMA_VERSION = "20"
+# I2 (Phase I2): integration_candidates table (additive) + the
+# one-INTEGRATING-per-(repository,target) partial unique index.
+SCHEMA_VERSION = "21"
 
 # D2 (Phase D): bounded JSON column budget enforced at the persistence gate.
 # Each handoff/checkpoint JSON column (result/artifacts/evidence/next-step/
@@ -185,6 +188,7 @@ _EXT_ACTION_POLICIES = "', '".join(p.value for p in ExternalActionsPolicy)
 _DISPATCH_STATUSES = "', '".join(s.value for s in DispatchStatus)
 _SEQUENCE_KINDS = "', '".join(k.value for k in SequenceKind)
 _PRIMARY_STATES = "', '".join(job_state.PRIMARY_STATE_VALUES)
+_CANDIDATE_STATES = "', '".join(integration_candidate.CANDIDATE_STATE_VALUES)
 _TERMINATION_CLASSES = "', '".join(TERMINATION_CLASS_VALUES)
 _RESOURCE_CLASSES = "', '".join(RESOURCE_CLASS_VALUES)
 
@@ -725,6 +729,60 @@ _SCHEMA: tuple[str, ...] = (
         acquired_at        TEXT NOT NULL,
         updated_at         TEXT NOT NULL
     )
+    """,
+    # I2 (Phase I2): the durable per-(repository, integration-target) merge
+    # queue (ARGENT ARCHITECTURE V1 FINAL §14, Phase I2 brief §1–§22).  This is
+    # a SEPARATE candidate state machine — it does NOT add primary job states
+    # (the 8-state ``job_state.PrimaryState`` model is untouched).  Candidates
+    # are controller-authoritative (created only from trusted store facts);
+    # ``revision`` is the monotonic CAS fence for every transition;
+    # ``holder_*`` records the action-lock holder (lease-fenced) that is
+    # driving the integration; ``result_json`` is bounded redacted evidence.
+    # One candidate per (source_job_id, integration_target) is enforced by a
+    # UNIQUE index; at most one INTEGRATING candidate per (repository,
+    # integration_target) by a partial unique index (defensive second layer —
+    # the authoritative single-holder boundary is the I1 action lock).
+    f"""
+    CREATE TABLE IF NOT EXISTS integration_candidates (
+        id                      TEXT PRIMARY KEY,
+        repository              TEXT NOT NULL,
+        integration_target      TEXT NOT NULL,
+        source_job_id           TEXT NOT NULL
+                                REFERENCES supervisor_jobs(id) ON DELETE CASCADE,
+        state                   TEXT NOT NULL CHECK (state IN
+                                ('{_CANDIDATE_STATES}')),
+        queue_position          INTEGER NOT NULL CHECK (queue_position >= 0),
+        priority                INTEGER NOT NULL DEFAULT 0,
+        depends_on              TEXT,
+        base_commit             TEXT,
+        source_head             TEXT,
+        source_branch           TEXT,
+        integration_worktree_path TEXT,
+        integration_branch      TEXT,
+        integrated_head         TEXT,
+        merge_classification    TEXT,
+        conflict_detail         TEXT,
+        revision                INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+        holder_owner_instance_id TEXT,
+        holder_lease_epoch      INTEGER NOT NULL DEFAULT 0 CHECK (holder_lease_epoch >= 0),
+        result_json             TEXT,
+        last_error_code         TEXT,
+        created_at              TEXT NOT NULL,
+        updated_at              TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_candidates_source_target
+        ON integration_candidates(source_job_id, integration_target)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_integration_candidates_repo_target_pos
+        ON integration_candidates(repository, integration_target, queue_position)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_candidates_one_integrating
+        ON integration_candidates(repository, integration_target)
+        WHERE state = 'INTEGRATING'
     """,
     """
     CREATE TABLE IF NOT EXISTS resource_recovery_markers (
@@ -4370,6 +4428,363 @@ class Store:
                 "DELETE FROM action_locks WHERE lock_name = ?", (lock_name,),
             )
             return True
+
+    def job_holds_current_lease(self, job_id: str, lease_epoch: int) -> bool:
+        """Public lease-liveness probe (I2 HIGH-1).
+
+        True iff ``(job_id, lease_epoch)`` is the current, unexpired lease
+        holder of an existing NON-TERMINAL job.  Fail-closed (False) for a
+        phantom job, a terminal job, an unleased job, a stale epoch, or an
+        expired lease.
+        """
+        if not isinstance(job_id, str) or not job_id.strip():
+            return False
+        if not isinstance(lease_epoch, int) or lease_epoch < 1:
+            return False
+        return self._job_holds_current_lease(job_id, lease_epoch, self.now_iso())
+
+    def action_lock_held_by(
+        self, lock_name: str, job_id: str, lease_epoch: int,
+    ) -> bool:
+        """True iff the named action lock is currently owned by the EXACT
+        holder ``(job_id, lease_epoch)`` (I2 HIGH-1).
+
+        Fail-closed: a missing lock row, a different holder, or a different
+        epoch returns False — a caller cannot claim ownership it does not hold.
+        """
+        if not isinstance(lock_name, str) or not lock_name.strip():
+            return False
+        row = self._conn.execute(
+            "SELECT holder_job_id, holder_lease_epoch FROM action_locks "
+            "WHERE lock_name = ?", (lock_name,),
+        ).fetchone()
+        if row is None:
+            return False
+        return row["holder_job_id"] == job_id and \
+            row["holder_lease_epoch"] == lease_epoch
+
+    def action_lock_state(self, lock_name: str) -> Optional[tuple]:
+        """Return ``(holder_job_id, holder_lease_epoch)`` for a lock, or None.
+
+        Read-only observation of the current action-lock holder (I2 HIGH-2).
+        """
+        if not isinstance(lock_name, str) or not lock_name.strip():
+            return None
+        row = self._conn.execute(
+            "SELECT holder_job_id, holder_lease_epoch FROM action_locks "
+            "WHERE lock_name = ?", (lock_name,),
+        ).fetchone()
+        if row is None:
+            return None
+        return (row["holder_job_id"], row["holder_lease_epoch"])
+
+    def reclaim_stale_action_lock(self, lock_name: str) -> bool:
+        """Atomically clear a named action lock iff its current holder no
+        longer holds a current unexpired lease (I2 HIGH-2).
+
+        Returns True when the stale lock was cleared (reclaimed), False when
+        the lock was already free or its holder is still live (never reclaimed
+        from a live holder).
+        """
+        if not isinstance(lock_name, str) or not lock_name.strip():
+            raise ValueError("lock_name must be a non-empty string")
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT holder_job_id, holder_lease_epoch FROM action_locks "
+                "WHERE lock_name = ?", (lock_name,),
+            ).fetchone()
+            if row is None:
+                return False
+            now_iso = self.now_iso()
+            if self._job_holds_current_lease(
+                row["holder_job_id"], row["holder_lease_epoch"], now_iso,
+            ):
+                return False  # holder still live -> never reclaim
+            self._conn.execute(
+                "DELETE FROM action_locks WHERE lock_name = ?", (lock_name,),
+            )
+            return True
+
+    # -- I2 (Phase I2): integration-candidate queue (durable merge queue) ----
+
+    #: Columns a fenced candidate transition may write (bounded allowlist).
+    _CANDIDATE_WRITABLE_FIELDS = frozenset({
+        "base_commit", "source_head", "source_branch",
+        "integration_worktree_path", "integration_branch", "integrated_head",
+        "merge_classification", "conflict_detail", "result_json",
+        "last_error_code", "depends_on", "priority", "queue_position",
+    })
+
+    def _validate_candidate_state(self, state: str) -> None:
+        if state not in integration_candidate.CANDIDATE_STATE_VALUES:
+            raise ValueError(f"invalid candidate state {state!r}")
+
+    def create_integration_candidate(
+        self,
+        *,
+        repository: str,
+        integration_target: str,
+        source_job_id: str,
+        base_commit: Optional[str] = None,
+        source_head: Optional[str] = None,
+        source_branch: Optional[str] = None,
+        depends_on: Optional[str] = None,
+        priority: int = 0,
+        queue_position: Optional[int] = None,
+    ) -> dict:
+        """Create (or idempotently return) an integration candidate row.
+
+        Controller-authoritative: only trusted store facts reach here.  The
+        candidate id is deterministic over (repository, integration_target,
+        source_job_id) and a UNIQUE index on (source_job_id,
+        integration_target) makes creation idempotent.  A new candidate starts
+        PENDING (never READY — promotion is a separate, fenced evaluation
+        step).  ``queue_position`` auto-increments per (repository,
+        integration_target) when omitted.
+        """
+        from .worktree import validate_repo_identity, validate_branch_identity
+
+        repo = validate_repo_identity(repository)
+        if repo is None:
+            raise ValueError("repository must be a non-empty string")
+        target = validate_branch_identity(integration_target)
+        if target is None:
+            raise ValueError("integration_target must be a non-empty branch")
+        if not isinstance(source_job_id, str) or not source_job_id.strip():
+            raise ValueError("source_job_id must be a non-empty string")
+        cid = integration_candidate.candidate_id_for(
+            repo, target, source_job_id)
+        now_iso = self.now_iso()
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM integration_candidates WHERE id = ?", (cid,)
+            ).fetchone()
+            if row is not None:
+                return dict(row)
+            if queue_position is None:
+                qrow = self._conn.execute(
+                    "SELECT COALESCE(MAX(queue_position), 0) + 1 AS n "
+                    "FROM integration_candidates WHERE repository = ? "
+                    "AND integration_target = ?",
+                    (repo, target),
+                ).fetchone()
+                queue_position = qrow["n"]
+            self._conn.execute(
+                "INSERT INTO integration_candidates "
+                "(id, repository, integration_target, source_job_id, state, "
+                "queue_position, priority, depends_on, base_commit, source_head, "
+                "source_branch, revision, holder_lease_epoch, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)",
+                (cid, repo, target, source_job_id,
+                 integration_candidate.CandidateState.PENDING.value,
+                 queue_position, priority, depends_on, base_commit, source_head,
+                 source_branch, now_iso, now_iso),
+            )
+            return self.get_integration_candidate(cid)
+
+    def get_integration_candidate(self, candidate_id: str) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM integration_candidates WHERE id = ?", (candidate_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_integration_candidate_for_source(
+        self, source_job_id: str, integration_target: str,
+    ) -> Optional[dict]:
+        row = self._conn.execute(
+            "SELECT * FROM integration_candidates WHERE source_job_id = ? "
+            "AND integration_target = ?",
+            (source_job_id, integration_target),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_integration_candidates(
+        self,
+        *,
+        repository: Optional[str] = None,
+        integration_target: Optional[str] = None,
+        state: Optional[str] = None,
+    ) -> list:
+        """List candidates, optionally filtered (trusted store data only)."""
+        clauses = []
+        params = []
+        if repository is not None:
+            clauses.append("repository = ?")
+            params.append(repository)
+        if integration_target is not None:
+            clauses.append("integration_target = ?")
+            params.append(integration_target)
+        if state is not None:
+            self._validate_candidate_state(state)
+            clauses.append("state = ?")
+            params.append(state)
+        q = "SELECT * FROM integration_candidates"
+        if clauses:
+            q += " WHERE " + " AND ".join(clauses)
+        q += " ORDER BY queue_position ASC, priority DESC, id"
+        rows = self._conn.execute(q, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def _transition_candidate_locked(
+        self,
+        candidate_id: str,
+        *,
+        from_state: str,
+        to_state: str,
+        expected_revision: int,
+        now_iso: str,
+        holder_owner_instance_id: Optional[str],
+        holder_lease_epoch: Optional[int],
+        clear_holder: bool,
+        fields: dict,
+    ) -> dict:
+        """Shared revision-CAS candidate transition body (must hold a
+        transaction).  Always clears the holder fields when ``clear_holder``
+        is set (I2 HIGH-2), otherwise records the holder when non-None."""
+        from .models import NotFound
+
+        row = self._conn.execute(
+            "SELECT * FROM integration_candidates WHERE id = ?", (candidate_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"integration candidate {candidate_id!r} not found")
+        if row["state"] != from_state:
+            raise integration_candidate.CandidateRevisionError(
+                f"candidate {candidate_id!r} in state {row['state']!r}, "
+                f"expected {from_state!r}"
+            )
+        if row["revision"] != expected_revision:
+            raise integration_candidate.CandidateRevisionError(
+                f"candidate {candidate_id!r} revision {row['revision']!r} != "
+                f"expected {expected_revision!r}"
+            )
+        updates = {"state": to_state, "revision": row["revision"] + 1,
+                   "updated_at": now_iso}
+        if clear_holder:
+            updates["holder_owner_instance_id"] = None
+            updates["holder_lease_epoch"] = 0
+        else:
+            if holder_owner_instance_id is not None:
+                updates["holder_owner_instance_id"] = holder_owner_instance_id
+            if holder_lease_epoch is not None:
+                updates["holder_lease_epoch"] = holder_lease_epoch
+        updates.update(fields)
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        self._conn.execute(
+            f"UPDATE integration_candidates SET {sets} WHERE id = ?",
+            (*updates.values(), candidate_id),
+        )
+        return self.get_integration_candidate(candidate_id)
+
+    def transition_integration_candidate(
+        self,
+        candidate_id: str,
+        *,
+        from_state: str,
+        to_state: str,
+        expected_revision: int,
+        holder_owner_instance_id: Optional[str] = None,
+        holder_lease_epoch: Optional[int] = None,
+        clear_holder: bool = False,
+        **fields,
+    ) -> dict:
+        """Fenced candidate transition (Phase I2 §1/§9: revision CAS).
+
+        Fails closed unless the candidate is currently in ``from_state`` AND
+        its ``revision`` equals ``expected_revision`` — a stale caller can
+        never commit a transition.  ``to_state`` is a validated candidate
+        state; ``holder_owner_instance_id`` / ``holder_lease_epoch`` (when
+        provided) record the action-lock holder driving the transition.
+        ``clear_holder=True`` explicitly clears the holder columns (I2 HIGH-2
+        — recovery must be able to clear a stale holder, not merely skip it).
+        ``revision`` is bumped on every transition.  ``fields`` are bounded to
+        the candidate write allowlist.  Raises
+        :class:`~argent_core.integration_candidate.CandidateRevisionError` on a
+        revision/state mismatch and :class:`NotFound` on a missing candidate.
+        """
+        self._validate_candidate_state(from_state)
+        self._validate_candidate_state(to_state)
+        if not isinstance(expected_revision, int) or expected_revision < 0:
+            raise ValueError("expected_revision must be a non-negative integer")
+        for key in fields:
+            if key not in self._CANDIDATE_WRITABLE_FIELDS:
+                raise ValueError(f"candidate field {key!r} is not writable")
+        now_iso = self.now_iso()
+        with self._transaction():
+            return self._transition_candidate_locked(
+                candidate_id, from_state=from_state, to_state=to_state,
+                expected_revision=expected_revision, now_iso=now_iso,
+                holder_owner_instance_id=holder_owner_instance_id,
+                holder_lease_epoch=holder_lease_epoch, clear_holder=clear_holder,
+                fields=fields,
+            )
+
+    def transition_integration_candidate_authoritative(
+        self,
+        candidate_id: str,
+        *,
+        lock_name: str,
+        holder_job_id: str,
+        holder_lease_epoch: int,
+        from_state: str,
+        to_state: str,
+        expected_revision: int,
+        holder_owner_instance_id: Optional[str] = None,
+        clear_holder: bool = False,
+        **fields,
+    ) -> dict:
+        """Holder-verified fenced candidate transition (I2 HIGH-1).
+
+        Atomically (in ONE transaction) re-verifies, before the write, that
+        the caller ``(holder_job_id, holder_lease_epoch)`` still holds BOTH a
+        current unexpired job lease AND the named action lock, then performs
+        the revision-CAS transition.  Any of the following aborts the
+        transaction (nothing is written) and raises
+        :class:`~argent_core.models.LeaseFencedError`: the holder's job lease
+        is stale/expired/terminal, or the action lock is no longer owned by
+        this exact holder (it was reclaimed or taken over).
+        """
+        self._validate_candidate_state(from_state)
+        self._validate_candidate_state(to_state)
+        if not isinstance(expected_revision, int) or expected_revision < 0:
+            raise ValueError("expected_revision must be a non-negative integer")
+        if not isinstance(lock_name, str) or not lock_name.strip():
+            raise ValueError("lock_name must be a non-empty string")
+        if not isinstance(holder_job_id, str) or not holder_job_id.strip():
+            raise ValueError("holder_job_id must be a non-empty string")
+        if not isinstance(holder_lease_epoch, int) or holder_lease_epoch < 1:
+            raise ValueError("holder_lease_epoch must be a positive integer")
+        for key in fields:
+            if key not in self._CANDIDATE_WRITABLE_FIELDS:
+                raise ValueError(f"candidate field {key!r} is not writable")
+        now_iso = self.now_iso()
+        with self._transaction():
+            if not self._job_holds_current_lease(
+                holder_job_id, holder_lease_epoch, now_iso,
+            ):
+                raise LeaseFencedError(
+                    f"integration transition: {holder_job_id!r} epoch "
+                    f"{holder_lease_epoch} is not the current unexpired "
+                    f"lease holder"
+                )
+            lrow = self._conn.execute(
+                "SELECT holder_job_id, holder_lease_epoch FROM action_locks "
+                "WHERE lock_name = ?", (lock_name,),
+            ).fetchone()
+            if lrow is None or lrow["holder_job_id"] != holder_job_id \
+                    or lrow["holder_lease_epoch"] != holder_lease_epoch:
+                raise LeaseFencedError(
+                    f"integration transition: action lock {lock_name!r} is "
+                    f"no longer owned by {holder_job_id!r} epoch "
+                    f"{holder_lease_epoch} (reclaimed/taken over)"
+                )
+            return self._transition_candidate_locked(
+                candidate_id, from_state=from_state, to_state=to_state,
+                expected_revision=expected_revision, now_iso=now_iso,
+                holder_owner_instance_id=holder_owner_instance_id,
+                holder_lease_epoch=holder_lease_epoch, clear_holder=clear_holder,
+                fields=fields,
+            )
 
     # -- F1 (Phase B2): in-transaction action fence ---------------------------
     #

@@ -368,7 +368,10 @@ class ChangeEvidence:
     """Bounded, trusted facts about a change set.
 
     There is deliberately **no** free-form "this is a small change" field: the
-    controller derives impact and risk from these facts only.
+    controller derives impact and risk from these facts only.  ``risk_class``
+    (I2 HIGH-6) is the inherited source-task risk classification
+    (``RiskClass`` value) that raises the derived risk so a HIGH-risk
+    integration forces the broad closing full suite.
     """
 
     changed_paths: Tuple[str, ...]
@@ -376,6 +379,7 @@ class ChangeEvidence:
     schema_migration: bool = False
     phase_closing: bool = False
     security_reviewed: bool = False
+    risk_class: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -977,6 +981,18 @@ def derive_change_impact(
     if unknown:
         risk = _max_risk(risk, RiskLevel.MEDIUM)
 
+    # I2 HIGH-6: inherit the source-task risk classification (canonicalised).
+    # A HIGH/CRITICAL task raises the derived risk so the integration plan
+    # forces the broad closing full suite.
+    if evidence.risk_class:
+        rc = evidence.risk_class.strip().upper()
+        if rc == "HIGH":
+            risk = _max_risk(risk, RiskLevel.HIGH)
+        elif rc == "CRITICAL":
+            risk = _max_risk(risk, RiskLevel.CRITICAL)
+        elif rc == "MEDIUM":
+            risk = _max_risk(risk, RiskLevel.MEDIUM)
+
     substantive = {
         s
         for s in subsystems_frozen
@@ -1184,6 +1200,7 @@ def build_test_plan(
                 "schema_migration": change_evidence.schema_migration,
                 "phase_closing": change_evidence.phase_closing,
                 "security_reviewed": change_evidence.security_reviewed,
+                "risk_class": change_evidence.risk_class,
             }
         )
     )
