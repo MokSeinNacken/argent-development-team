@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 from typing import Mapping, Optional
@@ -52,6 +53,7 @@ from .external_provider_adapter import (
     ExternalProviderAdapter,
     ProviderConflict,
     ProviderCredentialError,
+    ProviderError,
     ProviderNetworkError,
     ProviderObservation,
     ProviderRateLimited,
@@ -314,6 +316,45 @@ class GitHubProviderAdapter(ExternalProviderAdapter):
         except (ValueError, TypeError):
             return default
 
+    @staticmethod
+    def _parse_pr_number(proc, expected_repo: Optional[str] = None) -> Optional[int]:
+        """Extract a created PR number from ``gh pr create`` output.
+
+        ``gh pr create`` has no ``--json`` flag: on success (including the
+        existing-PR reconciliation case) it prints the PR URL, e.g.
+        ``https://github.com/owner/repo/pull/123``.  Parse defensively: a JSON
+        dict with ``number`` first, then a ``pull/<digits>`` URL in
+        stdout/stderr.  The URL MUST belong to ``expected_repo`` (canonical
+        ``owner/repo``) — a PR URL for any other repository is ignored (the
+        caller fails closed instead of claiming an unidentified/foreign
+        SUCCESS).  Returns ``None`` when no bound number is observable.
+        """
+        try:
+            data = json.loads(proc.stdout or "")
+        except (ValueError, TypeError):
+            data = {}
+        if isinstance(data, dict) and data.get("number") is not None:
+            try:
+                return int(data["number"])
+            except (TypeError, ValueError):
+                return None
+        # ``pull/<digits>`` URLs are only trusted when they belong to the
+        # EXPECTED repository (LOW-14): an agent/foreign URL can never bind.
+        expected_canonical = (canonicalize_repo_identity(expected_repo)
+                              if expected_repo is not None else None)
+        for text in ((proc.stdout or ""), (proc.stderr or "")):
+            m = re.search(
+                r"(?:https?://github\.com/|git@github\.com:)"
+                r"([^/\s]+)/([^/\s]+)/pull/([0-9]+)", text)
+            if m:
+                owner, repo, number = m.group(1), m.group(2), int(m.group(3))
+                if expected_canonical is not None:
+                    candidate = canonicalize_repo_identity(f"{owner}/{repo}")
+                    if candidate != expected_canonical:
+                        continue  # foreign repository — never bind (fail closed)
+                return number
+        return None
+
     # -- read operations -----------------------------------------------------
 
     def read_repository(self, request) -> ProviderResult:
@@ -395,6 +436,48 @@ class GitHubProviderAdapter(ExternalProviderAdapter):
 
     # -- mutation operations (live-write gated) ------------------------------
 
+    def _local_ref_sha(self, branch: str) -> Optional[str]:
+        """Resolve the LOCAL ``refs/heads/<branch>`` to a sha (fail-closed).
+
+        Runs ``git rev-parse --verify`` (argv, no shell).  A transport failure
+        (spawn/timeout/OS) propagates as :class:`ProviderNetworkError`; a
+        missing/invalid local ref (non-zero exit or non-sha output) returns
+        ``None`` so the caller fails closed (the local ref is NOT at the bound
+        sha).  Never treats an unverifiable local ref as correct.
+        """
+        argv = [self.git_executable, "rev-parse", "--verify",
+                f"refs/heads/{branch}"]
+        try:
+            proc = self._exec(argv, executable_kind="git")
+        except ProviderNetworkError:
+            raise  # real transport failure — never conflated with a mismatch
+        except ProviderError:
+            return None  # missing/invalid local ref
+        sha = (proc.stdout or "").strip()
+        return sha if is_sha_like(sha) else None
+
+    def _remote_ref_sha_strict(self, repository, branch) -> Optional[str]:
+        """Read the REMOTE ``refs/heads/<branch>`` sha (strict, fail-closed).
+
+        Runs ``git ls-remote <trusted-url> refs/heads/<branch>``.  Transport
+        failures propagate as :class:`ProviderNetworkError`; an absent/unknown
+        ref returns ``None``.  Used by the mutation boundary checks that MUST
+        not conflate "ref differs" with "could not read the ref".
+        """
+        url = self._trusted_push_url(repository)
+        argv = [self.git_executable, "ls-remote", url, f"refs/heads/{branch}"]
+        try:
+            proc = self._exec(argv, executable_kind="git")
+        except ProviderNetworkError:
+            raise
+        except ProviderError:
+            return None
+        line = (proc.stdout or "").strip()
+        if not line:
+            return None
+        sha = line.split()[0]
+        return sha if is_sha_like(sha) else None
+
     def push_feature_branch(self, request) -> ProviderResult:
         self._assert_write_enabled("push_feature_branch")
         branch = request.parameters["branch"]
@@ -403,9 +486,24 @@ class GitHubProviderAdapter(ExternalProviderAdapter):
         # The remote URL comes from TRUSTED repo metadata (CASE 4/5/6) — never
         # an agent-supplied URL.
         url = self._trusted_push_url(request.repository)
+        # (HIGH-6a) verify the LOCAL ref actually points at the BOUND sha
+        # BEFORE any push.  A mismatch/stale/missing local ref fails closed
+        # (conflict) with NO push invocation.
+        local = self._local_ref_sha(branch)
+        if local != sha:
+            raise ProviderConflict(
+                f"local ref refs/heads/{branch} does not point at the bound sha")
         refspec = f"refs/heads/{branch}:refs/heads/{branch}"
         argv = [self.git_executable, "push", url, refspec]
         self._exec(argv, executable_kind="git")
+        # (HIGH-6b) read the remote ref back and REQUIRE equality with the
+        # bound sha before claiming success — a race/stale mirror is a conflict,
+        # never a fabricated success.
+        remote = self._remote_ref_sha_strict(request.repository, branch)
+        if remote != sha:
+            raise ProviderConflict(
+                f"remote ref refs/heads/{branch} is not the bound sha "
+                f"(race/stale mirror)")
         return ProviderResult(OUTCOME_SUCCESS, object_id=sha,
                               state={"remote_ref": branch, "sha": sha})
 
@@ -429,6 +527,13 @@ class GitHubProviderAdapter(ExternalProviderAdapter):
         except ValueError as exc:
             raise ProviderValidationError(str(exc)) from exc
         repo = _validate_repo_identity(request.repository)
+        # (HIGH-6c) verify the REMOTE head ref equals head_sha BEFORE creating
+        # the PR — a stale/mismatched mirror fails closed (never a PR against
+        # an unverified head).
+        remote_head = self._remote_ref_sha_strict(repo, head_branch)
+        if remote_head != head_sha:
+            raise ProviderConflict(
+                f"remote head ref refs/heads/{head_branch} is not head_sha")
         argv = [self.gh_executable, "pr", "create", "--repo", repo,
                 "--head", head_branch, "--base", base_branch,
                 "--title", title]
@@ -445,10 +550,15 @@ class GitHubProviderAdapter(ExternalProviderAdapter):
                 os.unlink(body_path)
             except OSError:
                 pass
-        data = self._json(proc, {})
-        number = data.get("number") if isinstance(data, dict) else None
+        number = self._parse_pr_number(proc, expected_repo=repo)
+        if number is None:
+            # The provider accepted the action but Argent cannot identify the
+            # created object (or the URL belongs to a foreign repo): fail
+            # closed (never an unidentified/foreign SUCCESS).
+            raise ProviderValidationError(
+                "created PR number not observable from gh output")
         return ProviderResult(
-            OUTCOME_SUCCESS, object_id=str(number) if number else None,
+            OUTCOME_SUCCESS, object_id=str(number),
             state={"repo": repo, "head_branch": head_branch,
                    "base_branch": base_branch, "head_sha": head_sha,
                    "title": title, "number": number})
@@ -512,20 +622,12 @@ class GitHubProviderAdapter(ExternalProviderAdapter):
         return ProviderObservation(found=False)
 
     def _remote_ref_sha(self, repository, branch) -> Optional[str]:
+        # Best-effort reconciliation read: any failure degrades to None (the
+        # observation is "not found"), never crashes the reconcile path.
         try:
-            url = self._trusted_push_url(repository)
+            return self._remote_ref_sha_strict(repository, branch)
         except ProviderError:
             return None
-        argv = [self.git_executable, "ls-remote", url, f"refs/heads/{branch}"]
-        try:
-            proc = self._exec(argv, executable_kind="git")
-        except ProviderError:
-            return None
-        line = (proc.stdout or "").strip()
-        if not line:
-            return None
-        sha = line.split()[0]
-        return sha if is_sha_like(sha) else None
 
     def _find_own_pr(self, repository, head_branch, base_branch,
                      head_sha) -> Optional[dict]:
@@ -540,9 +642,11 @@ class GitHubProviderAdapter(ExternalProviderAdapter):
         data = self._json(proc, [])
         prs = data if isinstance(data, list) else []
         for pr in prs:
-            author = pr.get("author") or {}
-            if (isinstance(author, dict)
-                    and author.get("login") != GITHUB_ACCEPTANCE_ACCOUNT):
+            # (LOW-14) fail closed on a missing/non-dict author: a PR whose
+            # author is unknown is NEVER treated as Argent-owned.
+            author = pr.get("author") if isinstance(pr, dict) else None
+            if not isinstance(author, dict) or \
+                    author.get("login") != GITHUB_ACCEPTANCE_ACCOUNT:
                 continue
             if (pr.get("head_branch") or pr.get("headRefName")) != head_branch:
                 continue

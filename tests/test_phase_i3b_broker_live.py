@@ -88,9 +88,17 @@ def _pr_request(b, prov, *, branch, head, idem="ik-pr"):
 # ---------------------------------------------------------------------------
 
 def test_case13_push_via_broker_only(tmp_path):
-    core, project, sup, repo, jid, cid, head, tid, prov, b = _build(
-        tmp_path, scenario={"push": {"code": 0, "stdout": "", "stderr": ""}})
-    req = _push_request(b, prov, tid=tid, head=head)
+    core, project, sup, repo, jid, cid, head, tid, prov, b = _build(tmp_path)
+    branch = f"argent/{tid}-feature"
+    # Local ref must equal the bound sha (HIGH-6a) and the remote readback must
+    # equal it too (HIGH-6b) for the push to succeed through the broker.
+    write_scenario(tmp_path, {
+        "rev-parse": {"code": 0, "stdout": f"{head}\n", "stderr": ""},
+        "push": {"code": 0, "stdout": "", "stderr": ""},
+        "ls-remote": {"code": 0,
+                      "stdout": f"{head}\trefs/heads/{branch}\n", "stderr": ""},
+    })
+    req = _push_request(b, prov, tid=tid, head=head, branch=branch)
     req = b.authorize_autonomous(req["request_id"])
     assert req["state"] == RequestState.AUTHORIZED.value
     hid, hep = make_holder(core, project, sup)
@@ -103,8 +111,7 @@ def test_case13_push_via_broker_only(tmp_path):
     assert len(pushes) == 1
     argv = pushes[0]
     assert argv[1] == GITHUB_ACCEPTANCE_CANONICAL_URL
-    assert argv[2] == (f"refs/heads/argent/{tid}-feature:"
-                       f"refs/heads/argent/{tid}-feature")
+    assert argv[2] == (f"refs/heads/{branch}:refs/heads/{branch}")
     assert "--force" not in argv and "-f" not in argv
 
 

@@ -41,6 +41,8 @@ from argent_core.external_provider_adapter import (
     OUTCOME_SUCCESS,
     OUTCOME_UNAVAILABLE,
     FakeGitHubAdapter,
+    ProviderObservation,
+    ProviderResult,
 )
 from argent_core.models import ApprovalStatus, OwnerApproval, SourceClass
 
@@ -688,7 +690,7 @@ def test_case32_audit_lifecycle_durable_and_secret_free(tmp_path):
     b.execute(req["request_id"], holder_job_id=hid, holder_lease_epoch=hep)
     audit = core._store.list_external_action_audit(req["request_id"])
     events = [a["event_type"] for a in audit]
-    assert events == ["REQUESTED", "EXECUTED"]
+    assert events == ["REQUESTED", "AUTHORIZED", "EXECUTED"]
     # No secret in any audit column (bounded, no credential/token).
     for a in audit:
         for v in a.values():
@@ -704,6 +706,151 @@ def test_case33_failure_classes_distinguish(tmp_path):
     # Provider outage != code failure; rate limit != model failure.
     assert "PROVIDER_UNAVAILABLE" != "LOCAL_CODE_ERROR"
     assert "RATE_LIMIT" != "LOCAL_CODE_ERROR"
+
+
+# ---------------------------------------------------------------------------
+# HIGH-13 — audit history is authoritative (AUTHORIZED recorded; EXECUTED/
+# RECONCILED_SUCCESS strictly conditional on the authoritative transition)
+# ---------------------------------------------------------------------------
+
+def test_high13_authorize_autonomous_appends_authorized_once(tmp_path):
+    core, project, sup = make_env(str(tmp_path / "a.db"))
+    repo = init_repo(str(tmp_path / "r"))
+    jid, cid, head, tid = make_integrated_source(core, project, sup, repo)
+    prov = make_provenance(jid, cid, repo, head)
+    b = make_broker(core._store, repo=repo)
+    req = b.create_request(
+        provider="github", account="MokSeinNacken", action="read_ref",
+        repository=repo, resource_ref="main", requested_scope="read",
+        parameters={"ref": "main"}, idempotency_key="ik", provenance=prov)
+    b.authorize_autonomous(req["request_id"])
+    audit = core._store.list_external_action_audit(req["request_id"])
+    authorized = [a for a in audit if a["event_type"] == "AUTHORIZED"]
+    assert len(authorized) == 1
+    assert authorized[0]["reason_code"] == "ALLOWED"
+    assert "ALLOW_AUTONOMOUS" in (authorized[0]["detail"] or "")
+
+
+def test_high13_authorize_owner_appends_authorized_once(tmp_path):
+    from argent_core.gates import binding_hash
+    core, project, sup = make_env(str(tmp_path / "a.db"))
+    repo = init_repo(str(tmp_path / "r"))
+    jid, cid, head, tid = make_integrated_source(core, project, sup, repo)
+    prov = make_provenance(jid, cid, repo, head)
+    b = make_broker(core._store, repo=repo)
+    req = b.create_request(
+        provider="github", account="MokSeinNacken", action="read_ref",
+        repository=repo, resource_ref="main", requested_scope="read",
+        parameters={"ref": "main"}, idempotency_key="ik", provenance=prov)
+    scope = b._approval_scope(req)
+    ap = OwnerApproval(
+        id="ap-h13", task_id=tid, action="read_ref", scope=scope,
+        status=ApprovalStatus.PENDING, requested_by="owner",
+        source_class=SourceClass.TRUSTED, created_at="t", decided_at=None,
+        consumed_at=None, expires_at="2999-01-01T00:00:00+00:00",
+        binding_hash=binding_hash(tid, "read_ref", scope),
+    )
+    core._store._insert_approval(ap)
+    core._store._mark_approved("ap-h13", core._store.now_iso())
+    authorized = b.authorize_owner(req["request_id"], approval_id="ap-h13")
+    assert authorized["state"] == "AUTHORIZED"
+    audit = core._store.list_external_action_audit(req["request_id"])
+    auth_events = [a for a in audit if a["event_type"] == "AUTHORIZED"]
+    assert len(auth_events) == 1
+    assert "OWNER_GATE_REQUIRED" in (auth_events[0]["detail"] or "")
+
+
+class _ConcurrentRedriveAdapter(FakeGitHubAdapter):
+    """Simulates a concurrent redrive that moves the request out of EXECUTING
+    before the broker's authoritative finalize transition can run, so the
+    finalize revision CAS fails (the execution never actually finalized)."""
+
+    def __init__(self, store):
+        super().__init__(provider_name="github")
+        self._store = store
+
+    def push_feature_branch(self, request):
+        self._store.transition_external_action_request(
+            request.request_id, from_state="EXECUTING",
+            to_state="WAITING_EXTERNAL", expected_revision=request.revision,
+            attempt_count=1)
+        return ProviderResult(
+            OUTCOME_SUCCESS, object_id=request.parameters["sha"],
+            state={"remote_ref": request.parameters["branch"],
+                   "sha": request.parameters["sha"]})
+
+
+def test_high13_stale_cas_finalize_produces_no_executed_audit(tmp_path):
+    core, project, sup = make_env(str(tmp_path / "a.db"))
+    repo = init_repo(str(tmp_path / "r"))
+    jid, cid, head, tid = make_integrated_source(core, project, sup, repo)
+    prov = make_provenance(jid, cid, repo, head)
+    adapter = _ConcurrentRedriveAdapter(core._store)
+    b = make_broker(core._store, repo=repo, adapter=adapter)
+    branch = f"argent/{tid}-feature"
+    req = b.create_request(
+        provider="github", account="MokSeinNacken",
+        action="push_feature_branch", repository=repo, resource_ref=branch,
+        requested_scope="write", parameters={"branch": branch, "sha": head},
+        idempotency_key="ik", provenance=prov)
+    req = b.authorize_autonomous(req["request_id"])
+    hid, hep = make_holder(core, project, sup)
+    out = b.execute(req["request_id"], holder_job_id=hid, holder_lease_epoch=hep)
+    # The concurrent redrive won; the stale finalize CAS failed and must NOT
+    # have fabricated an EXECUTED audit row.
+    assert out["state"] == "WAITING_EXTERNAL"
+    audit = core._store.list_external_action_audit(req["request_id"])
+    events = [a["event_type"] for a in audit]
+    assert "EXECUTED" not in events
+    assert events == ["REQUESTED", "AUTHORIZED"]
+
+
+class _ConcurrentRedriveObserveAdapter(FakeGitHubAdapter):
+    """Simulates a concurrent transition invalidating the reconcile CAS: the
+    observation reports found=True but the authoritative SUCCEEDED transition
+    fails because the request was concurrently moved."""
+
+    def __init__(self, store):
+        super().__init__(provider_name="github")
+        self._store = store
+
+    def observe(self, request):
+        if request.state == "EXECUTING":
+            self._store.transition_external_action_request(
+                request.request_id, from_state="EXECUTING",
+                to_state="WAITING_EXTERNAL", expected_revision=request.revision,
+                attempt_count=1)
+        return ProviderObservation(
+            found=True, object_id=request.parameters["sha"],
+            state={"remote_ref": request.parameters["branch"],
+                   "sha": request.parameters["sha"]})
+
+
+def test_high13_reconcile_failed_transition_no_reconciled_success(tmp_path):
+    core, project, sup = make_env(str(tmp_path / "a.db"))
+    repo = init_repo(str(tmp_path / "r"))
+    jid, cid, head, tid = make_integrated_source(core, project, sup, repo)
+    prov = make_provenance(jid, cid, repo, head)
+    adapter = _ConcurrentRedriveObserveAdapter(core._store)
+    b = make_broker(core._store, repo=repo, adapter=adapter)
+    branch = f"argent/{tid}-feature"
+    req = b.create_request(
+        provider="github", account="MokSeinNacken",
+        action="push_feature_branch", repository=repo, resource_ref=branch,
+        requested_scope="write", parameters={"branch": branch, "sha": head},
+        idempotency_key="ik", provenance=prov)
+    req = b.authorize_autonomous(req["request_id"])
+    core._store.transition_external_action_request(
+        req["request_id"], from_state="AUTHORIZED", to_state="EXECUTING",
+        expected_revision=req["revision"])
+    hid, hep = make_holder(core, project, sup)
+    out = b.reconcile(req["request_id"], holder_job_id=hid,
+                      holder_lease_epoch=hep)
+    assert out["state"] == "WAITING_EXTERNAL"
+    audit = core._store.list_external_action_audit(req["request_id"])
+    events = [a["event_type"] for a in audit]
+    assert "EXECUTED" not in events
+    assert not any(a["reason_code"] == "RECONCILED_SUCCESS" for a in audit)
 
 
 def test_case34_audit_rejects_unknown_failure_class(tmp_path):

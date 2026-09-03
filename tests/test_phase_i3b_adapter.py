@@ -37,8 +37,12 @@ from argent_core.github_provider_adapter import (
 
 from i3b_helpers import (
     env_for,
+    init_repo,
+    make_gh_integrated_source,
+    make_gh_provenance,
     read_log,
     write_fake_executable,
+    write_scenario,
 )
 
 
@@ -87,7 +91,15 @@ def test_case3_fake_executable_refuses_credential_in_argv(tmp_path):
 
 def test_case21_adapter_never_places_credential_in_argv(tmp_path):
     fake_token = "ghp_" + "A" * 36
-    scenario = {"*": {"code": 0, "stdout": "{}", "stderr": ""}}
+    sha = "a" * 40
+    scenario = {
+        "repo view": {"code": 0, "stdout": "{}", "stderr": ""},
+        "rev-parse": {"code": 0, "stdout": sha + "\n", "stderr": ""},
+        "push": {"code": 0, "stdout": "", "stderr": ""},
+        "ls-remote": {"code": 0,
+                      "stdout": sha + "\trefs/heads/argent/t1-x\n",
+                      "stderr": ""},
+    }
     adapter = _adapter(tmp_path, scenario=scenario,
                        env_extra={"GH_TOKEN": fake_token})
     # A read AND a write both succeed WITHOUT the token in argv (the fake
@@ -96,7 +108,7 @@ def test_case21_adapter_never_places_credential_in_argv(tmp_path):
     assert r.outcome == OUTCOME_SUCCESS
     p = adapter.push_feature_branch(
         _req(action="push_feature_branch",
-             parameters={"branch": "argent/t1-x", "sha": "a" * 40}))
+             parameters={"branch": "argent/t1-x", "sha": sha}))
     assert p.outcome == OUTCOME_SUCCESS
     for argv in read_log(tmp_path):
         assert all("ghp_" not in a for a in argv)
@@ -197,13 +209,17 @@ def test_case14_remote_expected_sha_reconciles(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_case15_remote_sha_conflict_no_force(tmp_path):
-    scenario = {"push": {"code": 1, "stdout": "",
-                         "stderr": "! [rejected] argent/t1-x -> argent/t1-x "
-                                   "(non-fast-forward)"}}
+    sha = "a" * 40
+    scenario = {
+        "rev-parse": {"code": 0, "stdout": sha + "\n", "stderr": ""},
+        "push": {"code": 1, "stdout": "",
+                 "stderr": "! [rejected] argent/t1-x -> argent/t1-x "
+                           "(non-fast-forward)"},
+    }
     adapter = _adapter(tmp_path, scenario=scenario)
     with pytest.raises(ProviderConflict):
         adapter.push_feature_branch(_req(
-            parameters={"branch": "argent/t1-x", "sha": "a" * 40}))
+            parameters={"branch": "argent/t1-x", "sha": sha}))
     for argv in read_log(tmp_path):
         assert "--force" not in argv
         assert "-f" not in argv
@@ -316,3 +332,177 @@ def test_case25_timeout_maps_to_network_error(tmp_path):
     with pytest.raises(ProviderNetworkError):
         adapter.push_feature_branch(_req(
             parameters={"branch": "argent/t1-x", "sha": "a" * 40}))
+
+
+def test_live_gh_pr_create_url_parsing(tmp_path, monkeypatch):
+    """Real-gh behavior: ``gh pr create`` prints a URL (no --json) — the
+    adapter must extract the PR number from it (live-flow discovery fix)."""
+    from i3b_helpers import env_for, read_log, write_fake_executable, write_scenario
+    from argent_core.github_provider_adapter import (
+        GitHubProviderAdapter, github_acceptance_allowlist,
+        github_acceptance_standing_policy,
+    )
+    from argent_core.external_action_broker import ExternalActionBroker, RequestState
+    from i3a_helpers import TEST_MAC_KEY, make_env, make_holder
+
+    gh = write_fake_executable(tmp_path, "gh")
+    git = write_fake_executable(tmp_path, "git")
+    adapter = GitHubProviderAdapter(
+        live_write=True, gh_executable=gh, git_executable=git,
+        trusted_repo_urls={"MokSeinNacken/argent-development-team":
+                           "https://github.com/MokSeinNacken/"
+                           "argent-development-team.git"},
+        env=env_for(tmp_path, None),
+    )
+    core, project, sup = make_env(str(tmp_path / "a.db"))
+    repo = init_repo(str(tmp_path / "r"))
+    jid, cid, head, tid = make_gh_integrated_source(core, project, sup, repo)
+    prov = make_gh_provenance(jid, cid, head)
+    b = ExternalActionBroker(
+        core._store, adapter=adapter,
+        allowlist=github_acceptance_allowlist(),
+        standing_policy=github_acceptance_standing_policy(),
+        mac_key=TEST_MAC_KEY)
+    hid, hep = make_holder(core, project, sup)
+    branch = f"argent/{tid}-feature"
+    # Remote head ref must equal head_sha (HIGH-6c pre-check) before the PR
+    # create runs, and the created URL must bind to the expected repository.
+    write_scenario(tmp_path, {
+        "ls-remote": {"code": 0,
+                      "stdout": f"{head}\trefs/heads/{branch}\n",
+                      "stderr": ""},
+        "pr create": {"code": 0,
+                      "stdout": "https://github.com/MokSeinNacken/"
+                                "argent-development-team/pull/7\n"},
+    })
+    req = b.create_request(
+        provider="github", account="MokSeinNacken",
+        action="create_pull_request",
+        repository="MokSeinNacken/argent-development-team",
+        resource_ref=branch, requested_scope="write",
+        parameters={"head_branch": branch, "base_branch": "main",
+                    "head_sha": head, "title": "Add feature", "body": ""},
+        idempotency_key="ik-pr-url", provenance=prov)
+    req = b.authorize_autonomous(req["request_id"])
+    req = b.execute(req["request_id"], holder_job_id=hid, holder_lease_epoch=hep)
+    assert req["state"] == RequestState.SUCCEEDED.value
+    assert req["provider_object_id"] == "7"
+
+
+# ---------------------------------------------------------------------------
+# HIGH-6 — bound SHA enforced at the mutation boundary
+# ---------------------------------------------------------------------------
+
+def test_high6_local_ref_mismatch_refuses_push_no_push_invocation(tmp_path):
+    bound = "a" * 40
+    other = "b" * 40
+    scenario = {"rev-parse": {"code": 0, "stdout": other + "\n", "stderr": ""}}
+    adapter = _adapter(tmp_path, scenario=scenario)
+    with pytest.raises(ProviderConflict):
+        adapter.push_feature_branch(_req(
+            parameters={"branch": "argent/t1-x", "sha": bound}))
+    argv_log = read_log(tmp_path)
+    assert argv_log != []  # the local ref check DID run
+    assert all(a[0] != "push" for a in argv_log)  # NO git push invocation
+
+
+def test_high6_local_ref_missing_refuses_push(tmp_path):
+    bound = "a" * 40
+    scenario = {"rev-parse": {"code": 128, "stdout": "", "stderr": "fatal"}}
+    adapter = _adapter(tmp_path, scenario=scenario)
+    with pytest.raises(ProviderConflict):
+        adapter.push_feature_branch(_req(
+            parameters={"branch": "argent/t1-x", "sha": bound}))
+    assert all(a[0] != "push" for a in read_log(tmp_path))
+
+
+def test_high6_remote_ref_differs_after_push_conflict(tmp_path):
+    bound = "a" * 40
+    other = "b" * 40
+    scenario = {
+        "rev-parse": {"code": 0, "stdout": bound + "\n", "stderr": ""},
+        "push": {"code": 0, "stdout": "", "stderr": ""},
+        "ls-remote": {"code": 0,
+                      "stdout": other + "\trefs/heads/argent/t1-x\n",
+                      "stderr": ""},
+    }
+    adapter = _adapter(tmp_path, scenario=scenario)
+    with pytest.raises(ProviderConflict):
+        adapter.push_feature_branch(_req(
+            parameters={"branch": "argent/t1-x", "sha": bound}))
+
+
+def test_high6_remote_head_differs_before_pr_create_refused(tmp_path):
+    head_sha = "a" * 40
+    other = "b" * 40
+    scenario = {"ls-remote": {"code": 0,
+                              "stdout": other + "\trefs/heads/argent/t1-x\n",
+                              "stderr": ""}}
+    adapter = _adapter(tmp_path, scenario=scenario)
+    with pytest.raises(ProviderConflict):
+        adapter.create_pull_request(_req(
+            action="create_pull_request",
+            parameters={"head_branch": "argent/t1-x", "base_branch": "main",
+                        "head_sha": head_sha, "title": "t", "body": ""}))
+    argv_log = read_log(tmp_path)
+    assert all("pr create" not in " ".join(a) for a in argv_log)
+
+
+# ---------------------------------------------------------------------------
+# LOW-14 — PR parsing/author binding fail-closed
+# ---------------------------------------------------------------------------
+
+class _Proc:
+    def __init__(self, stdout="", stderr=""):
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_low14_parse_pr_number_binds_expected_repo():
+    # A foreign-repository URL must never bind (fail closed).
+    foreign = _Proc(
+        stdout="https://github.com/attacker/other/pull/42\n")
+    assert GitHubProviderAdapter._parse_pr_number(
+        foreign, expected_repo="MokSeinNacken/argent-development-team") is None
+    # The expected-repository URL binds.
+    own = _Proc(
+        stdout="https://github.com/MokSeinNacken/"
+               "argent-development-team/pull/7\n")
+    assert GitHubProviderAdapter._parse_pr_number(
+        own, expected_repo="MokSeinNacken/argent-development-team") == 7
+    # No expected_repo still parses (backward-compatible, no binding check).
+    assert GitHubProviderAdapter._parse_pr_number(own) == 7
+
+
+def test_low14_find_own_pr_fails_closed_on_unknown_author(tmp_path):
+    import json
+    branch = "argent/t1-x"
+    head = "a" * 40
+    # Missing author -> never treated as own.
+    scenario = {"pr list": {
+        "code": 0,
+        "stdout": json.dumps([{"number": 1, "headRefName": branch,
+                               "baseRefName": "main", "headRefOid": head}]),
+        "stderr": ""}}
+    adapter = _adapter(tmp_path, scenario=scenario)
+    assert adapter._find_own_pr(
+        GITHUB_ACCEPTANCE_REPOSITORY, branch, "main", head) is None
+    # Non-dict author (a bare string) -> never treated as own.
+    write_scenario(tmp_path, {"pr list": {
+        "code": 0,
+        "stdout": json.dumps([{"number": 1, "headRefName": branch,
+                               "baseRefName": "main", "headRefOid": head,
+                               "author": "MokSeinNacken"}]),
+        "stderr": ""}})
+    assert adapter._find_own_pr(
+        GITHUB_ACCEPTANCE_REPOSITORY, branch, "main", head) is None
+    # A matching author dict -> recognized as own.
+    write_scenario(tmp_path, {"pr list": {
+        "code": 0,
+        "stdout": json.dumps([{"number": 1, "headRefName": branch,
+                               "baseRefName": "main", "headRefOid": head,
+                               "author": {"login": "MokSeinNacken"}}]),
+        "stderr": ""}})
+    pr = adapter._find_own_pr(
+        GITHUB_ACCEPTANCE_REPOSITORY, branch, "main", head)
+    assert pr is not None and pr["number"] == 1

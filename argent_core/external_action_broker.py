@@ -1051,13 +1051,20 @@ class ExternalActionBroker:
         decision, reason = self.evaluate_policy(row)
         if decision is not PolicyDecision.ALLOW_AUTONOMOUS:
             return self._deny(row, reason)
-        return self.store.transition_external_action_request(
+        updated = self.store.transition_external_action_request(
             request_id, from_state=RequestState.PENDING.value,
             to_state=RequestState.AUTHORIZED.value,
             expected_revision=row["revision"],
             authorization_state=decision.value,
             last_error_code=None,
         )
+        # (HIGH-13) record the authorization decision exactly once, only after
+        # the transition succeeded (authorization reference + policy decision).
+        self.store.append_external_action_audit(
+            request_id, AUDIT_AUTHORIZED, failure_class=None,
+            reason_code=RC_ALLOWED,
+            detail=f"authorized autonomous: {decision.value}")
+        return updated
 
     def authorize_owner(self, request_id: str, *, approval_id: str) -> dict:
         """PENDING → AUTHORIZED via a verified single-use owner approval
@@ -1116,13 +1123,22 @@ class ExternalActionBroker:
         rc = self.store._consume_approval(approval.id, now_iso)
         if rc != 1:
             raise AuthorizationError("approval already consumed or expired")
-        return self.store.transition_external_action_request(
+        updated = self.store.transition_external_action_request(
             request_id, from_state=RequestState.PENDING.value,
             to_state=RequestState.AUTHORIZED.value,
             expected_revision=row["revision"],
             authorization_state=PolicyDecision.OWNER_GATE_REQUIRED.value,
             last_error_code=None,
         )
+        # (HIGH-13) record the owner authorization decision exactly once, only
+        # after the transition succeeded (authorization reference).
+        self.store.append_external_action_audit(
+            request_id, AUDIT_AUTHORIZED, failure_class=None,
+            reason_code=RC_ALLOWED,
+            detail=(f"authorized owner-gate "
+                    f"({PolicyDecision.OWNER_GATE_REQUIRED.value}): "
+                    f"approval {approval_id}"))
+        return updated
 
     def _approval_scope(self, request: dict) -> str:
         """The deterministic, fully-binding approval scope (HIGH-1).
@@ -1406,8 +1422,12 @@ class ExternalActionBroker:
                 holder_owner_instance_id=holder_job_id, clear_holder=(to_state in TERMINAL_REQUEST_STATES),
                 **fields)
         except (LeaseFencedError, RequestRevisionError):
-            updated = self.store.get_external_action_request(
+            # (HIGH-13) the authoritative transition did NOT happen — never
+            # claim an execution that did not occur.  Return the unchanged row
+            # WITHOUT an EXECUTED audit row.
+            return self.store.get_external_action_request(
                 row["request_id"]) or row
+        # The authoritative transition succeeded: record the audit row only now.
         self.store.append_external_action_audit(
             row["request_id"], audit, failure_class=failure_class,
             reason_code=error_code[:MAX_REASON_CODE_LEN],
@@ -1505,7 +1525,9 @@ class ExternalActionBroker:
                     to_state=RequestState.SUCCEEDED.value,
                     expected_revision=row["revision"], clear_holder=True, **fields)
             except (LeaseFencedError, RequestRevisionError):
-                updated = self.store.get_external_action_request(
+                # (HIGH-13) the transition did NOT happen — no RECONCILED_SUCCESS
+                # row (never claim a reconciliation that did not occur).
+                return self.store.get_external_action_request(
                     row["request_id"]) or row
             self.store.append_external_action_audit(
                 row["request_id"], AUDIT_RECONCILED, failure_class=None,
