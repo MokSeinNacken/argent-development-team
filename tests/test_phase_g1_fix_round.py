@@ -228,7 +228,7 @@ def test_scope_start_in_scope_passes_sanitized_env(monkeypatch):
         captured["env"] = kw.get("env")
         return FakePopen()
 
-    backend = SystemdRunScopeBackend(popen_fn=fake_popen)
+    backend = SystemdRunScopeBackend(popen_fn=fake_popen, sandbox_wrap=False)
     monkeypatch.setattr(backend, "_move_into_cgroup", lambda pid, cg: True)
     scope = ExecutionScope(
         scope_name="argent-c2-x", unit_name="argent-c2-x.scope",

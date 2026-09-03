@@ -3785,6 +3785,12 @@ class Supervisor:
             agent_id=AGENT_IDS[d.role], dispatch_id=dispatch_id,
             message_file=message_file, timeout_seconds=AGENT_TIMEOUT_SECONDS,
         )
+        # The sandbox writable worktree is ALWAYS the explicitly authorized job
+        # worktree, never the service's own working directory; a dispatch
+        # without a bound worktree gets NO worktree bind (agents work in their
+        # per-agent runtime dirs only).
+        worktree = job.get("canonical_worktree_path") or ""
+        workdir = worktree if (worktree and os.path.isdir(worktree)) else None
         result = self._enforcer.enforce_and_spawn(
             command=command,
             effective_limits=effective_limits,
@@ -3792,6 +3798,7 @@ class Supervisor:
             policy_version=admission.policy_version,
             job_id=job["id"],
             dispatch_id=dispatch_id,
+            workdir=workdir,
         )
         if not result.ok:
             self._finish_action(row["id"], "FAILED", f"enforcement:{result.status}")

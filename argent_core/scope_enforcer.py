@@ -257,12 +257,18 @@ class ExecutionEnforcer:
         job_id: str,
         dispatch_id: str,
         scope_name: Optional[str] = None,
+        workdir: Optional[str] = None,
     ) -> EnforcementResult:
         """Start-Barrier: create placeholder scope -> verify -> start agent.
 
         Returns ``SCOPE_OK`` with the verified scope on success, or a bounded
         failure result.  The agent is started only AFTER the scope is verified;
         every failure before that proves inactivity (fail-closed).
+
+        ``workdir`` (when set) is an explicitly authorized per-dispatch
+        product worktree threaded through to the backend's ``start_in_scope``;
+        when None the sandbox emits NO worktree bind and starts the child at
+        ``cwd="/"``.
         """
         full_command, scope, err = self._prepare(
             command=command, effective_limits=effective_limits,
@@ -308,7 +314,9 @@ class ExecutionEnforcer:
 
         # 4. start the agent inside the verified scope.
         try:
-            scope = self._backend.start_in_scope(scope=scope, command=full_command)
+            scope = self._backend.start_in_scope(
+                scope=scope, command=full_command, workdir=workdir,
+            )
         except ScopeCreateError as exc:
             return self._barrier_result(
                 EnforcementStatus.SCOPE_CREATION_FAILED.value,

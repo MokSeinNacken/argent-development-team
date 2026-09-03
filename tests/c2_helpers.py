@@ -104,8 +104,9 @@ class FakeScopeBackend:
             raise ScopeVerificationError(str(exc))
         return dict(self.verify_properties)
 
-    def start_in_scope(self, *, scope, command):
-        self.started.append({"scope": scope, "command": list(command)})
+    def start_in_scope(self, *, scope, command, workdir=None):
+        self.started.append({"scope": scope, "command": list(command),
+                             "workdir": workdir})
         return replace(scope, process_id=self.process_id)
 
     def verify_process_binding(self, scope):

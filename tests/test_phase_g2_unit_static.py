@@ -210,9 +210,21 @@ def test_install_check_declares_read_only_intent():
 # F6 — deployment-substitution normalization (template -> installed unit)
 # ---------------------------------------------------------------------------
 
-#: This host's three deployment substitutions (parameterizable defaults).
-_DEFAULT_WORKTREE = "/home/pc/projects/argent-worktrees/phase-g2-systemd-live-activation"
-_DEFAULT_DOC = f"file:{_DEFAULT_WORKTREE}/docs/PHASE_G2_ACCEPTANCE.md"
+#: This host's three deployment substitutions (env-parameterizable like
+#: g2-systemd/install-check.sh).  G3-B: the accepted live deployment advanced
+#: from the G2 worktree to the G3 worktree (unit WorkingDirectory/Documentation
+#: re-pointed during the authorized Phase-G deployment step), so the defaults
+#: track the G3 deployment.
+import os as _os
+
+_DEFAULT_WORKTREE = _os.environ.get(
+    "ARGENT_WORKTREE",
+    "/home/pc/projects/argent-worktrees/phase-g3-wsl-restart-acceptance",
+)
+_DEFAULT_DOC = _os.environ.get(
+    "ARGENT_DOC",
+    f"file:{_DEFAULT_WORKTREE}/docs/PHASE_G3_ACCEPTANCE.md",
+)
 _DEFAULT_WORKDIR = _DEFAULT_WORKTREE
 _DEFAULT_ENVFILE = "-/home/pc/.config/argent/service.env"
 

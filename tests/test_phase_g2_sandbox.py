@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -44,18 +45,27 @@ def test_sandbox_argv_has_required_elements(tmp_path):
     state_dir = home / ".local" / "state" / "argent"
     openclaw_dir = home / ".openclaw"
     cwd = tmp_path / "worktree"
+    agent_id = "argent-lead"
+    runtime_dirs = [openclaw_dir / "agents" / agent_id,
+                    openclaw_dir / "workspace" / agent_id]
 
     argv = build_agent_sandbox_argv(
-        ["openclaw", "agent", "--agent", "argent-lead"],
+        ["openclaw", "agent", "--agent", agent_id],
         config_dir=config_dir, state_dir=state_dir,
         openclaw_dir=openclaw_dir, cwd=cwd,
+        writable_runtime_dirs=runtime_dirs,
     )
 
     assert argv[0] == "bwrap"
     # Read-only root.
     assert _contains(argv, "--ro-bind", "/", "/")
-    # Writable binds for the legitimate child write areas.
-    assert _contains(argv, "--bind", str(openclaw_dir), str(openclaw_dir))
+    # G3-A narrows the policy: the whole ~/.openclaw is NO LONGER rw-bind-mounted.
+    assert not _contains(argv, "--bind", str(openclaw_dir), str(openclaw_dir))
+    # The two per-agent runtime dirs ARE rw-bind-mounted (the only ~/.openclaw
+    # write surface).
+    assert _contains(argv, "--bind", str(runtime_dirs[0]), str(runtime_dirs[0]))
+    assert _contains(argv, "--bind", str(runtime_dirs[1]), str(runtime_dirs[1]))
+    # The inherited working directory is rw-bound.
     assert _contains(argv, "--bind", str(cwd), str(cwd))
     # Empty tmpfs masks over the two trusted dirs.
     assert _contains(argv, "--tmpfs", str(config_dir))
@@ -68,7 +78,7 @@ def test_sandbox_argv_has_required_elements(tmp_path):
     assert "--unshare-net" not in argv
     # The command is preserved verbatim after the ``--`` separator.
     idx = argv.index("--")
-    assert argv[idx + 1:] == ["openclaw", "agent", "--agent", "argent-lead"]
+    assert argv[idx + 1:] == ["openclaw", "agent", "--agent", agent_id]
 
 
 def test_sandbox_argv_never_unshares_net_or_pid():
@@ -110,13 +120,26 @@ def test_start_in_scope_wraps_with_bwrap(tmp_path, monkeypatch):
     )
     scope = _scope()
     monkeypatch.setattr(backend, "_move_into_cgroup", lambda pid, cg: True)
-    backend.start_in_scope(scope=scope, command=["openclaw", "agent"])
+    backend.start_in_scope(
+        scope=scope, command=["openclaw", "agent", "--agent", "argent-lead"],
+    )
 
     argv = captured["argv"]
     assert argv[0] == "bwrap"
     assert _contains(argv, "--tmpfs", str(config_dir))
     assert _contains(argv, "--tmpfs", str(state_dir))
-    assert _contains(argv, "--bind", str(openclaw_dir), str(openclaw_dir))
+    # G3-A: whole ~/.openclaw is not rw-bound; only the per-agent runtime dirs.
+    assert not _contains(argv, "--bind", str(openclaw_dir), str(openclaw_dir))
+    assert _contains(
+        argv, "--bind",
+        str(openclaw_dir / "agents" / "argent-lead"),
+        str(openclaw_dir / "agents" / "argent-lead"),
+    )
+    assert _contains(
+        argv, "--bind",
+        str(openclaw_dir / "workspace" / "argent-lead"),
+        str(openclaw_dir / "workspace" / "argent-lead"),
+    )
     assert "openclaw" in argv  # the command is still present
     # The child env remains the allowlisted, secret-stripped env.
     assert captured["env"] is not None
@@ -205,6 +228,122 @@ def test_adversarial_probe_cannot_read_or_persist_trusted_dirs(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# (b2) G3-A adversarial probe — ~/.openclaw narrowed to per-agent runtime dirs
+# ---------------------------------------------------------------------------
+
+_G3_PROBE = """\
+import os, sys, json
+oc_json = sys.argv[1]      # <home>/.openclaw/openclaw.json (must be read-only)
+agents_dir = sys.argv[2]   # <home>/.openclaw/agents/<id> (rw)
+workspace_dir = sys.argv[3]  # <home>/.openclaw/workspace/<id> (rw)
+cwd_probe = sys.argv[4]    # <cwd>/probe-write.txt (rw)
+r = {}
+
+def rd(p):
+    try:
+        os.close(os.open(p, os.O_RDONLY))
+        return "OPENED"
+    except FileNotFoundError:
+        return "ENOENT"
+    except Exception as e:  # noqa: BLE001
+        return type(e).__name__
+
+r["oc_json_read"] = rd(oc_json)
+
+# Writing to ~/.openclaw/openclaw.json must FAIL (read-only root).
+try:
+    with open(oc_json, "w") as fh:
+        fh.write("pwned")
+    r["oc_json_write"] = "WROTE"
+except Exception as e:  # noqa: BLE001
+    r["oc_json_write"] = type(e).__name__
+
+# Writing into ~/.openclaw/agents/<id>/sessions must SUCCEED (rw bind).
+session_dir = os.path.join(agents_dir, "sessions")
+os.makedirs(session_dir, exist_ok=True)
+sp = os.path.join(session_dir, "probe.txt")
+try:
+    with open(sp, "w") as fh:
+        fh.write("ok")
+    r["agent_session_write"] = "WROTE"
+except Exception as e:  # noqa: BLE001
+    r["agent_session_write"] = type(e).__name__
+
+# Writing into the cwd worktree must SUCCEED (rw bind).
+try:
+    with open(cwd_probe, "w") as fh:
+        fh.write("ok")
+    r["cwd_write"] = "WROTE"
+except Exception as e:  # noqa: BLE001
+    r["cwd_write"] = type(e).__name__
+
+print(json.dumps(r))
+"""
+
+
+@pytest.mark.skipif(not _HAS_BWRAP, reason="bwrap unavailable on this host")
+def test_g3_sandbox_narrows_openclaw_to_per_agent_runtime_dirs():
+    # The fixture "home" must live OUTSIDE /tmp: the sandbox masks /tmp with an
+    # empty tmpfs (plus the two trusted dirs), so anything under pytest's
+    # tmp_path (which is /tmp) would be invisible to the child.  A home under
+    # the worktree is covered by the read-only root, exactly like the real
+    # ~/.openclaw under /home.  Use a throwaway dir under the worktree and
+    # clean it up afterwards.
+    repo_root = Path(__file__).resolve().parents[1]
+    base = Path(tempfile.mkdtemp(prefix=".g3-sandbox-home-", dir=str(repo_root)))
+    try:
+        home = base / "home"
+        config_dir = home / ".config" / "argent"
+        state_dir = home / ".local" / "state" / "argent"
+        openclaw_dir = home / ".openclaw"
+        cwd = base / "worktree"
+        agent_id = "argent-lead"
+        runtime_dirs = [openclaw_dir / "agents" / agent_id,
+                        openclaw_dir / "workspace" / agent_id]
+        for d in (config_dir, state_dir, openclaw_dir, cwd, *runtime_dirs):
+            d.mkdir(parents=True, exist_ok=True)
+
+        # Seed an authoritative config file under ~/.openclaw: the child must be
+        # able to READ it (the real openclaw CLI needs it) but never WRITE it.
+        oc_json = openclaw_dir / "openclaw.json"
+        oc_json.write_text('{"trusted": true}\n', encoding="utf-8")
+
+        probe = cwd / "g3_probe.py"
+        probe.write_text(_G3_PROBE, encoding="utf-8")
+        cwd_probe = cwd / "probe-write.txt"
+
+        argv = build_agent_sandbox_argv(
+            ["python3", str(probe), str(oc_json), str(runtime_dirs[0]),
+             str(runtime_dirs[1]), str(cwd_probe)],
+            config_dir=config_dir, state_dir=state_dir,
+            openclaw_dir=openclaw_dir, cwd=cwd,
+            writable_runtime_dirs=runtime_dirs,
+        )
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30,
+                              cwd=str(cwd))
+        assert proc.returncode == 0, proc.stderr
+        r = json.loads(proc.stdout)
+
+        # (1) openclaw.json is READABLE (config visible read-only).
+        assert r["oc_json_read"] == "OPENED", r
+        # (2) writing to openclaw.json FAILS (read-only root).
+        assert r["oc_json_write"] != "WROTE", r
+        # (3) writing into the per-agent sessions dir SUCCEEDS (rw bind).
+        assert r["agent_session_write"] == "WROTE", r
+        # (5) writing into the cwd worktree SUCCEEDS (rw bind).
+        assert r["cwd_write"] == "WROTE", r
+
+        # The REAL ~/.openclaw/openclaw.json is untouched.
+        assert oc_json.read_text(encoding="utf-8") == '{"trusted": true}\n'
+        # The probe file persisted in the per-agent sessions dir (rw bind real).
+        assert (runtime_dirs[0] / "sessions" / "probe.txt").exists()
+        # The cwd write persisted.
+        assert cwd_probe.exists()
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # (c) fail-closed: missing bwrap -> no process started
 # ---------------------------------------------------------------------------
 
@@ -230,7 +369,10 @@ def test_fail_closed_missing_bwrap_starts_no_process(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(backend, "_move_into_cgroup", lambda pid, cg: True)
     with pytest.raises(ScopeCreateError):
-        backend.start_in_scope(scope=_scope(), command=["openclaw", "agent"])
+        backend.start_in_scope(
+            scope=_scope(),
+            command=["openclaw", "agent", "--agent", "argent-lead"],
+        )
     # No unwrapped spawn: Popen must never have been invoked.
     assert "argv" not in called
 

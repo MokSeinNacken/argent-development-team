@@ -95,11 +95,33 @@ def agent_spawn_env(extra: Optional[Mapping[str, str]] = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Agent-dispatch sandbox (G2 F1) — real filesystem trust boundary
+# Agent-dispatch sandbox (G2 F1 -> G3-A narrowing) — real filesystem trust
+# boundary
 # ---------------------------------------------------------------------------
+#
+# G2 (F1) masked only the two TRUSTED dirs (~/.config/argent and
+# ~/.local/state/argent).  G3-A closes the remaining trust-boundary defect:
+# the whole ~/.openclaw was bind-mounted READ-WRITE for the untrusted
+# same-UID agent child, which therefore could rewrite authoritative OpenClaw
+# config + credentials (openclaw.json + backups, .env, credentials/,
+# identity/, exec-approvals.json, ...) and expand its own future capabilities.
+#
+# New trust model (G3-A):
+#   * the ro root makes EVERYTHING under ~/.openclaw READ-ONLY by default;
+#   * the ONLY writable locations inside the sandbox are the two per-agent
+#     runtime dirs (~/.openclaw/agents/<id> and ~/.openclaw/workspace/<id>)
+#     plus an EXPLICITLY authorized workdir (the per-dispatch product
+#     worktree, passed through by the supervisor — NEVER the service's own
+#     working directory);
+#   * the child keeps READ access to openclaw.json/credentials (needed by the
+#     real openclaw CLI) but can never write them;
+#   * ~/.config/argent and ~/.local/state/argent remain masked (absent).
 
 #: bwrap (bubblewrap) executable used to sandbox the agent-dispatch child.
 BWRAP_CMD = "bwrap"
+
+#: Safe agent-id pattern (G3-A): lowercase start, then lowercase/digits/hyphens.
+_AGENT_ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 
 
 def verify_bwrap_available(bwrap: str = BWRAP_CMD) -> bool:
@@ -124,6 +146,25 @@ def verify_bwrap_available(bwrap: str = BWRAP_CMD) -> bool:
         return False
 
 
+def _agent_id_from_command(command: Sequence[str]) -> Optional[str]:
+    """Extract the agent id from a ``build_agent_command`` argv (fail-closed).
+
+    Scans for the literal token ``--agent`` followed by a value matching the
+    safe pattern ``^[a-z][a-z0-9-]{0,63}$``.  Returns ``None`` for anything
+    else (no match, missing/unsafe value, non-sequence input) so callers can
+    fail-closed instead of guessing an id.
+    """
+    if not isinstance(command, (list, tuple)):
+        return None
+    tokens = [str(t) for t in command]
+    for i, tok in enumerate(tokens):
+        if tok == "--agent" and i + 1 < len(tokens):
+            value = tokens[i + 1]
+            if _AGENT_ID_RE.match(value):
+                return value
+    return None
+
+
 def build_agent_sandbox_argv(
     command: Sequence[str],
     *,
@@ -131,18 +172,24 @@ def build_agent_sandbox_argv(
     state_dir,
     openclaw_dir,
     cwd=None,
+    writable_runtime_dirs: Sequence[Path] = (),
     bwrap: str = BWRAP_CMD,
 ) -> list:
-    """Wrap ``command`` in a read-only-root bwrap namespace (G2 F1).
+    """Wrap ``command`` in a read-only-root bwrap namespace (G3-A trust model).
 
     The sandboxed child gets:
 
     * ``--ro-bind / /`` — the whole real root is READ-ONLY (no write to the
-      host filesystem by default);
-    * writable binds for the two locations the child legitimately needs:
-      ``openclaw_dir`` (``~/.openclaw`` — sessions/trajectories the supervisor
-      reads back) and ``cwd`` (the inherited working directory/worktree the
-      implementer agent must write);
+      host filesystem by default).  Because the ro root covers ``~/.openclaw``,
+      the authoritative config/credentials (openclaw.json + backups, .env,
+      credentials/, identity/, exec-approvals.json, ...) are READ-ONLY: the
+      child can still READ them (the real openclaw CLI needs them) but can
+      never WRITE them;
+    * writable ``--bind <d> <d>`` for EVERY dir in ``writable_runtime_dirs``
+      (the per-agent runtime dirs ``~/.openclaw/agents/<id>`` and
+      ``~/.openclaw/workspace/<id>``) and for ``cwd`` ONLY when it is
+      explicitly provided (an authorized per-dispatch worktree; when it is
+      ``None`` no worktree/dir bind is emitted beyond the runtime dirs);
     * empty ``--tmpfs`` masks over the two TRUSTED dirs (``config_dir`` =
       ``~/.config/argent``, ``state_dir`` = ``~/.local/state/argent``) so the
       real key/DB are ABSENT (a read raises ``FileNotFoundError``) and any
@@ -153,15 +200,21 @@ def build_agent_sandbox_argv(
       child without it, and the scope cgroup move targets the outer process;
       keeping one fork layer preserves today's cgroup-binding semantics).
 
-    Pure: no filesystem side effects (the caller ensures ``openclaw_dir``
-    exists so ``--bind`` cannot fail on a missing source).
+    ``openclaw_dir`` is kept for API compatibility and as the canonical
+    ``~/.openclaw`` reference, but it is NO LONGER whole-bind-mounted rw — the
+    writable surface is exactly ``writable_runtime_dirs`` + an EXPLICITLY
+    provided ``cwd`` (never an implicit ``Path.cwd()``).
+
+    Pure: no filesystem side effects (the caller ensures each bind source in
+    ``writable_runtime_dirs`` exists so ``--bind`` cannot fail on a missing
+    source).
     """
-    cwd = Path.cwd() if cwd is None else Path(cwd)
     # Order matters: the broad read-only root and the ephemeral /tmp tmpfs come
-    # FIRST, then the trusted-dir tmpfs masks, then the specific writable binds
-    # LAST so they override any enclosing mask (this also makes the sandbox
-    # correct when the worktree/home live under a masked region, e.g. in tests).
-    return [
+    # FIRST, then the trusted-dir tmpfs masks, then the specific writable
+    # runtime-dir + cwd binds LAST so they override any enclosing read-only
+    # root/mask (this also makes the sandbox correct when the worktree/home
+    # live under a masked region, e.g. in tests).
+    argv = [
         bwrap,
         "--ro-bind", "/", "/",
         "--dev", "/dev",
@@ -169,11 +222,13 @@ def build_agent_sandbox_argv(
         "--tmpfs", "/tmp",
         "--tmpfs", str(config_dir),
         "--tmpfs", str(state_dir),
-        "--bind", str(openclaw_dir), str(openclaw_dir),
-        "--bind", str(cwd), str(cwd),
-        "--",
-        *[str(c) for c in command],
     ]
+    for d in writable_runtime_dirs:
+        argv += ["--bind", str(d), str(d)]
+    if cwd is not None:
+        argv += ["--bind", str(cwd), str(cwd)]
+    argv += ["--", *[str(c) for c in command]]
+    return argv
 
 
 # ---------------------------------------------------------------------------
@@ -808,21 +863,29 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
         *,
         scope: ExecutionScope,
         command: Sequence[str],
+        workdir: Optional[str] = None,
     ) -> ExecutionScope:
         """Start the agent detached (NO shell) and move it into the scope cgroup.
 
-        G2 (F1): the real command is wrapped in a read-only-root bwrap sandbox
-        (``build_agent_sandbox_argv``) that masks the trusted ``~/.config/argent``
-        and ``~/.local/state/argent`` dirs with empty tmpfs mounts, so an
-        untrusted same-UID agent child can neither read the evidence key / DB
-        nor write into them.  Fail-closed: if ``bwrap`` is unavailable or the
-        wrap cannot be built, a :class:`ScopeCreateError` is raised (mapped to
-        ``SCOPE_CREATION_FAILED`` by the enforcer) — there is NO unwrapped
-        fallback.
+        G3-A: the real command is wrapped in a read-only-root bwrap sandbox
+        (``build_agent_sandbox_argv``) whose ONLY writable surface is the
+        per-agent runtime dirs (~/.openclaw/agents/<id>,
+        ~/.openclaw/workspace/<id>) + an EXPLICITLY authorized ``workdir`` (an
+        absolute host path for the per-dispatch product worktree).  The
+        supervisor's own working directory is NEVER implicitly rw-bound: when
+        ``workdir`` is None the child is started with ``cwd="/"`` (read-only
+        inside the sandbox) and no worktree bind is emitted.
+        The trusted ``~/.config/argent`` and ``~/.local/state/argent`` dirs are
+        masked with empty tmpfs mounts (real key/DB absent), and the
+        authoritative ``~/.openclaw`` config/credentials are READ-ONLY via the
+        ro root.  Fail-closed: if ``bwrap`` is unavailable, no valid agent id
+        can be derived, or the wrap cannot be built, a
+        :class:`ScopeCreateError` is raised (mapped to ``SCOPE_CREATION_FAILED``
+        by the enforcer) — there is NO unwrapped fallback.
         """
         argv = list(command)
         if self._sandbox_wrap:
-            argv = self._wrap_for_sandbox(argv)
+            argv = self._wrap_for_sandbox(argv, workdir=workdir)
         try:
             popen = self._popen_fn(
                 argv,
@@ -832,6 +895,7 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
                 env=agent_spawn_env(),
+                cwd=workdir if workdir is not None else "/",
             )
         except (OSError, ValueError) as exc:
             raise ScopeCreateError(f"agent start failed: {exc}") from exc
@@ -843,29 +907,51 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
             raise ScopeCreateError("could not move agent into scope cgroup")
         return replace(scope, process_id=pid)
 
-    def _wrap_for_sandbox(self, command: Sequence[str]) -> list:
-        """Build the bwrap sandbox argv for an agent-dispatch command (G2 F1).
+    def _wrap_for_sandbox(self, command: Sequence[str], workdir=None) -> list:
+        """Build the bwrap sandbox argv for an agent-dispatch command (G3-A).
 
-        Fail-closed: raises :class:`ScopeCreateError` when ``bwrap`` is missing
-        or the writable bind target (``~/.openclaw``) cannot be prepared.
+        Fail-closed: raises :class:`ScopeCreateError` when ``bwrap`` is
+        missing, when no valid agent id can be derived from the command (the
+        production enforcer always passes ``build_agent_command`` output, which
+        carries ``--agent <id>``), or when the per-agent runtime writable dirs
+        cannot be prepared.  The ``workdir`` bind is emitted ONLY when
+        ``workdir`` is not None (an explicitly authorized per-dispatch
+        worktree); the service's own working directory is never implied.
         """
         if shutil.which(self._sandbox_bwrap) is None:
             raise ScopeCreateError(
                 f"sandbox (bwrap) unavailable: {self._sandbox_bwrap!r}"
             )
+        agent_id = _agent_id_from_command(command)
+        if agent_id is None:
+            raise ScopeCreateError(
+                "cannot derive a valid agent id from the agent-dispatch command"
+            )
         dirs = self._resolve_sandbox_dirs()
         openclaw_dir = Path(dirs["openclaw_dir"])
+        runtime_dirs = [
+            openclaw_dir / "agents" / agent_id,
+            openclaw_dir / "workspace" / agent_id,
+        ]
         try:
-            # The child writes sessions/trajectories here; bwrap ``--bind``
-            # requires the source to exist.
+            # The child writes sessions/trajectories + its per-agent workspace
+            # here; bwrap ``--bind`` requires the source to exist.
             openclaw_dir.mkdir(parents=True, exist_ok=True)
+            for d in runtime_dirs:
+                d.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise ScopeCreateError(
-                f"cannot prepare sandbox openclaw dir {openclaw_dir!s}: {exc}"
+                f"cannot prepare sandbox runtime dir under {openclaw_dir!s}: {exc}"
             ) from exc
         try:
             return self._sandbox_argv_builder(
-                command, bwrap=self._sandbox_bwrap, **dirs,
+                command,
+                config_dir=dirs["config_dir"],
+                state_dir=dirs["state_dir"],
+                openclaw_dir=dirs["openclaw_dir"],
+                bwrap=self._sandbox_bwrap,
+                writable_runtime_dirs=runtime_dirs,
+                cwd=workdir,
             )
         except (TypeError, ValueError) as exc:
             raise ScopeCreateError(f"cannot build sandbox argv: {exc}") from exc
@@ -875,18 +961,20 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
 
         Production resolves the two TRUSTED dirs through the same canonical
         ``runtime_paths`` resolvers the rest of the service uses (so an env
-        override can never split them), the ``~/.openclaw`` runtime dir, and the
-        inherited working directory.
+        override can never split them) and the ``~/.openclaw`` runtime dir
+        (used ONLY as the parent for the per-agent runtime dirs — it is no
+        longer whole-bind-mounted rw).  The dict has NO ``cwd`` key: the
+        writable workdir bind is derived SOLELY from the explicitly
+        authorized per-dispatch ``workdir``, never from the service's own
+        working directory.  Injected test dirs are returned unchanged (a test
+        seam that may still carry a ``cwd`` entry).
         """
         if self._sandbox_dirs is not None:
-            dirs = dict(self._sandbox_dirs)
-            dirs.setdefault("cwd", Path.cwd())
-            return dirs
+            return dict(self._sandbox_dirs)
         return {
             "config_dir": runtime_paths.resolve_config_dir(),
             "state_dir": runtime_paths.resolve_state_dir(),
             "openclaw_dir": Path.home() / ".openclaw",
-            "cwd": Path.cwd(),
         }
 
     def run_in_scope(
