@@ -685,6 +685,59 @@ class SupervisorStore:
 
     # -- B1 durable queue / lease facade (delegates to Store primitives) ---
 
+    def set_job_metadata(
+        self,
+        job_id: str,
+        *,
+        owner_instance_id: str,
+        lease_epoch: int,
+        mutation_path_roots: Optional[list] = None,
+        mutation_modules: Optional[list] = None,
+        external_action_class: Optional[str] = None,
+        integration_target: Optional[str] = None,
+        action_scope: Optional[str] = None,
+        depends_on: Optional[str] = None,
+        repo_identity: Optional[str] = None,
+        canonical_worktree_path: Optional[str] = None,
+        branch_identity: Optional[str] = None,
+    ) -> dict:
+        """Trusted per-job mutation metadata facade (Phase I1 §9/§3).
+
+        Supervisor-authorized + lease-fenced: the caller MUST hold the job's
+        current unexpired lease ``(owner_instance_id, lease_epoch)`` (like
+        ``bind_writer_worktree``); a stale/absent holder is fenced.  Delegates
+        to :meth:`argent_core.store.Store.set_job_metadata`; input is trusted
+        controller/task analysis only (never agent prose).
+        """
+        return self._store.set_job_metadata(
+            job_id,
+            owner_instance_id=owner_instance_id,
+            lease_epoch=lease_epoch,
+            mutation_path_roots=mutation_path_roots,
+            mutation_modules=mutation_modules,
+            external_action_class=external_action_class,
+            integration_target=integration_target,
+            action_scope=action_scope,
+            depends_on=depends_on,
+            repo_identity=repo_identity,
+            canonical_worktree_path=canonical_worktree_path,
+            branch_identity=branch_identity,
+        )
+
+    def get_dependency_terminal(self, depends_on: str):
+        return self._store.get_dependency_terminal(depends_on)
+
+    def list_active_job_facts(self, *, exclude_job_id=None):
+        return self._store.list_active_job_facts(exclude_job_id=exclude_job_id)
+
+    def try_acquire_action_lock(self, lock_name, *, job_id, lease_epoch):
+        return self._store.try_acquire_action_lock(
+            lock_name, job_id=job_id, lease_epoch=lease_epoch)
+
+    def release_action_lock(self, lock_name, *, job_id, lease_epoch):
+        return self._store.release_action_lock(
+            lock_name, job_id=job_id, lease_epoch=lease_epoch)
+
     def claim_job(
         self, job_id: str, *, owner_instance_id: str, ttl_seconds: int
     ) -> dict:
@@ -1727,6 +1780,12 @@ class Supervisor:
         # created by a CRASHED previous process has no entry here (its residue
         # is the bounded sweep's job).
         self._prompt_files: dict = {}
+        # I1 (F1): the job currently being admitted (excluded from the
+        # store-backed active-jobs view so a job never concurrency-blocks
+        # itself at the binding admission point).  Set/cleared around every
+        # snapshot capture by BOTH the Scheduler's claim preflight and this
+        # Supervisor's ``_fresh_admission`` (single shared cell).
+        self._admission_exclude_job_id: Optional[str] = None
 
     # ---------------------------------------------------------------- utils
 
@@ -3718,7 +3777,14 @@ class Supervisor:
         return ActionOutcome("SPAWN_RUN", "executed", dispatch_id=dispatch_id)
 
     def _default_active_jobs_reader(self):
-        """Store-backed active-jobs reader for the default host provider (F1)."""
+        """Store-backed active-jobs reader for the default host provider (F1).
+
+        Excludes the job currently being admitted
+        (``self._admission_exclude_job_id``) so a job never concurrency-blocks
+        ITSELF: no self-count in the class-count concurrency limit, and no
+        double subtraction of its own memory ceiling in the aggregate host
+        reserve.  Returns None (UNKNOWN, fail-closed) on any store read error.
+        """
         store = self.core._store
 
         def reader():
@@ -3727,11 +3793,13 @@ class Supervisor:
             except Exception:
                 return None
             try:
+                exclude = getattr(self, "_admission_exclude_job_id", None)
                 return [
                     (row["id"], row.get("resource_class") or ResourceClass.LIGHT.value)
                     for row in rows
                     if row.get("terminal") is None
                     and row.get("primary_state") == job_state.PrimaryState.RUNNING.value
+                    and row["id"] != exclude
                 ]
             except Exception:
                 return None
@@ -3746,6 +3814,9 @@ class Supervisor:
         to the real (read-only) defaults when none are injected.  The effective
         limits come from THIS admission — a single source, never a separate
         recomputation.
+
+        F1: the candidate job is EXCLUDED from the active-jobs view for this
+        capture (``_admission_exclude_job_id``) so it never counts itself.
         """
         from .host_snapshot import HostSnapshotProvider
         from .resource_governor import ResourceGovernor
@@ -3755,7 +3826,11 @@ class Supervisor:
             active_jobs_reader=self._default_active_jobs_reader(),
         )
         rc = ResourceClass(job.get("resource_class") or ResourceClass.LIGHT.value)
-        snapshot = provider.capture(self._workspace_root)
+        self._admission_exclude_job_id = job["id"]
+        try:
+            snapshot = provider.capture(self._workspace_root)
+        finally:
+            self._admission_exclude_job_id = None
         return governor.decide(
             resource_class=rc, snapshot=snapshot, now_iso=self._now_iso(),
         )

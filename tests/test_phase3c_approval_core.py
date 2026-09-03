@@ -145,9 +145,10 @@ def _column_names(core, table):
 # ---------------------------------------------------------------------------
 
 def test_schema_version_is_15():
-    # G1 fix-round (F2): schema 17 -> 18 (additive revision column on
-    # supervisor_instances for the monotonic CAS fence).
-    assert SCHEMA_VERSION == "18"
+    # I1 (Phase I1): schema 18 -> 19 -> 20 (additive mutation-footprint +
+    # dependency + action-lock columns + writer-worktree partial unique index +
+    # action_locks FK on supervisor_jobs).
+    assert SCHEMA_VERSION == "20"
 
 
 def test_fresh_db_has_v6_tables_and_version(db_path, core):

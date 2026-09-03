@@ -170,6 +170,27 @@ class ResourceGovernor:
                 missing.append("cpu_count")
         return missing
 
+    @staticmethod
+    def _active_reserved_bytes(active_jobs, policy: ResourcePolicy) -> int:
+        """I1: aggregate memory already reserved by active RUNNING jobs.
+
+        Sum of each active job's ``memory_max_bytes`` ceiling (trusted store
+        data — never agent output).  Unknown/unparseable classes are skipped
+        (fail-safe: they are already accounted by the concurrency-limit step
+        and the per-job evidence-unknown gate).  Returns bytes (int).
+        """
+        total = 0
+        for item in active_jobs or ():
+            try:
+                cls = item[1] if isinstance(item, (tuple, list)) else None
+                if cls is None:
+                    continue
+                rc = ResourceClass(cls)
+            except (ValueError, TypeError, IndexError):
+                continue
+            total += policy.limits_for(rc).memory_max_bytes
+        return total
+
     def _effective_limits(
         self, resource_class: ResourceClass, snapshot: HostResourceSnapshot,
         reserve: Optional[int],
@@ -347,15 +368,23 @@ class ResourceGovernor:
                         timestamp=now_iso or _now_iso_default(),
                     )
 
-        # 6. host reserve (core rule).
+        # 6. host reserve (core rule) — I1 aggregate-aware.
+        # A candidate must leave the host reserve free AFTER accounting for the
+        # memory already reserved by ACTIVE RUNNING jobs (their class ceilings)
+        # plus its own ceiling.  With no active jobs this degenerates to the
+        # original per-job rule.
         reserve = required_host_reserve(
             snapshot.mem_total_bytes,
             minimum_host_reserve_bytes=policy.minimum_host_reserve_bytes,
             host_reserve_ram_ratio=policy.host_reserve_ram_ratio,
         )
         limits = policy.limits_for(resource_class)
+        active_reserved = self._active_reserved_bytes(
+            snapshot.active_jobs, policy,
+        )
         if snapshot.mem_available_bytes is not None:
-            if snapshot.mem_available_bytes - limits.memory_max_bytes < reserve:
+            if snapshot.mem_available_bytes - active_reserved \
+                    - limits.memory_max_bytes < reserve:
                 verdict, reason = (
                     AdmissionVerdict.DEFER,
                     ResourceReasonCode.INSUFFICIENT_MEMORY_RESERVE,

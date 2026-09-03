@@ -73,6 +73,7 @@ from .models import (
     TaskState,
     TestResult,
     TestRun,
+    WorktreeConflictError,
 )
 from .context_pack import ContextPackRecord
 from .checkpoint import CHECKPOINT_VERSION as CHECKPOINT_RECORD_VERSION
@@ -98,7 +99,10 @@ from .handoff import HANDOFF_VERSION as HANDOFF_RECORD_VERSION
 # G1 fix-round (F2): a monotonic ``revision`` INTEGER column is the CAS fence
 # for the singleton instance row (``updated_at`` alone is ABA-prone under a
 # frozen clock); it is atomically incremented on every write.
-SCHEMA_VERSION = "18"
+# I1 fix-round (Sol closing review F3/F5): hard ONE-worktree =
+# ONE-authoritative-writer-lease partial unique index + a FK on
+# action_locks.holder_job_id -> supervisor_jobs(id).  Additive only.
+SCHEMA_VERSION = "20"
 
 # D2 (Phase D): bounded JSON column budget enforced at the persistence gate.
 # Each handoff/checkpoint JSON column (result/artifacts/evidence/next-step/
@@ -620,6 +624,14 @@ _SCHEMA: tuple[str, ...] = (
         last_recovery_decision TEXT,
         last_failure_class    TEXT,
         last_recovery_at      TEXT,
+        mutation_path_roots   TEXT,
+        mutation_modules      TEXT,
+        external_action_class TEXT,
+        integration_target    TEXT,
+        action_scope          TEXT,
+        depends_on            TEXT,
+        last_concurrency_reason_code TEXT,
+        last_concurrency_at   TEXT,
         created_at            TEXT NOT NULL,
         updated_at            TEXT NOT NULL,
         CHECK ((terminal IS NULL) OR (status = 'TERMINAL' AND next_action = 'NONE'))
@@ -699,6 +711,20 @@ _SCHEMA: tuple[str, ...] = (
     """
     CREATE INDEX IF NOT EXISTS idx_process_registry_identity
         ON process_registry(boot_id, pid, process_start_ticks)
+    """,
+    # I1 (Phase I1 §17): minimal named action-lock boundary for I2/I3
+    # (merge/integrate/deploy/release/config).  Repository-global and global
+    # named locks, CAS-acquired by a single (job, lease_epoch) holder.  No
+    # merge queue is implemented here — only the serialization boundary.
+    """
+    CREATE TABLE IF NOT EXISTS action_locks (
+        lock_name          TEXT PRIMARY KEY,
+        holder_job_id      TEXT NOT NULL
+                           REFERENCES supervisor_jobs(id) ON DELETE CASCADE,
+        holder_lease_epoch INTEGER NOT NULL CHECK (holder_lease_epoch >= 0),
+        acquired_at        TEXT NOT NULL,
+        updated_at         TEXT NOT NULL
+    )
     """,
     """
     CREATE TABLE IF NOT EXISTS resource_recovery_markers (
@@ -1407,6 +1433,54 @@ class Store:
         if "host_id" not in sicols:
             self._conn.execute(
                 "ALTER TABLE supervisor_instances ADD COLUMN host_id TEXT")
+
+        # --- I1 (Phase I1): trusted mutation footprint + dependency ---------
+        # Additive columns only (single source of truth on supervisor_jobs).
+        # ``mutation_path_roots`` / ``mutation_modules`` are bounded JSON arrays
+        # (serialized by concurrency_policy); ``depends_on`` is a single
+        # prerequisite job id (no DAG); ``last_concurrency_*`` are pure audit
+        # (the persisted reason NEVER authorises an automatic admission — every
+        # new claim re-runs the concurrency policy).  All NULL-able so older
+        # rows stay valid (NULL footprint => UNKNOWN overlap => SERIALIZE).
+        sjcols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(supervisor_jobs)")
+        }
+        for col, ddl in (
+            ("mutation_path_roots",
+             "ALTER TABLE supervisor_jobs ADD COLUMN mutation_path_roots TEXT"),
+            ("mutation_modules",
+             "ALTER TABLE supervisor_jobs ADD COLUMN mutation_modules TEXT"),
+            ("external_action_class",
+             "ALTER TABLE supervisor_jobs ADD COLUMN external_action_class TEXT"),
+            ("integration_target",
+             "ALTER TABLE supervisor_jobs ADD COLUMN integration_target TEXT"),
+            ("action_scope",
+             "ALTER TABLE supervisor_jobs ADD COLUMN action_scope TEXT"),
+            ("depends_on",
+             "ALTER TABLE supervisor_jobs ADD COLUMN depends_on TEXT"),
+            ("last_concurrency_reason_code",
+             "ALTER TABLE supervisor_jobs ADD COLUMN "
+             "last_concurrency_reason_code TEXT"),
+            ("last_concurrency_at",
+             "ALTER TABLE supervisor_jobs ADD COLUMN last_concurrency_at TEXT"),
+        ):
+            if col not in sjcols:
+                self._conn.execute(ddl)
+
+        # I1 fix-round (F3): hard ONE-worktree = ONE-authoritative-writer-lease
+        # partial UNIQUE index.  At most one non-terminal job may hold
+        # ``writer_binding_mode='BOUND'`` per ``canonical_worktree_path``.  NULL
+        # worktree paths are excluded (the WHERE is false) and SQLite treats
+        # NULL keys in a partial index as distinct, so it is migration-safe.
+        # Created in ``_migrate`` (NOT ``_SCHEMA``) because legacy databases
+        # only gain ``canonical_worktree_path`` / ``writer_binding_mode`` via
+        # the B3 ALTER statements above.
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_supervisor_jobs_writer_worktree "
+            "ON supervisor_jobs(canonical_worktree_path) "
+            "WHERE terminal IS NULL AND writer_binding_mode = 'BOUND'"
+        )
 
         # --- D2 (Phase D): record_version on checkpoints + handoffs_v2 -------
         # Additive; a schema-12 DB that already has these tables (without the
@@ -2892,6 +2966,10 @@ class Store:
             "last_resource_at",
             "last_recovery_decision", "last_failure_class",
             "last_recovery_at",
+            "mutation_path_roots", "mutation_modules",
+            "external_action_class", "integration_target", "action_scope",
+            "depends_on",
+            "last_concurrency_reason_code", "last_concurrency_at",
         }
     )
 
@@ -3057,6 +3135,17 @@ class Store:
         # callers/tests that build a partial job row.
         for col in (
             "last_recovery_decision", "last_failure_class", "last_recovery_at",
+        ):
+            if col not in row:
+                row[col] = None
+        # I1: trusted mutation footprint + dependency columns defaulted for
+        # older callers/tests that build a partial job row (NULL footprint =>
+        # UNKNOWN overlap => SERIALIZE, the conservative default).
+        for col in (
+            "mutation_path_roots", "mutation_modules",
+            "external_action_class", "integration_target", "action_scope",
+            "depends_on",
+            "last_concurrency_reason_code", "last_concurrency_at",
         ):
             if col not in row:
                 row[col] = None
@@ -3419,6 +3508,23 @@ class Store:
                 claimable, _reason = self._job_is_claimable(job, now_iso)
                 if not claimable:
                     continue
+                # I1 (§14): dependency gate — a QUEUED job with a prerequisite
+                # is claimable only when the prerequisite has reached a
+                # satisfied terminal state (terminal='DONE').  An unsatisfied
+                # (still-running/queued) prerequisite leaves the job QUEUED; a
+                # MISSING prerequisite fails conservative by BLOCKing the job
+                # (terminal, no silent infinite wait).
+                depends_on = job.get("depends_on")
+                if depends_on:
+                    dep_row = self._conn.execute(
+                        "SELECT terminal FROM supervisor_jobs WHERE id = ?",
+                        (depends_on,),
+                    ).fetchone()
+                    if dep_row is None:
+                        self._block_missing_dependency(job, now_iso)
+                        continue
+                    if dep_row["terminal"] != "DONE":
+                        continue
                 return self._do_claim_locked(
                     job["id"],
                     owner_instance_id=owner_instance_id,
@@ -3426,6 +3532,36 @@ class Store:
                     now=now,
                 )
             return None
+
+    def _block_missing_dependency(self, job: dict, now_iso: str) -> None:
+        """I1 (§14): fail-conservative BLOCK of a QUEUED job whose
+        ``depends_on`` prerequisite does not exist.
+
+        A missing prerequisite is a controller/analysis error that can never be
+        satisfied by retrying — the dependent is quarantined as BLOCKED
+        (terminal) with ``DEPENDENCY_UNKNOWN`` so an owner/policy requeue is the
+        only way back.  Runs inside the caller's transaction; terminal jobs are
+        never downgraded.
+        """
+        if job.get("terminal") is not None:
+            return
+        self._transition_job(
+            job["id"],
+            to_primary_state=job_state.PrimaryState.BLOCKED.value,
+            to_status="TERMINAL",
+            fields={
+                "terminal": "BLOCKED",
+                "owner_instance_id": None,
+                "lease_expires_at": None,
+                "error_class": job_state.ErrorClass.OWNER_REQUIRED.value,
+                "last_error_code": "DEPENDENCY_UNKNOWN",
+                "next_action": "NONE",
+                "next_wake_at": None,
+            },
+            bump_facts_version=True,
+            cas_primary_state=job["primary_state"],
+            now_iso=now_iso,
+        )
 
     def renew_lease(
         self,
@@ -3894,7 +4030,9 @@ class Store:
         identity, the expected/current HEAD (real git provenance) and sets
         ``writer_binding_mode=BOUND`` in ONE transaction.  A stale epoch /
         wrong owner / expired lease raises :class:`LeaseFencedError` (rollback
-        — no partial binding).
+        — no partial binding).  A DIFFERENT non-terminal job already BOUND to
+        the same canonical worktree raises :class:`WorktreeConflictError`
+        (F3: ONE worktree = ONE authoritative writer lease).
         """
         self._validate_lease_owner(owner_instance_id)
         if not isinstance(lease_epoch, int) or lease_epoch < 1:
@@ -3923,6 +4061,27 @@ class Store:
                 raise LeaseFencedError(
                     f"bind writer: lease expired for job {job_id!r}"
                 )
+            # F3 (I1): hard ONE-worktree = ONE-authoritative-writer-lease
+            # invariant.  Reject when a DIFFERENT non-terminal job already holds
+            # ``writer_binding_mode='BOUND'`` for the SAME canonical worktree
+            # path.  Runs inside this single BEGIN IMMEDIATE transaction (single
+            # SQLite connection) so it is race-free; the matching partial unique
+            # index (idx_supervisor_jobs_writer_worktree) is the second,
+            # defensive enforcement layer.
+            conflict = self._conn.execute(
+                "SELECT id FROM supervisor_jobs "
+                "WHERE canonical_worktree_path = ? "
+                "AND writer_binding_mode = 'BOUND' "
+                "AND terminal IS NULL "
+                "AND id != ? "
+                "LIMIT 1",
+                (canonical_worktree_path, job_id),
+            ).fetchone()
+            if conflict is not None:
+                raise WorktreeConflictError(
+                    f"worktree {canonical_worktree_path!r} is already bound by "
+                    f"non-terminal job {conflict['id']!r}"
+                )
             self._update_supervisor_job(
                 job_id,
                 writer_dispatch_id=dispatch_id,
@@ -3937,6 +4096,280 @@ class Store:
                 writer_binding_mode="BOUND",
             )
             return self.get_supervisor_job(job_id)
+
+    def set_job_metadata(
+        self,
+        job_id: str,
+        *,
+        owner_instance_id: str,
+        lease_epoch: int,
+        mutation_path_roots: Optional[list] = None,
+        mutation_modules: Optional[list] = None,
+        external_action_class: Optional[str] = None,
+        integration_target: Optional[str] = None,
+        action_scope: Optional[str] = None,
+        depends_on: Optional[str] = None,
+        repo_identity: Optional[str] = None,
+        canonical_worktree_path: Optional[str] = None,
+        branch_identity: Optional[str] = None,
+    ) -> dict:
+        """Persist the trusted per-job mutation metadata (Phase I1 §9/§3).
+
+        Supervisor-authorized + lease-fenced (F5): the job MUST currently be
+        held by ``(owner_instance_id, lease_epoch)`` with an unexpired lease —
+        exactly like :meth:`bind_writer_worktree`.  A stale epoch / wrong owner
+        / expired lease / absent job raises :class:`LeaseFencedError` (or
+        :class:`NotFound`), and nothing is written.  ``facts_version`` is
+        bumped on every write so a concurrent action fence observes the change.
+
+        TRUSTED input only — originates from controller/task analysis, never
+        from agent prose.  Serializes the bounded path-roots/module lists and
+        persists the footprint + dependency columns on ``supervisor_jobs``
+        (single source of truth; no second table).  Additive: only the columns
+        the caller provides are written; ``None`` leaves a column untouched.
+
+        A repository identity / canonical worktree path / branch identity may
+        also be pre-declared here (the same columns ``bind_writer_worktree``
+        later confirms against real git provenance).  Raises ``ValueError`` on
+        over-bounded/malformed input (fail-closed).
+        """
+        from .concurrency_policy import (
+            serialize_footprint_modules,
+            serialize_footprint_paths,
+        )
+
+        fields: dict = {}
+        if mutation_path_roots is not None:
+            fields["mutation_path_roots"] = serialize_footprint_paths(
+                mutation_path_roots)
+        if mutation_modules is not None:
+            fields["mutation_modules"] = serialize_footprint_modules(
+                mutation_modules)
+        if external_action_class is not None:
+            if not isinstance(external_action_class, str) \
+                    or not external_action_class.strip():
+                raise ValueError(
+                    "external_action_class must be a non-empty string when set")
+            fields["external_action_class"] = external_action_class.strip()
+        if integration_target is not None:
+            if not isinstance(integration_target, str) \
+                    or not integration_target.strip():
+                raise ValueError(
+                    "integration_target must be a non-empty string when set")
+            fields["integration_target"] = integration_target.strip()
+        if action_scope is not None:
+            from .concurrency_policy import ACTION_GLOBAL, ACTION_REPO_GLOBAL
+            if action_scope not in (ACTION_GLOBAL, ACTION_REPO_GLOBAL):
+                raise ValueError(
+                    f"action_scope must be {ACTION_GLOBAL!r} or "
+                    f"{ACTION_REPO_GLOBAL!r}")
+            fields["action_scope"] = action_scope
+        if depends_on is not None:
+            if not isinstance(depends_on, str) or not depends_on.strip():
+                raise ValueError("depends_on must be a non-empty string when set")
+            fields["depends_on"] = depends_on.strip()
+        if repo_identity is not None:
+            from .worktree import validate_repo_identity
+            fields["repo_identity"] = validate_repo_identity(repo_identity)
+        if canonical_worktree_path is not None:
+            if not isinstance(canonical_worktree_path, str) \
+                    or not canonical_worktree_path.strip():
+                raise ValueError(
+                    "canonical_worktree_path must be a non-empty string when set")
+            fields["canonical_worktree_path"] = canonical_worktree_path.strip()
+        if branch_identity is not None:
+            from .worktree import validate_branch_identity
+            fields["branch_identity"] = validate_branch_identity(branch_identity)
+        # Supervisor-authorized lease fencing (F5): a valid non-empty owner and
+        # a positive epoch are required up front; the exact current-lease check
+        # happens inside the transaction.
+        self._validate_lease_owner(owner_instance_id)
+        if not isinstance(lease_epoch, int) or lease_epoch < 1:
+            raise ValueError("lease_epoch must be a positive integer")
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT * FROM supervisor_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise NotFound(f"supervisor job {job_id!r} not found")
+            job = dict(row)
+            if job["owner_instance_id"] != owner_instance_id:
+                raise LeaseFencedError(
+                    f"set_job_metadata: owner mismatch for job {job_id!r}"
+                )
+            if job["lease_epoch"] != lease_epoch:
+                raise LeaseFencedError(
+                    f"set_job_metadata: epoch mismatch for job {job_id!r}"
+                )
+            now_iso = self.now_iso()
+            if job["lease_expires_at"] is None or job["lease_expires_at"] <= now_iso:
+                raise LeaseFencedError(
+                    f"set_job_metadata: lease expired for job {job_id!r}"
+                )
+            if fields:
+                fields["facts_version"] = job["facts_version"] + 1
+                self._update_supervisor_job(job_id, **fields)
+            return self.get_supervisor_job(job_id)
+
+    def get_dependency_terminal(self, depends_on: str) -> Optional[str]:
+        """Resolve a prerequisite job's terminal state (or ``DEPENDENCY_MISSING``).
+
+        Returns the referenced job's ``terminal`` value, or the
+        ``concurrency_policy.DEPENDENCY_MISSING`` sentinel when the referenced
+        job does not exist (fail conservative).  Pure read.
+        """
+        from .concurrency_policy import DEPENDENCY_MISSING
+
+        row = self._conn.execute(
+            "SELECT terminal FROM supervisor_jobs WHERE id = ?", (depends_on,)
+        ).fetchone()
+        if row is None:
+            return DEPENDENCY_MISSING
+        return row["terminal"]
+
+    def list_active_job_facts(self, *, exclude_job_id: Optional[str] = None):
+        """List concurrency-relevant facts for every active (RUNNING) job.
+
+        Returns a list of dicts (id, role, resource_class, repo_identity,
+        canonical_worktree_path, branch_identity, mutation_path_roots,
+        mutation_modules, external_action_class, integration_target,
+        depends_on) — trusted store data only, excluding ``exclude_job_id``
+        (so a job never serializes against itself).
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM supervisor_jobs"
+        ).fetchall()
+        out = []
+        for row in rows:
+            job = dict(row)
+            if job.get("terminal") is not None:
+                continue
+            if job.get("primary_state") != job_state.PrimaryState.RUNNING.value:
+                continue
+            if exclude_job_id is not None and job["id"] == exclude_job_id:
+                continue
+            out.append({
+                "id": job["id"],
+                "role": job.get("expected_role"),
+                "resource_class": job.get("resource_class") or "LIGHT",
+                "repo_identity": job.get("repo_identity"),
+                "canonical_worktree_path": job.get("canonical_worktree_path"),
+                "branch_identity": job.get("branch_identity"),
+                "mutation_path_roots": job.get("mutation_path_roots"),
+                "mutation_modules": job.get("mutation_modules"),
+                "external_action_class": job.get("external_action_class"),
+                "integration_target": job.get("integration_target"),
+                "action_scope": job.get("action_scope"),
+                "depends_on": job.get("depends_on"),
+            })
+        return out
+
+    def _job_holds_current_lease(
+        self, job_id: str, lease_epoch: int, now_iso: str,
+    ) -> bool:
+        """True iff ``(job_id, lease_epoch)`` is the current, unexpired lease
+        holder of an existing NON-TERMINAL job (F5 action-lock boundary).
+
+        Fails closed for a phantom job id, a terminal job, an unleased job
+        (owner NULL), a stale epoch, or an expired lease — the caller does not
+        hold a current lease.
+        """
+        row = self._conn.execute(
+            "SELECT owner_instance_id, lease_epoch, lease_expires_at, terminal "
+            "FROM supervisor_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["terminal"] is not None:
+            return False
+        if row["owner_instance_id"] is None:
+            return False
+        if row["lease_epoch"] != lease_epoch:
+            return False
+        expires = row["lease_expires_at"]
+        return expires is not None and expires > now_iso
+
+    def try_acquire_action_lock(
+        self, lock_name: str, *, job_id: str, lease_epoch: int,
+    ) -> bool:
+        """I1 (§17): CAS-acquire a named action lock (repo-global or global).
+
+        Crash-safe / lease-fenced (F5): the caller ``(job_id, lease_epoch)``
+        MUST be the current, unexpired lease holder of an existing non-terminal
+        job (else :class:`LeaseFencedError`, fail closed).  Returns True when
+        the lock was free, already held by this exact holder (re-entrant), or
+        reclaimed from a stale holder whose lease is no longer current
+        (expired / terminal / reassigned) — the reclaim is an atomic CAS on the
+        lock row.  Returns False when a DIFFERENT valid holder owns it.  Runs
+        atomically on a single connection.
+        """
+        if not isinstance(lock_name, str) or not lock_name.strip():
+            raise ValueError("lock_name must be a non-empty string")
+        if not isinstance(job_id, str) or not job_id.strip():
+            raise ValueError("job_id must be a non-empty string")
+        if not isinstance(lease_epoch, int) or lease_epoch < 1:
+            raise ValueError("lease_epoch must be a positive integer")
+        with self._transaction():
+            now_iso = self.now_iso()
+            if not self._job_holds_current_lease(job_id, lease_epoch, now_iso):
+                raise LeaseFencedError(
+                    f"action lock: {job_id!r} epoch {lease_epoch} is not the "
+                    f"current unexpired lease holder"
+                )
+            row = self._conn.execute(
+                "SELECT holder_job_id, holder_lease_epoch FROM action_locks "
+                "WHERE lock_name = ?", (lock_name,),
+            ).fetchone()
+            if row is None:
+                self._conn.execute(
+                    "INSERT INTO action_locks (lock_name, holder_job_id, "
+                    "holder_lease_epoch, acquired_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (lock_name, job_id, lease_epoch, now_iso, now_iso),
+                )
+                return True
+            if row["holder_job_id"] == job_id and \
+                    row["holder_lease_epoch"] == lease_epoch:
+                return True
+            # Bounded staleness: a lock whose holder no longer holds a current
+            # lease may be reclaimed atomically (CAS on the lock row).
+            if not self._job_holds_current_lease(
+                row["holder_job_id"], row["holder_lease_epoch"], now_iso,
+            ):
+                self._conn.execute(
+                    "UPDATE action_locks SET holder_job_id = ?, "
+                    "holder_lease_epoch = ?, updated_at = ? "
+                    "WHERE lock_name = ?",
+                    (job_id, lease_epoch, now_iso, lock_name),
+                )
+                return True
+            return False
+
+    def release_action_lock(
+        self, lock_name: str, *, job_id: str, lease_epoch: int,
+    ) -> bool:
+        """I1 (§17): release a named action lock iff this holder owns it.
+
+        Returns True when the lock was released (or already free), False when
+        another holder owns it (the release is refused — fail closed).
+        """
+        if not isinstance(lock_name, str) or not lock_name.strip():
+            raise ValueError("lock_name must be a non-empty string")
+        with self._transaction():
+            row = self._conn.execute(
+                "SELECT holder_job_id, holder_lease_epoch FROM action_locks "
+                "WHERE lock_name = ?", (lock_name,),
+            ).fetchone()
+            if row is None:
+                return True
+            if row["holder_job_id"] != job_id or \
+                    row["holder_lease_epoch"] != lease_epoch:
+                return False
+            self._conn.execute(
+                "DELETE FROM action_locks WHERE lock_name = ?", (lock_name,),
+            )
+            return True
 
     # -- F1 (Phase B2): in-transaction action fence ---------------------------
     #
@@ -4041,6 +4474,10 @@ class Store:
         last_resource_reason_code: Optional[str] = None,
         last_resource_snapshot_hash: Optional[str] = None,
         last_resource_at: Optional[str] = None,
+        # I1: concurrency audit (persisted for audit; never authorizes an
+        # automatic admission — a new claim always re-runs the policy).
+        last_concurrency_reason_code: Optional[str] = None,
+        last_concurrency_at: Optional[str] = None,
     ) -> dict:
         """(Re-)enqueue a job as ``QUEUED`` with queue/retry metadata (F2).
 
@@ -4095,6 +4532,8 @@ class Store:
                 ("last_resource_reason_code", last_resource_reason_code),
                 ("last_resource_snapshot_hash", last_resource_snapshot_hash),
                 ("last_resource_at", last_resource_at),
+                ("last_concurrency_reason_code", last_concurrency_reason_code),
+                ("last_concurrency_at", last_concurrency_at),
             ):
                 if val is not None:
                     common_fields[key] = val

@@ -187,6 +187,30 @@ def test_dual_supervisor_store_reader_blocks_second_writer(db_path):
                                resource_class=ResourceClass.MEDIUM.value)
     jid1, jid2 = j1.supervisor_job_id, j2.supervisor_job_id
 
+    # I1: give the two writers DISTINCT trusted footprints (different repos /
+    # worktrees / disjoint path roots) so the structural concurrency gate
+    # ALLOWs them; the Resource Governor's single-writer budget is then the
+    # authority that blocks the second writer (preserving this test's intent).
+    # The metadata setter is lease-fenced (F5): each job is leased first.
+    e1 = sup1.store.claim_job(jid1, owner_instance_id="A",
+                              ttl_seconds=3600)["lease_epoch"]
+    sup1.store.set_job_metadata(
+        jid1, owner_instance_id="A", lease_epoch=e1,
+        repo_identity="repo-A", canonical_worktree_path="/wt/A",
+        branch_identity="main", mutation_path_roots=["src/a"],
+    )
+    e2 = sup1.store.claim_job(jid2, owner_instance_id="B",
+                              ttl_seconds=3600)["lease_epoch"]
+    sup1.store.set_job_metadata(
+        jid2, owner_instance_id="B", lease_epoch=e2,
+        repo_identity="repo-B", canonical_worktree_path="/wt/B",
+        branch_identity="main", mutation_path_roots=["src/b"],
+    )
+    # jid2 is re-enqueued (metadata persists) so its fresh claim re-runs the
+    # structural gate against the RUNNING jid1.
+    sup1.store.enqueue_job(jid2, queue_reason="NEW", owner_instance_id="B",
+                           lease_epoch=e2)
+
     # A claims job1 (deterministic ALLOW) -> RUNNING.
     allow = FakeGovernor(_admission(
         AdmissionVerdict.ALLOW.value, ResourceReasonCode.OK.value,

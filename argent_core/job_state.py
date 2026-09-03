@@ -52,6 +52,10 @@ class QueueReason(str, Enum):
     # job stays QUEUED; these are just queue_reason values).
     RESOURCE_DEFERRED = "RESOURCE_DEFERRED"
     RESOURCE_DENIED = "RESOURCE_DENIED"
+    # I1: structural concurrency serialization/deferral (worktree/repo/
+    # footprint/dependency/action conflicts).  Not a failure class — the job
+    # stays QUEUED with a bounded next_eligible_at and is retried later.
+    CONCURRENCY_SERIALIZED = "CONCURRENCY_SERIALIZED"
 
 
 class ErrorClass(str, Enum):

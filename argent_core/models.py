@@ -231,6 +231,16 @@ class LeaseFencedError(ArgentError):
     """
 
 
+class WorktreeConflictError(ArgentError):
+    """A writer-worktree binding conflicts with another job (Phase I1, F3).
+
+    Raised when a job attempts to bind a canonical worktree that is already
+    authoritatively bound (``writer_binding_mode='BOUND'``) by a DIFFERENT
+    non-terminal job — the hard ONE-worktree = ONE-authoritative-writer-lease
+    invariant.  Nothing was written.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------

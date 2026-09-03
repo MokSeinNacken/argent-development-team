@@ -140,12 +140,13 @@ def test_regression_retrieval_bounds(tmp_path):
             authorized_root=str(root), reference="../etc/passwd"))
 
 
-# Schema: version 18 (G1 fix-round F2 additive revision column); additive tables present
+# Schema: version 20 (I1 additive mutation-footprint + dependency + action-lock
+# + hard writer-worktree partial unique index + action_locks FK); additive tables present
 def test_regression_schema_version(db_path):
     core = Core(db_path)
-    assert SCHEMA_VERSION == "18"
+    assert SCHEMA_VERSION == "20"
     tables = {r[0] for r in core._store._conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    for t in ("context_packs", "handoffs_v2", "checkpoints"):
+    for t in ("context_packs", "handoffs_v2", "checkpoints", "action_locks"):
         assert t in tables
     core.close()

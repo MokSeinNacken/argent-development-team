@@ -47,6 +47,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 
 from . import job_state
+from .concurrency_policy import (
+    ConcurrencyVerdict,
+    JobFacts,
+    MutationFootprint,
+    decide as decide_concurrency,
+    parse_footprint_list,
+)
 from .context_pack import is_permanent_context_code
 from .host_snapshot import HostSnapshotProvider
 from .models import LeaseError, LeaseFencedError, NotFound
@@ -102,6 +109,9 @@ OUTCOME_RESOURCE_LOST = "resource_lost"
 OUTCOME_RESOURCE_RECOVERED = "resource_recovered"
 # D1 (Phase D): a Context-Pack build failure (fail-closed, no dispatch).
 OUTCOME_CONTEXT_FAILED = "context_build_failed"
+# I1 (Phase I1): structural concurrency gate outcomes.
+OUTCOME_CONCURRENCY_SERIALIZED = "concurrency_serialized"
+OUTCOME_CONCURRENCY_BLOCKED = "concurrency_blocked"
 
 #: Far-future ``next_eligible_at`` delay (seconds) for DENY_LOCAL: prevents an
 #: identical automatic retry without inventing a new primary state.  The job
@@ -216,8 +226,11 @@ class Scheduler:
                 active_jobs_reader=self._store_active_jobs_reader(),
             )
         # Job currently being preflighted (excluded from the active-jobs view so
-        # a job never concurrency-blocks itself).  Set by ``_resource_preflight``.
-        self._preflight_job_id: Optional[str] = None
+        # a job never concurrency-blocks itself).  This is a SINGLE shared cell
+        # on the Supervisor (``_admission_exclude_job_id``), set by BOTH
+        # ``_resource_preflight`` (claim gate) and the Supervisor's
+        # ``_fresh_admission`` (binding spawn gate).
+        self._supervisor._admission_exclude_job_id = None
 
         # C2: wire the resolved governor/provider back onto the supervisor so
         # the supervisor's ``_perform_spawn_run`` performs its own FRESH C1
@@ -443,33 +456,14 @@ class Scheduler:
     def _store_active_jobs_reader(self):
         """Build the default active-jobs reader from the trusted job store (F1).
 
-        Reads every non-terminal RUNNING job (with its persisted
-        ``resource_class`` — trusted store data, never agent output) and returns
-        ``[(job_id, resource_class), ...]``.  The job currently being preflighted
-        (``self._preflight_job_id``) is excluded so a job never blocks itself.
-        Any store read/parse error returns ``None`` (UNKNOWN, fail-closed) —
-        never an empty list for an unreadable store.
+        Delegates to the Supervisor's UNIFIED store-backed reader, which
+        excludes the job currently being admitted
+        (``_admission_exclude_job_id``) — the SAME shared cell the Supervisor's
+        ``_fresh_admission`` sets at the binding enforcement point — so a job
+        never concurrency-blocks itself at EITHER the claim preflight or the
+        spawn admission.  Returns ``[(job_id, resource_class), ...]``.
         """
-        store = self._supervisor.core._store
-
-        def reader():
-            try:
-                rows = store.list_supervisor_jobs()
-            except Exception:
-                return None
-            try:
-                exclude = self._preflight_job_id
-                return [
-                    (row["id"], row.get("resource_class") or ResourceClass.LIGHT.value)
-                    for row in rows
-                    if row.get("terminal") is None
-                    and row.get("primary_state") == job_state.PrimaryState.RUNNING.value
-                    and row["id"] != exclude
-                ]
-            except Exception:
-                return None
-
-        return reader
+        return self._supervisor._default_active_jobs_reader()
 
     def _resource_preflight(self, job_id: str):
         """Run the C1 admission preflight for a job.
@@ -479,7 +473,7 @@ class Scheduler:
         The job's ``resource_class`` comes from the trusted persisted job row —
         never from agent output.
         """
-        self._preflight_job_id = job_id
+        self._supervisor._admission_exclude_job_id = job_id
         try:
             row = self._supervisor.store._job_row(job_id)
             rc = (row or {}).get("resource_class") or ResourceClass.LIGHT.value
@@ -492,7 +486,7 @@ class Scheduler:
                 now_iso=self._supervisor._now_iso(),
             )
         finally:
-            self._preflight_job_id = None
+            self._supervisor._admission_exclude_job_id = None
 
     def _resource_gate(self, job_id: str, epoch: int, admission):
         """Apply a non-ALLOW admission verdict; returns a result or None.
@@ -676,6 +670,116 @@ class Scheduler:
         except (LeaseError, LeaseFencedError):
             pass
 
+    # -- I1 (Phase I1): structural concurrency gate -------------------------
+
+    def _facts_from_row(self, row, *, dependency_terminal=None) -> JobFacts:
+        """Build :class:`JobFacts` from a persisted supervisor_jobs row."""
+        return JobFacts(
+            job_id=row["id"],
+            role=row.get("role") or row.get("expected_role"),
+            resource_class=row.get("resource_class") or "LIGHT",
+            footprint=MutationFootprint(
+                repo_identity=row.get("repo_identity"),
+                canonical_worktree_path=row.get("canonical_worktree_path"),
+                branch_identity=row.get("branch_identity"),
+                path_roots=parse_footprint_list(row.get("mutation_path_roots")),
+                modules=parse_footprint_list(row.get("mutation_modules")),
+                external_action_class=row.get("external_action_class"),
+                integration_target=row.get("integration_target"),
+            ),
+            depends_on=row.get("depends_on"),
+            dependency_terminal=dependency_terminal,
+            action_class=row.get("action_scope"),
+        )
+
+    def _concurrency_preflight(self, job_id: str):
+        """Compute the structural concurrency decision for a job against the
+        active RUNNING set (trusted store data only, never agent output).
+
+        Resolves the job's ``depends_on`` prerequisite terminal state from the
+        store before calling the pure policy.  Returns ``None`` when the job
+        row is missing (caller handles it).
+        """
+        row = self._supervisor.store._job_row(job_id)
+        if row is None:
+            return None
+        dep_terminal = None
+        if row.get("depends_on"):
+            dep_terminal = self._supervisor.store.get_dependency_terminal(
+                row["depends_on"])
+        candidate = self._facts_from_row(row, dependency_terminal=dep_terminal)
+        active = [
+            self._facts_from_row(f)
+            for f in self._supervisor.store.list_active_job_facts(
+                exclude_job_id=job_id)
+        ]
+        return decide_concurrency(candidate, active)
+
+    def _concurrency_gate(self, job_id: str, epoch: int, decision):
+        """Apply a non-ALLOW_PARALLEL concurrency decision; returns a result.
+
+        SERIALIZE/DEFER requeue as QUEUED (no spawn) with a bounded retry
+        horizon and ``CONCURRENCY_SERIALIZED`` queue reason; BLOCK quarantines
+        the job as BLOCKED (terminal, owner/policy requeue only).  ALLOW_PARALLEL
+        returns ``None`` so the caller continues to the resource gate.
+        """
+        if decision is None or \
+                decision.verdict == ConcurrencyVerdict.ALLOW_PARALLEL.value:
+            return None
+        if decision.verdict == ConcurrencyVerdict.BLOCK.value:
+            self._concurrency_block_job(job_id, epoch, decision)
+            self._supervisor.clear_lease_owner()
+            return SchedulerPassResult(
+                OUTCOME_CONCURRENCY_BLOCKED, job_id=job_id,
+                detail=decision.reason_code,
+            )
+        # SERIALIZE / DEFER -> bounded requeue (no spawn).
+        self._concurrency_defer_job(job_id, epoch, decision)
+        self._supervisor.clear_lease_owner()
+        return SchedulerPassResult(
+            OUTCOME_CONCURRENCY_SERIALIZED, job_id=job_id,
+            detail=decision.reason_code,
+        )
+
+    def _concurrency_defer_job(self, job_id: str, epoch: int, decision) -> None:
+        """SERIALIZE/DEFER: requeue as QUEUED (no spawn) with a bounded horizon."""
+        policy = self._governor.policy if self._governor is not None else None
+        defer_seconds = getattr(policy, "defer_retry_seconds", 300) \
+            if policy is not None else 300
+        now_iso = self._supervisor._now_iso()
+        try:
+            dt = datetime.fromisoformat(now_iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            next_eligible_at = (
+                dt + timedelta(seconds=defer_seconds)
+            ).isoformat()
+        except (ValueError, TypeError):
+            next_eligible_at = None
+        self._supervisor.store.enqueue_job(
+            job_id,
+            queue_reason=job_state.QueueReason.CONCURRENCY_SERIALIZED.value,
+            next_eligible_at=next_eligible_at,
+            error_class=job_state.ErrorClass.NONE.value,
+            error_code=decision.reason_code,
+            owner_instance_id=self.owner_instance_id,
+            lease_epoch=epoch,
+            last_concurrency_reason_code=decision.reason_code,
+            last_concurrency_at=now_iso,
+        )
+
+    def _concurrency_block_job(self, job_id: str, epoch: int, decision) -> None:
+        """BLOCK: quarantine as BLOCKED (terminal; owner/policy requeue only).
+
+        A structural BLOCK (e.g. a missing prerequisite) can never be satisfied
+        by retrying, so the job is quarantined like a worktree divergence.
+        """
+        self._supervisor.store.quarantine_blocked(
+            job_id,
+            error_code=decision.reason_code,
+            error_class=job_state.ErrorClass.OWNER_REQUIRED.value,
+        )
+
     def run_pass(self, job_id: Optional[str] = None) -> SchedulerPassResult:
         """Run one bounded scheduler pass (exactly one safe step, then return).
 
@@ -691,6 +795,19 @@ class Scheduler:
 
         target_job_id, epoch, held = target
         self._supervisor.set_lease_owner(self.owner_instance_id, epoch)
+
+        # I1 (Phase I1): the structural concurrency gate runs on every NEW claim
+        # (``held=False``) BEFORE the resource gate — the earliest trusted
+        # structural admission filter (worktree/repo/footprint/dependency/
+        # action conflicts).  A continuation (``held=True``) is re-gated at the
+        # spawn gate below (F2) using the persisted facts, so a role/footprint
+        # change can never slip a write job past as read-only.
+        if not held:
+            gate = self._concurrency_gate(
+                target_job_id, epoch, self._concurrency_preflight(target_job_id)
+            )
+            if gate is not None:
+                return gate
 
         # C1: resource preflight runs on every NEW claim (``held=False``), after
         # the atomic claim and BEFORE reconcile/spawn — the earliest trusted
@@ -742,6 +859,18 @@ class Scheduler:
                 return SchedulerPassResult(
                     OUTCOME_NO_WORK, job_id=target_job_id, detail="stop_requested",
                 )
+            # I1 (F2): the STRUCTURAL concurrency policy is re-computed at the
+            # spawn gate from the persisted facts (role/footprint/worktree)
+            # EVERY time a job is about to SPAWN_RUN — INCLUDING continuations
+            # (``held=True``) — so a role/footprint change since claim can never
+            # slip a write-capable job past as read-only.  This runs BEFORE the
+            # resource gate (structural conflict is the earlier filter).
+            cgate = self._concurrency_gate(
+                target_job_id, epoch,
+                self._concurrency_preflight(target_job_id),
+            )
+            if cgate is not None:
+                return cgate
             gate = self._resource_gate(
                 target_job_id, epoch, self._resource_preflight(target_job_id)
             )
