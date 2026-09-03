@@ -211,19 +211,19 @@ def test_install_check_declares_read_only_intent():
 # ---------------------------------------------------------------------------
 
 #: This host's three deployment substitutions (env-parameterizable like
-#: g2-systemd/install-check.sh).  I3-B: the accepted live deployment advanced
-#: from the G3 worktree to the I3-A worktree (unit WorkingDirectory/
-#: Documentation re-pointed during the authorized Phase-I3-A deploy), so the
-#: defaults track the I3-A deployment.
+#: g2-systemd/install-check.sh).  I3-C1: the accepted live deployment advanced
+#: from the I3-A worktree to the I3-B worktree (unit WorkingDirectory/
+#: Documentation re-pointed during the authorized Phase-I3-B deploy), so the
+#: defaults track the I3-B deployment.
 import os as _os
 
 _DEFAULT_WORKTREE = _os.environ.get(
     "ARGENT_WORKTREE",
-    "/home/pc/projects/argent-worktrees/phase-i3a-external-action-broker",
+    "/home/pc/projects/argent-worktrees/phase-i3b-github-live-acceptance",
 )
 _DEFAULT_DOC = _os.environ.get(
     "ARGENT_DOC",
-    f"file:{_DEFAULT_WORKTREE}/docs/PHASE_I3A_ACCEPTANCE.md",
+    f"file:{_DEFAULT_WORKTREE}/docs/PHASE_I3B_ACCEPTANCE.md",
 )
 _DEFAULT_WORKDIR = _DEFAULT_WORKTREE
 _DEFAULT_ENVFILE = "-/home/pc/.config/argent/service.env"

@@ -256,3 +256,56 @@ class AutoRunStatusProvider:
             provider=provider, model=model, thinking_tier=thinking,
             result=result,
         )
+
+
+def allow_governor():
+    """Deterministic always-ALLOW resource governor + no-op snapshot provider.
+
+    Scheduler unit tests that prove scheduling/fencing/wait semantics must not
+    depend on the REAL host resource governor: under machine memory pressure a
+    new-claim preflight can be DEFERred, intermittently breaking full-suite
+    runs (pre-existing load-sensitive race, reproduced at the I3-B base;
+    production single-supervisor path unaffected).  Resource admission itself
+    is exercised in the C-phase suites with scripted governors.
+    """
+    from argent_core.resource_governor import AdmissionDecision
+    from argent_core.resource_policy import ResourceClass, ResourcePolicy
+
+    class _AllowGovernor:
+        def __init__(self):
+            self.policy = ResourcePolicy()
+            self.decision = AdmissionDecision(
+                resource_class=ResourceClass.LIGHT.value,
+                policy_version="1",
+                snapshot_ref="snap-test",
+                decision="ALLOW",
+                reason_code="OK",
+                next_eligible_at=None,
+                effective_limits={},
+                timestamp="2026-09-01T00:00:00+00:00",
+            )
+            self.calls = []
+
+        def decide(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.decision
+
+    class _NoopSnapshotProvider:
+        def capture(self, *args, **kwargs):
+            return {}
+
+    return _AllowGovernor(), _NoopSnapshotProvider()
+
+
+def make_deterministic_scheduler(supervisor, *, owner_instance_id, lease_ttl_seconds):
+    """Scheduler with canned ALLOW admission (no real-host dependency)."""
+    from argent_core.scheduler import Scheduler
+
+    governor, snapshot = allow_governor()
+    return Scheduler(
+        supervisor,
+        owner_instance_id=owner_instance_id,
+        lease_ttl_seconds=lease_ttl_seconds,
+        resource_governor=governor,
+        snapshot_provider=snapshot,
+    )

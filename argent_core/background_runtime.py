@@ -398,6 +398,7 @@ class SupervisorRuntime:
         external_wait_manager,
         instance: SupervisorInstance,
         store,
+        ci_wait_manager=None,
         clock: Optional[Callable[[], datetime]] = None,
         sleep_fn: Optional[Callable[[float], None]] = None,
         stop_event=None,
@@ -410,6 +411,7 @@ class SupervisorRuntime:
     ):
         self._scheduler = scheduler
         self._external_wait_manager = external_wait_manager
+        self._ci_wait_manager = ci_wait_manager
         self._instance = instance
         self._store = store
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -541,15 +543,35 @@ class SupervisorRuntime:
         else:
             self._consecutive_errors = 0
         # F7(d): external waits + heartbeat run even in pass-error passes.
-        try:
-            wait_results = self._external_wait_manager.check_due_waits()
-        except Exception as exc:  # noqa: BLE001 - contained per-wait already; loop-level safety
-            self._record_error(type(exc).__name__)
-            wait_results = []
+        # HIGH-2(a): re-verify the single-active singleton fence BEFORE polling
+        # due waits — a stale/taken-over instance must abort with NO writes.
+        fence_held = True
+        if self._instance.identity is not None:
+            fence_held = self._fence_held()
+        wait_results = []
+        ci_wait_results = []
+        if not fence_held:
+            self.mark_failed("instance_lease_lost")
+        else:
+            try:
+                wait_results = self._external_wait_manager.check_due_waits()
+            except Exception as exc:  # noqa: BLE001 - contained per-wait already; loop-level safety
+                self._record_error(type(exc).__name__)
+                wait_results = []
+            if self._ci_wait_manager is not None:
+                try:
+                    ci_wait_results = self._ci_wait_manager.check_due_ci_waits(
+                        instance_id=(self._instance.instance_id
+                                     if self._instance.identity is not None
+                                     else None))
+                except Exception as exc:  # noqa: BLE001 - contained per-wait already
+                    self._record_error(type(exc).__name__)
+                    ci_wait_results = []
         self._last_pass_outcome = outcome
         self._last_work_had_activity = (
             (outcome is not None and outcome != OUTCOME_NO_WORK)
             or bool(wait_results)
+            or bool(ci_wait_results)
         )
         # F3(b): heartbeat + fence checks are only meaningful once we actually
         # hold the single-active fence (a successful acquire sets ``identity``).

@@ -26,7 +26,7 @@ from argent_core.models import LeaseError, LeaseFencedError
 from argent_core.scheduler import OUTCOME_NO_WORK, Scheduler
 from argent_core.supervisor import ReconcileAction, Supervisor
 from argent_core.store import _format_dt
-from mock_supervisor_runtime import FakeClock, FakeRunLauncher, FakeRunStatusProvider
+from mock_supervisor_runtime import FakeClock, FakeRunLauncher, FakeRunStatusProvider, make_deterministic_scheduler
 
 OWNER = OWNER_SOURCE
 LEAD = role_source(Role.LEAD)
@@ -217,7 +217,7 @@ def test_f2_backoff_before_deadline_is_effectless(db_path):
     clock = FakeClock()
     env = make_env(db_path, clock=clock)
     jid = add_job_for_task(env)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     env.sup.store.claim_job(jid, owner_instance_id="A", ttl_seconds=60)
     env.sup.set_lease_owner("A", 1)
     # Produce a snapshot-contention backoff (the F2 persistence shape).
@@ -250,7 +250,7 @@ def test_f2_held_continue_requires_running_state(db_path):
     clock = FakeClock()
     env = make_env(db_path, clock=clock)
     jid = add_job_for_task(env)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     # A holds a valid lease, but the job was persisted into BACKOFF (QUEUED)
     # with a future eligibility deadline while the lease lingered.
     env.sup.store.claim_job(jid, owner_instance_id="A", ttl_seconds=60)
@@ -298,7 +298,7 @@ def test_f3_interleaving_scan_quarantine_does_not_overwrite(db_path):
         jid, primary_state="RUNNING", status="ACTIVE",
         owner_instance_id="A", lease_epoch=1,
     )
-    sched = Scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
     real_quarantine = env.sup.store.quarantine_lost
     interleaved = {"done": False}
 
@@ -333,7 +333,7 @@ def test_f4_owner_null_future_expiry_is_lost_not_foreign(db_path):
         jid, primary_state="RUNNING", status="ACTIVE",
         owner_instance_id=None, lease_epoch=0, lease_expires_at=future,
     )
-    sched = Scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
     summary = sched.reconcile_after_restart()
     assert summary.quarantined_lost == 1
     assert summary.foreign_lease_kept == 0
@@ -350,7 +350,7 @@ def test_f4_owner_null_expired_expiry_is_lost_not_takeover(db_path):
         jid, primary_state="RUNNING", status="ACTIVE",
         owner_instance_id=None, lease_epoch=0, lease_expires_at=past,
     )
-    sched = Scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
     summary = sched.reconcile_after_restart()
     assert summary.quarantined_lost == 1
     assert summary.takeover_candidates == 0

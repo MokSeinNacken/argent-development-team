@@ -97,6 +97,44 @@ def seed_owner(
     return row
 
 
+def _allow_governor():
+    """Deterministic always-ALLOW admission for scheduler unit-test envs.
+
+    The default (real) ResourceGovernor reads the LIVE host snapshot, so
+    new-claim preflights in unit tests are load-sensitive: under machine
+    memory pressure a claim can be DEFERred, intermittently breaking tests
+    that drive a job to RUNNING via scheduler passes (pre-existing race,
+    reproduced at the I3-B base; production single-supervisor path
+    unaffected).  These envs prove scheduling/fencing/wait semantics, not
+    host admission, so claims use a canned ALLOW governor.
+    """
+    from argent_core.resource_governor import AdmissionDecision
+    from argent_core.resource_policy import ResourceClass, ResourcePolicy
+
+    class _AllowGovernor:
+        def __init__(self):
+            self.policy = ResourcePolicy()
+            self.decision = AdmissionDecision(
+                resource_class=ResourceClass.LIGHT.value,
+                policy_version="1",
+                snapshot_ref="snap-test",
+                decision="ALLOW",
+                reason_code="OK",
+                next_eligible_at=None,
+                effective_limits={},
+                timestamp="2026-09-01T00:00:00+00:00",
+            )
+
+        def decide(self, **kwargs):
+            return self.decision
+
+    class _NoopSnapshotProvider:
+        def capture(self, *args, **kwargs):
+            return {}
+
+    return _AllowGovernor(), _NoopSnapshotProvider()
+
+
 def make_runtime_env(
     db_path,
     *,
@@ -124,7 +162,14 @@ def make_runtime_env(
         enforcer=enforcer or ExecutionEnforcer(FakeScopeBackend()),
         prompts_dir=Path(db_path).parent / "prompts",
     )
-    sched = Scheduler(sup, owner_instance_id=instance_id, lease_ttl_seconds=60)
+    governor, snapshot_provider = _allow_governor()
+    sched = Scheduler(
+        sup,
+        owner_instance_id=instance_id,
+        lease_ttl_seconds=60,
+        resource_governor=governor,
+        snapshot_provider=snapshot_provider,
+    )
     ewm = ExternalWaitManager(core._store, adapters=adapters or {}, clock=clock)
     instance = make_instance(
         core._store,

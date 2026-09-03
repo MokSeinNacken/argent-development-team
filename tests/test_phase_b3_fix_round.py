@@ -51,7 +51,7 @@ from argent_core.worktree import (
     writer_guard_for,
 )
 from argent_core.workspace_broker import CONTROLLER_SOURCE, WorkspaceBroker
-from mock_supervisor_runtime import FakeClock, FakeRunLauncher, FakeRunStatusProvider
+from mock_supervisor_runtime import FakeClock, FakeRunLauncher, FakeRunStatusProvider, make_deterministic_scheduler
 
 OWNER = OWNER_SOURCE
 
@@ -195,7 +195,7 @@ def test_f2_same_identity_no_takeover(db_path):
                              process_start_ticks=4242),
     })
     env = _f2_env(db_path, prov)
-    sched = Scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
     summary = sched.reconcile_after_restart()
     assert summary.takeover_candidates == 0
     assert summary.process_alive == 1
@@ -212,7 +212,7 @@ def test_f2_boot_change_allows_takeover(db_path):
                              process_start_ticks=4242),
     })
     env = _f2_env(db_path, prov)
-    sched = Scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
     summary = sched.reconcile_after_restart()
     assert summary.takeover_candidates == 1
     assert summary.process_alive == 0
@@ -227,7 +227,7 @@ def test_f2_pid_reuse_is_not_same_process(db_path):
                              process_start_ticks=9999),
     })
     env = _f2_env(db_path, prov)
-    sched = Scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
     summary = sched.reconcile_after_restart()
     assert summary.takeover_candidates == 1
     assert summary.process_alive == 0
@@ -238,7 +238,7 @@ def test_f2_unreadable_identity_lost_no_claim(db_path):
     from argent_core.scheduler import Scheduler
     prov = _ScriptedIdentityProvider({})  # unreadable -> UNKNOWN identity
     env = _f2_env(db_path, prov)
-    sched = Scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
     summary = sched.reconcile_after_restart()
     assert summary.quarantined_lost == 1
     assert summary.takeover_candidates == 0

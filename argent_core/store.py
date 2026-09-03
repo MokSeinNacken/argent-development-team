@@ -109,7 +109,7 @@ from .handoff import HANDOFF_VERSION as HANDOFF_RECORD_VERSION
 # I3-A (Phase I3-A): external_action_requests + external_action_audit tables
 # (additive) — the durable, secret-free external action request lifecycle
 # (provider-neutral).  SEPARATE state machine; no new supervisor_jobs states.
-SCHEMA_VERSION = "22"
+SCHEMA_VERSION = "23"
 
 # D2 (Phase D): bounded JSON column budget enforced at the persistence gate.
 # Each handoff/checkpoint JSON column (result/artifacts/evidence/next-step/
@@ -673,6 +673,8 @@ _SCHEMA: tuple[str, ...] = (
         check_attempt        INTEGER NOT NULL DEFAULT 0 CHECK (check_attempt >= 0),
         event_version        INTEGER NOT NULL DEFAULT 0 CHECK (event_version >= 0),
         terminal_observed_at TEXT,
+        ci_policy            TEXT,
+        ci_evidence          TEXT,
         created_at           TEXT NOT NULL,
         updated_at           TEXT NOT NULL
     )
@@ -1637,6 +1639,22 @@ class Store:
                     f"ALTER TABLE {table} ADD COLUMN record_version "
                     f"TEXT NOT NULL DEFAULT '{version}'"
                 )
+
+        # I3-C1 (Phase I3-C1): CI wait policy + evidence on external_waits
+        # (additive, nullable).  ``ci_policy`` holds the trusted immutable CI
+        # wait identity/policy (required/optional checks, expected base,
+        # candidate id); ``ci_evidence`` holds the latest bounded structured
+        # provider evidence (aggregate state, failing check identity, provider
+        # run ref, head SHA, classification).  Both bounded JSON.  A migrated
+        # pre-I3-C1 table gains them idempotently; a fresh table already
+        # carries them.
+        ecols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(external_waits)")
+        }
+        for col in ("ci_policy", "ci_evidence"):
+            if col not in ecols:
+                self._conn.execute(
+                    f"ALTER TABLE external_waits ADD COLUMN {col} TEXT")
 
         # UPSERT the schema version after successful DDL + migration.
         self._conn.execute(
@@ -3127,6 +3145,7 @@ class Store:
             "wait_id", "job_id", "kind", "provider", "ref", "expected_subject",
             "last_observed_state", "next_check_at", "deadline_at",
             "check_attempt", "event_version", "terminal_observed_at",
+            "ci_policy", "ci_evidence",
             "created_at", "updated_at",
         }
     )
@@ -5789,13 +5808,17 @@ class Store:
         rows = self._conn.execute(q, params).fetchall()
         return [dict(r) for r in rows]
 
-    def list_due_external_waits(self, now_iso: str, limit: int) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT * FROM external_waits WHERE terminal_observed_at IS NULL "
-            "AND (next_check_at <= ? OR deadline_at <= ?) "
-            "ORDER BY next_check_at LIMIT ?",
-            (now_iso, now_iso, limit),
-        ).fetchall()
+    def list_due_external_waits(self, now_iso: str, limit: int,
+                                kind: Optional[str] = None) -> list[dict]:
+        q = ("SELECT * FROM external_waits WHERE terminal_observed_at IS NULL "
+             "AND (next_check_at <= ? OR deadline_at <= ?) ")
+        params: list = [now_iso, now_iso]
+        if kind is not None:
+            q += "AND kind = ? "
+            params.append(kind)
+        q += "ORDER BY next_check_at LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(q, params).fetchall()
         return [dict(r) for r in rows]
 
     def _update_external_wait(self, wait_id: str, **fields) -> int:
@@ -5810,6 +5833,50 @@ class Store:
             list(fields.values()) + [wait_id],
         )
         return cur.rowcount
+
+    def update_external_wait_fenced(
+        self,
+        wait_id: str,
+        *,
+        expected_instance_id: Optional[str] = None,
+        **fields,
+    ) -> int:
+        """Update a NON-terminal external-wait row, optionally instance-fenced.
+
+        Fail-closed: a wait whose ``terminal_observed_at`` is already set is
+        IMMUTABLE — the update is skipped (returns 0), so a late response or
+        backoff can never corrupt terminal evidence (``ci_evidence`` /
+        ``last_observed_state`` / ``ci_policy`` / ``event_version``).  When
+        ``expected_instance_id`` is provided, the single-active singleton fence
+        must still be held by that instance, else the update is skipped (a
+        stale/taken-over instance cannot mutate wait rows).  The terminal flag
+        itself cannot be set here — only :meth:`complete_wait_and_requeue`
+        finalizes a wait.
+        """
+        unknown = set(fields) - (
+            self._EXTERNAL_WAIT_COLUMNS
+            - {"wait_id", "created_at", "terminal_observed_at"}
+        )
+        if unknown:
+            raise ValueError(f"unknown external_waits columns: {sorted(unknown)}")
+        if not fields:
+            return 0
+        with self._transaction():
+            if expected_instance_id is not None:
+                inst = self._conn.execute(
+                    "SELECT instance_id, status FROM supervisor_instances "
+                    "WHERE singleton_id = 'primary'"
+                ).fetchone()
+                if inst is None or inst["instance_id"] != expected_instance_id \
+                        or inst["status"] != "ACTIVE":
+                    return 0
+            assignments = ", ".join(f"{c} = ?" for c in fields)
+            cur = self._conn.execute(
+                f"UPDATE external_waits SET {assignments} "
+                f"WHERE wait_id = ? AND terminal_observed_at IS NULL",
+                list(fields.values()) + [wait_id],
+            )
+            return cur.rowcount
 
     def transition_to_waiting_external(
         self,
@@ -5878,6 +5945,9 @@ class Store:
         error_class: str = "NONE",
         observed_state: Optional[str] = None,
         event_version: Optional[int] = None,
+        ci_policy: Optional[str] = None,
+        ci_evidence: Optional[str] = None,
+        expected_instance_id: Optional[str] = None,
         now_iso: Optional[str] = None,
     ) -> Optional[dict]:
         """Atomically mark a wait terminal and requeue its job to QUEUED.
@@ -5886,9 +5956,22 @@ class Store:
         wait is already terminal or the job has already left WAITING_EXTERNAL.
         The job is NEVER set to DONE/FAILED here — only QUEUED, so a later
         scheduler admission/claim decides what happens next.
+
+        HIGH-2(b): when ``expected_instance_id`` is provided, the wake is
+        instance/epoch-fenced — the single-active singleton fence must still be
+        held by that instance inside the same transaction, else ``None`` is
+        returned (a stale finalizer can never win).
         """
         now_iso = now_iso or self.now_iso()
         with self._transaction():
+            if expected_instance_id is not None:
+                inst = self._conn.execute(
+                    "SELECT instance_id, status FROM supervisor_instances "
+                    "WHERE singleton_id = 'primary'"
+                ).fetchone()
+                if inst is None or inst["instance_id"] != expected_instance_id \
+                        or inst["status"] != "ACTIVE":
+                    return None
             wrow = self._conn.execute(
                 "SELECT * FROM external_waits WHERE wait_id = ?", (wait_id,)
             ).fetchone()
@@ -5910,6 +5993,10 @@ class Store:
                 updates["last_observed_state"] = observed_state
             if event_version is not None:
                 updates["event_version"] = event_version
+            if ci_policy is not None:
+                updates["ci_policy"] = ci_policy
+            if ci_evidence is not None:
+                updates["ci_evidence"] = ci_evidence
             self._update_external_wait(wait_id, **updates)
             updated = self._transition_job(
                 wait["job_id"],

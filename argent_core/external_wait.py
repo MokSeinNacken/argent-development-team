@@ -259,11 +259,16 @@ class ExternalWaitManager:
         adapters: Optional[dict] = None,
         clock: Optional[Callable[[], datetime]] = None,
         jitter: Optional[Callable[[], float]] = None,
+        kinds: Optional[frozenset] = None,
     ):
         self._store = store
         self._adapters = dict(adapters or {})
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._jitter = jitter or (lambda: 0.0)
+        #: Optional wait-kind allowlist.  When set, only due waits whose
+        #: ``kind`` is in the set are processed (I3-C1 uses this to let the
+        #: CI wait manager own ``CI`` waits exclusively).  Default None = all.
+        self._kinds = frozenset(kinds) if kinds is not None else None
 
     # -- helpers -----------------------------------------------------------
 
@@ -333,6 +338,8 @@ class ExternalWaitManager:
             "check_attempt": 0,
             "event_version": 0,
             "terminal_observed_at": None,
+            "ci_policy": None,
+            "ci_evidence": None,
             "created_at": now_iso,
             "updated_at": now_iso,
         }
@@ -378,6 +385,8 @@ class ExternalWaitManager:
             return []
         now = self._now_iso()
         due = self._store.list_due_external_waits(now, limit=max_items)
+        if self._kinds is not None:
+            due = [w for w in due if w["kind"] in self._kinds]
         results: list[WaitCheckResult] = []
         # F5: process each due wait in isolation — an uncaught failure on one
         # untrusted observation must NEVER abort the rest of the bounded pass.
