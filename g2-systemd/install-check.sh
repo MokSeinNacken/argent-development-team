@@ -37,10 +37,10 @@ UNIT_FILE="${REPO_DIR}/g1-systemd/argent-supervisor.service"
 # --- Parameterizable deployment values (env-overridable; host defaults) -----
 # A different host overrides these via environment (e.g. in the Supervisor's
 # deployment script); the defaults below are this host's live values.
-# G3-B: the accepted live deployment advanced to the G3 worktree (unit
-# WorkingDirectory/Documentation re-pointed in the authorized Phase-G deploy).
-ARGENT_WORKTREE="${ARGENT_WORKTREE:-/home/pc/projects/argent-worktrees/phase-g3-wsl-restart-acceptance}"
-ARGENT_DOC="${ARGENT_DOC:-file:${ARGENT_WORKTREE}/docs/PHASE_G3_ACCEPTANCE.md}"
+# I3-B: the accepted live deployment advanced to the I3-A worktree (unit
+# WorkingDirectory/Documentation re-pointed in the authorized Phase-I3-A deploy).
+ARGENT_WORKTREE="${ARGENT_WORKTREE:-/home/pc/projects/argent-worktrees/phase-i3a-external-action-broker}"
+ARGENT_DOC="${ARGENT_DOC:-file:${ARGENT_WORKTREE}/docs/PHASE_I3A_ACCEPTANCE.md}"
 ARGENT_WORKDIR="${ARGENT_WORKDIR:-${ARGENT_WORKTREE}}"
 ARGENT_ENVFILE="${ARGENT_ENVFILE:--${HOME:-/home/pc}/.config/argent/service.env}"
 
