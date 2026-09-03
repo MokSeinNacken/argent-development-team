@@ -11,6 +11,7 @@ RESOURCE).
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from argent_core import Core, OWNER_SOURCE, Role, role_source
@@ -78,7 +79,8 @@ def _make_env(db_path, context_builder=None):
     backend = FakeScopeBackend(verify_properties=verified_properties(_limits()))
     enforcer = ExecutionEnforcer(backend)
     sup = Supervisor(core, FakeRunStatusProvider(), launch, clock=clock,
-                     enforcer=enforcer, context_builder=context_builder)
+                     enforcer=enforcer, context_builder=context_builder,
+                     prompts_dir=Path(db_path).parent / "prompts")
     job = sup.store.create_job(task.id, idempotency_key="job-main",
                                resource_class=ResourceClass.HEAVY.value)
     jid = job.supervisor_job_id

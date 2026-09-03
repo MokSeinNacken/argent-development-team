@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import os
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 from argent_core import Core, OWNER_SOURCE, Role, role_source
@@ -97,6 +98,7 @@ def make_d3_env(db_path, *, context_builder=None, retriever=None,
         core, FakeRunStatusProvider(), launch, clock=clock,
         enforcer=enforcer, context_builder=context_builder,
         retriever=retriever, checkpoint_store=checkpoint_store,
+        prompts_dir=Path(db_path).parent / "prompts",
     )
     job = sup.store.create_job(task.id, idempotency_key="job-main",
                                resource_class=resource_class)
@@ -228,6 +230,7 @@ def make_d3_e2e_env(tmp_path, *, implementer_content=None):
         retriever=retriever,
         checkpoint_store=checkpoint_store,
         git_provenance_provider=git,
+        prompts_dir=tmp_path / "prompts",
     )
     job = sup.store.create_job(task.id, idempotency_key="job-main",
                                resource_class=ResourceClass.HEAVY.value)

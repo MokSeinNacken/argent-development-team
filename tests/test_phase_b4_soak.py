@@ -17,6 +17,7 @@ No sleep, no network, no real process; time is a ``FakeClock``.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from argent_core import Core, OWNER_SOURCE
@@ -84,6 +85,7 @@ def _build_env(db_path, clock):
         enforcer=ExecutionEnforcer(FakeScopeBackend()),
         resource_governor=FakeGovernor(_allow_admission()),
         snapshot_provider=FakeSnapshotProvider(),
+        prompts_dir=Path(db_path).parent / "prompts",
     )
     sched = Scheduler(sup, owner_instance_id="soak-A", lease_ttl_seconds=LEASE_TTL)
     adapter = FakeExternalWaitAdapter()

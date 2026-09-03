@@ -57,6 +57,19 @@ def _make_job(core):
 
 def test_full_dev_flow_no_raw_history(tmp_path):
     env = make_d3_e2e_env(tmp_path)
+
+    # G2 (F3): prompt files are deterministically unlinked on consume, so capture
+    # their content AT CREATION so the no-transcript-leak check still holds.
+    captured_messages = []
+    orig_build = env.sup._build_message_file
+
+    def spy_build(*args, **kwargs):
+        path = orig_build(*args, **kwargs)
+        captured_messages.append(path.read_text(encoding="utf-8"))
+        return path
+
+    env.sup._build_message_file = spy_build
+
     final, row = drive_to_terminal(env)
     assert row is not None and row["terminal"] == "DONE"
 
@@ -83,12 +96,9 @@ def test_full_dev_flow_no_raw_history(tmp_path):
     for p in env.core._store.list_context_packs(env.jid):
         rec = env.core._store.get_context_pack_by_id(p["context_pack_id"])
         assert rec.token_count <= rec.hard_budget
-    for cmd in env.backend.started:
-        if "--message-file" in cmd["command"]:
-            path = cmd["command"][cmd["command"].index("--message-file") + 1]
-            text = open(path, encoding="utf-8").read()
-            for field in _FORBIDDEN_TRANSCRIPT_FIELDS:
-                assert field not in text
+    for text in captured_messages:
+        for field in _FORBIDDEN_TRANSCRIPT_FIELDS:
+            assert field not in text
     env.core.close()
 
 

@@ -139,9 +139,10 @@ choose the key/store authority path (CODE-ENFORCED).
 ## Restart policy (SPEC G1 §L)
 
 The unit uses `Restart=on-failure`, `RestartSec=5`, `StartLimitBurst=5`,
-`StartLimitIntervalSec=120` — a bounded restart with visible failure (a
-persistent init/policy corruption ends in a failed/inactive unit, not an
-aggressive respawn loop).
+`StartLimitIntervalSec=120` — systemd rate limiting: `StartLimitBurst=5` within
+a sliding 120s window bounds aggressive respawn bursts; NOT an absolute restart
+cap (a process failing less often than ~30s restarts indefinitely; a stronger
+persistent-flap policy is deferred to G3/operator gate).
 
 ## WSL boundary (SPEC G1 §P)
 

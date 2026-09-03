@@ -45,13 +45,16 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import shutil
 import signal
 import subprocess
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
+from . import runtime_paths
 from .resource_policy import ResourceClass, ResourcePolicy
 
 # ---------------------------------------------------------------------------
@@ -89,6 +92,88 @@ def agent_spawn_env(extra: Optional[Mapping[str, str]] = None) -> dict:
                 raise ValueError(f"refusing to inject {k!r} into agent env")
             env[k] = v
     return env
+
+
+# ---------------------------------------------------------------------------
+# Agent-dispatch sandbox (G2 F1) — real filesystem trust boundary
+# ---------------------------------------------------------------------------
+
+#: bwrap (bubblewrap) executable used to sandbox the agent-dispatch child.
+BWRAP_CMD = "bwrap"
+
+
+def verify_bwrap_available(bwrap: str = BWRAP_CMD) -> bool:
+    """True iff ``bwrap`` exists and a minimal dry-run namespace succeeds.
+
+    G2 (F1) fail-closed gate: the agent-dispatch sandbox is MANDATORY.  If
+    ``bwrap`` is missing or cannot create a minimal read-only-root namespace,
+    the service preflight refuses to start AND every dispatch fails (there is
+    NO unwrapped fallback — an untrusted same-UID child must never run with the
+    real trusted dirs visible).
+    """
+    if shutil.which(bwrap) is None:
+        return False
+    try:
+        proc = subprocess.run(
+            [bwrap, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+             "--tmpfs", "/tmp", "/bin/true"],
+            capture_output=True, timeout=15,
+        )
+        return proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def build_agent_sandbox_argv(
+    command: Sequence[str],
+    *,
+    config_dir,
+    state_dir,
+    openclaw_dir,
+    cwd=None,
+    bwrap: str = BWRAP_CMD,
+) -> list:
+    """Wrap ``command`` in a read-only-root bwrap namespace (G2 F1).
+
+    The sandboxed child gets:
+
+    * ``--ro-bind / /`` — the whole real root is READ-ONLY (no write to the
+      host filesystem by default);
+    * writable binds for the two locations the child legitimately needs:
+      ``openclaw_dir`` (``~/.openclaw`` — sessions/trajectories the supervisor
+      reads back) and ``cwd`` (the inherited working directory/worktree the
+      implementer agent must write);
+    * empty ``--tmpfs`` masks over the two TRUSTED dirs (``config_dir`` =
+      ``~/.config/argent``, ``state_dir`` = ``~/.local/state/argent``) so the
+      real key/DB are ABSENT (a read raises ``FileNotFoundError``) and any
+      write lands on an ephemeral tmpfs that vanishes;
+    * ``--tmpfs /tmp`` (ephemeral), ``--dev /dev``, ``--proc /proc``;
+    * NO ``--unshare-net`` (the agent needs provider network) and NO
+      ``--unshare-pid`` (empirically, bwrap forwards SIGTERM/SIGKILL to the
+      child without it, and the scope cgroup move targets the outer process;
+      keeping one fork layer preserves today's cgroup-binding semantics).
+
+    Pure: no filesystem side effects (the caller ensures ``openclaw_dir``
+    exists so ``--bind`` cannot fail on a missing source).
+    """
+    cwd = Path.cwd() if cwd is None else Path(cwd)
+    # Order matters: the broad read-only root and the ephemeral /tmp tmpfs come
+    # FIRST, then the trusted-dir tmpfs masks, then the specific writable binds
+    # LAST so they override any enclosing mask (this also makes the sandbox
+    # correct when the worktree/home live under a masked region, e.g. in tests).
+    return [
+        bwrap,
+        "--ro-bind", "/", "/",
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/tmp",
+        "--tmpfs", str(config_dir),
+        "--tmpfs", str(state_dir),
+        "--bind", str(openclaw_dir), str(openclaw_dir),
+        "--bind", str(cwd), str(cwd),
+        "--",
+        *[str(c) for c in command],
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +517,13 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
         poll_timeout_seconds: float = 5.0,
         poll_interval_seconds: float = 0.1,
         popen_fn=None,
+        # G2 (F1): agent-dispatch sandbox (mandatory, fail-closed).  ``False``
+        # only for the raw C2 scope smoke test that exercises the backend
+        # WITHOUT an agent dispatch; the production enforcer path always wraps.
+        sandbox_wrap: bool = True,
+        sandbox_bwrap: str = BWRAP_CMD,
+        sandbox_dirs: Optional[Mapping[str, Path]] = None,
+        sandbox_argv_builder=build_agent_sandbox_argv,
     ):
         self._systemd_run = systemd_run
         self._systemctl = systemctl
@@ -439,6 +531,10 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
         self._poll_timeout = poll_timeout_seconds
         self._poll_interval = poll_interval_seconds
         self._popen_fn = popen_fn or subprocess.Popen
+        self._sandbox_wrap = sandbox_wrap
+        self._sandbox_bwrap = sandbox_bwrap
+        self._sandbox_dirs = dict(sandbox_dirs) if sandbox_dirs else None
+        self._sandbox_argv_builder = sandbox_argv_builder
 
     # -- helpers -------------------------------------------------------------
 
@@ -713,10 +809,23 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
         scope: ExecutionScope,
         command: Sequence[str],
     ) -> ExecutionScope:
-        """Start the agent detached (NO shell) and move it into the scope cgroup."""
+        """Start the agent detached (NO shell) and move it into the scope cgroup.
+
+        G2 (F1): the real command is wrapped in a read-only-root bwrap sandbox
+        (``build_agent_sandbox_argv``) that masks the trusted ``~/.config/argent``
+        and ``~/.local/state/argent`` dirs with empty tmpfs mounts, so an
+        untrusted same-UID agent child can neither read the evidence key / DB
+        nor write into them.  Fail-closed: if ``bwrap`` is unavailable or the
+        wrap cannot be built, a :class:`ScopeCreateError` is raised (mapped to
+        ``SCOPE_CREATION_FAILED`` by the enforcer) — there is NO unwrapped
+        fallback.
+        """
+        argv = list(command)
+        if self._sandbox_wrap:
+            argv = self._wrap_for_sandbox(argv)
         try:
             popen = self._popen_fn(
-                list(command),
+                argv,
                 start_new_session=True,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -733,6 +842,52 @@ class SystemdRunScopeBackend(ExecutionScopeBackend):
             self._kill_pid(pid)
             raise ScopeCreateError("could not move agent into scope cgroup")
         return replace(scope, process_id=pid)
+
+    def _wrap_for_sandbox(self, command: Sequence[str]) -> list:
+        """Build the bwrap sandbox argv for an agent-dispatch command (G2 F1).
+
+        Fail-closed: raises :class:`ScopeCreateError` when ``bwrap`` is missing
+        or the writable bind target (``~/.openclaw``) cannot be prepared.
+        """
+        if shutil.which(self._sandbox_bwrap) is None:
+            raise ScopeCreateError(
+                f"sandbox (bwrap) unavailable: {self._sandbox_bwrap!r}"
+            )
+        dirs = self._resolve_sandbox_dirs()
+        openclaw_dir = Path(dirs["openclaw_dir"])
+        try:
+            # The child writes sessions/trajectories here; bwrap ``--bind``
+            # requires the source to exist.
+            openclaw_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ScopeCreateError(
+                f"cannot prepare sandbox openclaw dir {openclaw_dir!s}: {exc}"
+            ) from exc
+        try:
+            return self._sandbox_argv_builder(
+                command, bwrap=self._sandbox_bwrap, **dirs,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ScopeCreateError(f"cannot build sandbox argv: {exc}") from exc
+
+    def _resolve_sandbox_dirs(self) -> dict:
+        """Resolve the sandbox bind/mask dirs (injectable for tests).
+
+        Production resolves the two TRUSTED dirs through the same canonical
+        ``runtime_paths`` resolvers the rest of the service uses (so an env
+        override can never split them), the ``~/.openclaw`` runtime dir, and the
+        inherited working directory.
+        """
+        if self._sandbox_dirs is not None:
+            dirs = dict(self._sandbox_dirs)
+            dirs.setdefault("cwd", Path.cwd())
+            return dirs
+        return {
+            "config_dir": runtime_paths.resolve_config_dir(),
+            "state_dir": runtime_paths.resolve_state_dir(),
+            "openclaw_dir": Path.home() / ".openclaw",
+            "cwd": Path.cwd(),
+        }
 
     def run_in_scope(
         self,

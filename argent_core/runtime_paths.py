@@ -26,6 +26,7 @@ from typing import Mapping, Optional
 _DEFAULT_STATE_HOME = ".local/state"
 _DEFAULT_DATA_HOME = ".local/share"
 _DEFAULT_CACHE_HOME = ".cache"
+_DEFAULT_CONFIG_HOME = ".config"
 
 #: Ephemeral (tmpfs) prefixes that durable data must never live under.
 _EPHEMERAL_ROOTS: tuple[str, ...] = ("/tmp", "/dev/shm", "/run")
@@ -99,6 +100,26 @@ def resolve_state_dir(
     return full
 
 
+def resolve_config_dir(
+    *, home: Optional[Path] = None, env: Optional[Mapping[str, str]] = None,
+    reject_ephemeral: bool = True,
+) -> Path:
+    """Trusted config directory (``~/.config/argent`` or XDG_CONFIG_HOME).
+
+    G2 (F1): one of the two TRUSTED directories that untrusted agent children
+    (same UID) must never reach through normal agent execution.  It holds the
+    evidence MAC key and ``service.env`` (the protected operator secrets), so
+    the agent-dispatch sandbox masks it with an empty tmpfs.  Production
+    callers pass neither ``home`` nor ``env`` (canonical, refused under ``/tmp``).
+    """
+    base = _base("XDG_CONFIG_HOME", _DEFAULT_CONFIG_HOME, home=home, env=env,
+                 reject_ephemeral=reject_ephemeral)
+    full = base / "argent"
+    if reject_ephemeral:
+        return _refuse_ephemeral(full, "XDG_CONFIG_HOME/argent")
+    return full
+
+
 def resolve_share_dir(
     *, home: Optional[Path] = None, env: Optional[Mapping[str, str]] = None,
     reject_ephemeral: bool = True,
@@ -123,6 +144,29 @@ def resolve_cache_dir(
     if reject_ephemeral:
         return _refuse_ephemeral(full, "XDG_CACHE_HOME/argent")
     return full
+
+
+#: Subdirectory (under the canonical cache dir) that holds per-dispatch agent
+#: prompt message files (Phase G2 F3).  These are ephemeral, bounded, and
+#: cleaned up by a bounded sweep — they must NEVER live under ``/tmp``.
+PROMPTS_SUBDIR = "prompts"
+
+
+def resolve_prompts_dir(
+    *, home: Optional[Path] = None, env: Optional[Mapping[str, str]] = None,
+    reject_ephemeral: bool = True,
+) -> Path:
+    """Directory for ephemeral agent-prompt message files (``cache/prompts``).
+
+    G2 (F3): prompt files previously written via ``tempfile.mkstemp()`` under
+    ``/tmp`` (a tmpfs — ENOSPC risk) never cleaned up.  They now live in a
+    bounded subdirectory of the canonical CACHE dir (never an ephemeral root),
+    so they are outside any agent write area and are swept by a bounded
+    age/count cleanup.  Production callers pass neither ``home`` nor ``env``;
+    the returned path is canonical and refused when it resolves under ``/tmp``.
+    """
+    return resolve_cache_dir(home=home, env=env,
+                             reject_ephemeral=reject_ephemeral) / PROMPTS_SUBDIR
 
 
 def default_db_path(

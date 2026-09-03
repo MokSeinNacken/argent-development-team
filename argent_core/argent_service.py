@@ -53,6 +53,7 @@ from .supervisor import (
     OpenClawRunLauncher,
     Supervisor,
     TrajectoryRunStatusProvider,
+    sweep_prompt_files,
 )
 
 #: Process exit codes (SPEC G1 §B: non-zero on unrecoverable init error).
@@ -277,6 +278,25 @@ class ServiceRuntime:
     acquire_result: "object"
 
 
+# G2 (F1): startup preflight for the agent-dispatch sandbox (bwrap).  Fail-closed
+# — if bwrap is unavailable, the service must refuse to start.  Tests that call
+# ``main()`` with fully-injected/backed backends disable this flag (the real
+# scope backend is never constructed on those paths).
+_SANDBOX_PREFLIGHT_ENABLED = True
+
+
+def _sandbox_preflight() -> None:
+    """Verify the agent-dispatch sandbox is available (G2 F1).
+
+    Raises ``ValueError`` (mapped to ``EXIT_INIT_ERROR`` by ``main``) when
+    ``bwrap`` is missing or a minimal dry-run namespace cannot be created.
+    """
+    from .execution_scope import verify_bwrap_available
+
+    if not verify_bwrap_available():
+        raise ValueError("sandbox (bwrap) unavailable or non-functional")
+
+
 def _acquire_lock(state_dir: Path):
     """Best-effort non-blocking advisory lock (defense-in-depth, SPEC G1 §C).
 
@@ -325,6 +345,10 @@ def build_service(
         TrajectoryRunStatusProvider(),
         run_launcher=OpenClawRunLauncher(),
         clock=clock,
+        # G2 (F3): bind the prompt-file dir to the SAME canonical cache dir the
+        # service validated (honouring any ARGENT_CACHE_DIR override) so the
+        # startup sweep and the Supervisor can never split their target dir.
+        prompts_dir=config.cache_dir / runtime_paths.PROMPTS_SUBDIR,
     )
     instance_id = "instance:" + uuid4().hex
     scheduler = scheduler or Scheduler(
@@ -392,6 +416,16 @@ def main(argv=None) -> int:
         print(f"argent-supervisor: fatal: {exc}", file=sys.stderr)
         return EXIT_INIT_ERROR
 
+    # G2 (F1): fail-closed sandbox preflight (bwrap available + minimal dry-run)
+    # BEFORE any lock/DB/loop.  Disabled only when the real scope backend is not
+    # constructed (fully-injected unit tests).
+    if _SANDBOX_PREFLIGHT_ENABLED:
+        try:
+            _sandbox_preflight()
+        except ValueError as exc:
+            print(f"argent-supervisor: fatal: {exc}", file=sys.stderr)
+            return EXIT_INIT_ERROR
+
     lock = _acquire_lock(config.state_dir)
     if lock is None:
         print(
@@ -399,6 +433,13 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         return EXIT_OWNER_CONFLICT
+
+    # G2 (F3): bounded startup sweep of stale agent-prompt files left behind
+    # by a previous (possibly crashed) run.  Runs ONLY after the singleton lock
+    # is acquired (a single active instance sweeps) and targets the SAME dir the
+    # Supervisor resolves (``cache/prompts``).  Best-effort — never blocks
+    # startup and never deletes a file a live child could still need.
+    sweep_prompt_files(config.cache_dir / runtime_paths.PROMPTS_SUBDIR)
 
     try:
         try:

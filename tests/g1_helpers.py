@@ -9,6 +9,7 @@ pattern as Phase B3/C3 helpers).
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 from argent_core import Core, OWNER_SOURCE
@@ -121,6 +122,7 @@ def make_runtime_env(
         FakeRunLauncher(),
         clock=clock,
         enforcer=enforcer or ExecutionEnforcer(FakeScopeBackend()),
+        prompts_dir=Path(db_path).parent / "prompts",
     )
     sched = Scheduler(sup, owner_instance_id=instance_id, lease_ttl_seconds=60)
     ewm = ExternalWaitManager(core._store, adapters=adapters or {}, clock=clock)

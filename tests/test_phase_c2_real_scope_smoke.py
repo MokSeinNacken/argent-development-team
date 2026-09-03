@@ -56,7 +56,9 @@ def _systemd_scope_available() -> bool:
     reason="systemd-run --user --scope not available (no root workaround)",
 )
 def test_real_scope_create_verify_cleanup():
-    backend = SystemdRunScopeBackend()
+    # The raw C2 scope backend is exercised WITHOUT the agent-dispatch sandbox
+    # (the bwrap wrap is G2 F1; this test proves the scope mechanism itself).
+    backend = SystemdRunScopeBackend(sandbox_wrap=False)
     scope_name = generate_scope_name("smoke", "real")
     assert is_valid_scope_name(scope_name)
 

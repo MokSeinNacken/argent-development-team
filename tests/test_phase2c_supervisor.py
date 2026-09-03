@@ -149,6 +149,7 @@ def make_env(db_path, clock=None, *, workspace=None, run_tests_fn=None,
         workspace_root=workspace, run_tests_fn=run_tests_fn,
         enforcer=enforcer, resource_governor=resource_governor,
         snapshot_provider=snapshot_provider,
+        prompts_dir=Path(db_path).parent / "prompts",
     )
     job = sup.store.create_job(task.id, idempotency_key=idempotency_key)
     return SimpleNamespace(

@@ -35,6 +35,7 @@ from typing import Callable, Optional, Protocol
 
 from . import job_state, notifications, outputs, workflow
 from . import model_router
+from . import runtime_paths
 from .core import ReceiveResult
 from .notifications import NotificationStatus, NotificationType
 from .resource_policy import RESOURCE_CLASS_VALUES, ResourceClass
@@ -119,6 +120,92 @@ AGENT_IDS: dict[Role, str] = {
 # NOT_OBSERVED is a pure persistence sentinel (A10): it has no RunStatus
 # counterpart and only ever lives in the supervisor_jobs.result_status column.
 NOT_OBSERVED = "NOT_OBSERVED"
+
+# G2 (F3): bounded lifecycle for per-dispatch agent prompt message files.
+# They are written under the canonical cache dir (``cache/prompts``, never
+# ``/tmp``) and swept with an age + count bound.  The age bound (24h) is far
+# beyond any real dispatch lifetime, so a still-running child's asynchronously
+# read ``--message-file`` is NEVER deleted while it could still be needed; the
+# count bound additionally caps accumulation even if many fresh files arrive.
+PROMPT_FILE_MAX_AGE_SECONDS = 24 * 3600
+PROMPT_FILE_MAX_COUNT = 500
+#: Count-bound eviction may only touch files OLDER than this floor (G2 F3).
+#: It must exceed any dispatch lifetime (AGENT_TIMEOUT_SECONDS=900 plus margin)
+#: so a fresh/in-flight prompt file can NEVER be count-evicted while a child
+#: might still be reading it.  Age-gated eviction (24h) handles truly stale
+#: residue; the count bound only prunes old accumulation.
+PROMPT_FILE_MIN_AGE_FOR_COUNT_EVICTION_SECONDS = 3600
+
+
+def sweep_prompt_files(
+    prompts_dir,
+    *,
+    now: Optional[float] = None,
+    max_age_seconds: int = PROMPT_FILE_MAX_AGE_SECONDS,
+    max_count: int = PROMPT_FILE_MAX_COUNT,
+    min_age_for_count_eviction_seconds: int = (
+        PROMPT_FILE_MIN_AGE_FOR_COUNT_EVICTION_SECONDS
+    ),
+) -> int:
+    """Bounded cleanup of stale agent-prompt files (G2 F3).
+
+    Removes prompt files whose mtime is older than ``max_age_seconds``, then —
+    if more than ``max_count`` files remain — removes the oldest files that are
+    OLDER than ``min_age_for_count_eviction_seconds`` (a conservative floor that
+    exceeds any dispatch lifetime) until the directory is bounded.  A fresh or
+    in-flight file is NEVER removed by the count bound.  Returns the number of
+    files removed.  Best-effort: never raises (a missing directory yields 0, an
+    unreadable entry is skipped), so a sweep can never break startup or a
+    dispatch.
+
+    The age bound is the safety guarantee: a freshly spawned child reads its
+    ``--message-file`` asynchronously after process start, but no dispatch can
+    outlive ``max_age_seconds``, so age-gated deletion can never remove a file
+    a live child still needs.
+    """
+    prompts_dir = Path(prompts_dir)
+    if now is None:
+        now = time.time()
+    try:
+        entries = list(prompts_dir.iterdir())
+    except OSError:
+        return 0
+    files = []
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+            files.append((entry, entry.stat().st_mtime))
+        except OSError:
+            continue
+    removed = 0
+    # Age bound: delete anything older than ``max_age_seconds``.
+    for path, mtime in files:
+        if now - mtime > max_age_seconds:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    # Count bound: keep at most ``max_count`` newest files, but ONLY evict
+    # files older than the conservative floor — a fresh/in-flight file is
+    # never removed by the count bound (the age sweep handles truly stale
+    # files).  Evict oldest-first among the eligible files.
+    remaining = [p for p in files if p[0].exists()]
+    if len(remaining) > max_count:
+        eligible = [
+            (path, mtime) for path, mtime in remaining
+            if now - mtime > min_age_for_count_eviction_seconds
+        ]
+        eligible.sort(key=lambda item: item[1])  # oldest first
+        excess = len(remaining) - max_count
+        for path, _mtime in eligible[:excess]:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 # ---------------------------------------------------------------------------
@@ -1553,6 +1640,11 @@ class Supervisor:
         # E2: optional router injection (tests pass a deterministic router or a
         # custom policy; default = ModelRouter over the core's registry).
         router=None,
+        # G2 (F3): optional agent-prompt message-file directory injection.
+        # Default ``None`` resolves the canonical cache ``prompts`` dir lazily
+        # (never ``/tmp``); deterministic tests inject an isolated tmp dir so
+        # they never touch the live cache directory.
+        prompts_dir: Optional[Path] = None,
     ):
         self.core = core
         self.controller_source = controller_source
@@ -1625,8 +1717,37 @@ class Supervisor:
         self._handoff_builder = handoff_builder
         # E2: adaptive model router (default = ModelRouter over the core's registry).
         self._router = router
+        # G2 (F3): agent-prompt message-file directory (injected for tests;
+        # else resolved lazily to the canonical cache prompts dir).
+        self._prompts_dir = Path(prompts_dir) if prompts_dir is not None else None
+        # G2 (F3): in-process tracking of the prompt file created for each
+        # dispatch, keyed by ``dispatch_id`` (the 1:1 identity that every
+        # terminal handler resolves).  Enables deterministic best-effort unlink
+        # on SUCCESS/FAILED/CANCELLED/TIMEOUT terminal outcomes.  A dispatch
+        # created by a CRASHED previous process has no entry here (its residue
+        # is the bounded sweep's job).
+        self._prompt_files: dict = {}
 
     # ---------------------------------------------------------------- utils
+
+    def _track_prompt_file(self, dispatch_id, path: Path) -> None:
+        """Record the prompt file for ``dispatch_id`` (G2 F3)."""
+        self._prompt_files[dispatch_id] = Path(path)
+
+    def _unlink_prompt_file(self, dispatch_id) -> None:
+        """Deterministic best-effort unlink of a dispatch's prompt file.
+
+        Never raises into the state machine (cleanup is best-effort; a crashed
+        predecessor's residue is handled by the bounded sweep).  Also removes
+        the tracking entry so a later terminal handler cannot double-unlink.
+        """
+        path = self._prompt_files.pop(dispatch_id, None)
+        if path is None:
+            return
+        try:
+            Path(path).unlink()
+        except OSError:
+            pass
 
     def _now(self) -> datetime:
         return self._clock()
@@ -3568,20 +3689,28 @@ class Supervisor:
             validate_context_pack(pack)
             pack_id = self._persist_context_pack(pack)
             message_file = self._build_message_file(d, pack, pack_id=pack_id)
+            # G2 (F3): track the prompt file for deterministic unlink on the
+            # terminal outcome (SUCCESS/FAILED/CANCELLED/TIMEOUT).
+            self._track_prompt_file(dispatch_id, message_file)
             # F1: re-assert the lease fence IMMEDIATELY before the external
             # spawn effect (a stale holder must never launch an agent).
             self._recheck_lease_fence(job["id"])
             outcome = self._spawn_scoped(d, job, message_file, row, admission)
             if outcome is not None:
+                # G2 (F3): enforcement failed BEFORE a live child existed — the
+                # prompt file is now orphaned; unlink it deterministically.
+                self._unlink_prompt_file(dispatch_id)
                 return outcome
         except ContextError as exc:
             # Context errors (build/retrieval/checkpoint/handoff) are
             # ORCHESTRATION errors — never CODE_FAILURE, never a resource/model
             # failure.  No spawn happened.
+            self._unlink_prompt_file(dispatch_id)
             self._finish_action(row["id"], "FAILED", exc.code)
             return ActionOutcome("SPAWN_RUN", "context_build_failed",
                                  exc.code, dispatch_id=dispatch_id)
         except Exception as exc:
+            self._unlink_prompt_file(dispatch_id)
             self._finish_action(row["id"], "FAILED", f"{type(exc).__name__}")
             return ActionOutcome("SPAWN_RUN", "failed", str(exc),
                                  dispatch_id=dispatch_id)
@@ -3856,8 +3985,22 @@ class Supervisor:
             ))
             return pack.context_pack_id
 
+    def _resolve_prompts_dir(self) -> Path:
+        """The agent-prompt message-file directory (G2 F3).
+
+        Returns the injected ``prompts_dir`` when present (deterministic
+        tests), else the canonical cache ``prompts`` directory
+        (``~/.cache/argent/prompts``) — NEVER ``/tmp``.  Named
+        ``_resolve_prompts_dir`` to avoid shadowing the ``_prompts_dir``
+        instance attribute (a name collision would make ``self._prompts_dir()``
+        raise ``TypeError`` at spawn time).
+        """
+        if self._prompts_dir is not None:
+            return self._prompts_dir
+        return runtime_paths.resolve_prompts_dir()
+
     def _build_message_file(self, d: AgentDispatch, pack=None, pack_id=None) -> Path:
-        """Write the agent prompt to a temp file.
+        """Write the agent prompt to a bounded cache file (never ``/tmp``).
 
         D1: when ``pack`` is provided (the only D1-migrated dispatch path), the
         file is rendered from the immutable Context Pack via
@@ -3866,8 +4009,26 @@ class Supervisor:
         minimal-prompt path used ONLY by non-D1-migrated callers (none exist
         today; kept isolated and documented in PHASE_D1_NOTES.md — a migrated
         dispatch must NEVER fall back to it).
+
+        G2 (F3): the file is created under the canonical cache prompts dir
+        (configurable via the Supervisor's ``prompts_dir``) instead of
+        ``tempfile.mkstemp()``'s ``/tmp`` default, and a bounded age/count
+        sweep runs BEFORE each write so the directory cannot grow without
+        bound.  The file itself is NOT deleted here: OpenClaw reads it
+        asynchronously after the child starts, so only the (age-bounded) sweep
+        may remove it, and only once it is provably stale.
         """
         import tempfile
+        prompts_dir = self._resolve_prompts_dir()
+        try:
+            # G2 (F4): owner-only mode (0700) — prompt files are 0600 via
+            # mkstemp, but the directory must never be group/world-readable.
+            prompts_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError:
+            raise
+        # G2 (F3): bounded sweep before writing (age + count bound; never
+        # removes a freshly-written in-flight file).
+        sweep_prompt_files(prompts_dir)
         if pack is not None:
             prompt = render_pack(pack, context_pack_id=pack_id)
         else:
@@ -3881,7 +4042,10 @@ class Supervisor:
                 f"{task.description or ''}\n"
                 "Reply with exactly one JSON object matching your role schema.\n"
             )
-        fd, path = tempfile.mkstemp(suffix=".md", prefix="argent-supervisor-", text=True)
+        fd, path = tempfile.mkstemp(
+            suffix=".md", prefix="argent-supervisor-", dir=str(prompts_dir),
+            text=True,
+        )
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(prompt)
         return Path(path)
@@ -4984,6 +5148,10 @@ class Supervisor:
         if obs.status is not RunStatus.SUCCEEDED:
             return ActionOutcome("CONSUME_RESULT", "skipped",
                                  f"status_{obs.status.value}")
+        # G2 (F3): the child authoritatively finished (SUCCEEDED).  The prompt
+        # file is now orphaned — unlink it deterministically (best-effort; a
+        # crashed predecessor's residue is the bounded sweep's job).
+        self._unlink_prompt_file(dispatch_id)
         result = obs.result or {}
         envelope = _write_envelope(d.role, result)
         # Validate envelope (fail-closed) before consume.
@@ -5078,6 +5246,9 @@ class Supervisor:
         d = self.core._store.get_dispatch(dispatch_id)
         if d is None:
             return ActionOutcome("MARK_RUN_FAILED", "skipped", "dispatch_missing")
+        # G2 (F3): the child is authoritatively gone (FAILED/CANCELLED/TIMEOUT).
+        # Unlink the tracked prompt file deterministically (best-effort).
+        self._unlink_prompt_file(dispatch_id)
         # F2 (E3 fix-round): derive the provider/transport signal from the
         # observed run so a provider failure persists ATTEMPT_OUTCOME_PROVIDER
         # (never CAPABILITY).  A missing/unreadable observation -> no signal

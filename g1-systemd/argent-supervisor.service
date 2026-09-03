@@ -21,10 +21,13 @@ Description=Argent background supervisor (single-active, durable queue)
 Documentation=file:%h/argent/docs/PHASE_G1_NOTES.md
 After=network-online.target
 Wants=network-online.target
-# Bounded restart policy (no endless crash loops, SPEC G1 §L): retry on failure
-# with backoff, then stop.  A persistent init/policy corruption is therefore
-# VISIBLE as a failed/inactive unit after StartLimitBurst, never a hidden
-# aggressive respawn.
+# Bounded restart policy (SPEC G1 §L): retry on failure with backoff, then
+# stop for FAST persistent init failures.  StartLimitBurst/IntervalSec bounds
+# the rate of respawns within a sliding 120s window, so a rapid init/policy
+# corruption is VISIBLE as a failed/inactive unit.  It is NOT an absolute
+# restart cap: a process that fails only every ~30s can still be restarted
+# indefinitely (RestartSec=5 keeps the window sliding).  Slow periodic failures
+# therefore need an additional watchdog/operator gate (G3).
 StartLimitBurst=5
 StartLimitIntervalSec=120
 
@@ -46,15 +49,23 @@ EnvironmentFile=-%h/.config/argent/service.env
 # entrypoint resolves by default:
 #   StateDirectory -> $STATE_DIRECTORY  (~/.local/state/argent)
 #   CacheDirectory -> $CACHE_DIRECTORY  (~/.cache/argent)
+# G2 (F4): the created state/cache directories are 0700 (owner-only) and the
+# service runs with UMask=0077, so durable state, cache and any prompt files
+# are never group/world-readable — matching the operator's live hardened unit.
 StateDirectory=argent
 CacheDirectory=argent
+StateDirectoryMode=0700
+CacheDirectoryMode=0700
+UMask=0077
 
 # Graceful shutdown: SIGTERM -> bounded STOPPING (SPEC G1 §G).  The entrypoint
 # drains the current bounded pass, releases only safe ownerships, and exits 0.
 KillSignal=SIGTERM
 TimeoutStopSec=30
 
-# Bounded restart policy (no endless crash loops, SPEC G1 §L).
+# systemd rate limiting (SPEC G1 §L): StartLimitBurst=5 within a sliding 120s
+# window bounds aggressive respawn bursts; NOT an absolute restart cap — a
+# process that fails less often than roughly every 30s is restarted indefinitely.
 Restart=on-failure
 RestartSec=5
 

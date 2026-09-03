@@ -8,6 +8,7 @@ is explicit so the enforcement outcome is fully deterministic.
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 from argent_core import Core, OWNER_SOURCE, Role, role_source
@@ -191,7 +192,8 @@ def make_env(
     core.start_task_run(task.id, OWNER)
     launch = FakeRunLauncher()
     sup = Supervisor(core, FakeRunStatusProvider(), launch, clock=clock,
-                     enforcer=enforcer)
+                     enforcer=enforcer,
+                     prompts_dir=Path(db_path).parent / "prompts")
     job = sup.store.create_job(
         task.id, idempotency_key="job-main", resource_class=resource_class,
     )

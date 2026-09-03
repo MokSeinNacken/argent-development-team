@@ -499,6 +499,9 @@ def test_main_returns_failed_exit_code(monkeypatch, tmp_path):
             db_path=state / "a.db"),
     )
     monkeypatch.setattr(svcmod, "build_service", lambda config, **kw: FakeSvc())
+    # G2 (F1): the sandbox preflight is irrelevant on this fully-injected path
+    # (no real scope backend is constructed) — disable it.
+    monkeypatch.setattr(svcmod, "_SANDBOX_PREFLIGHT_ENABLED", False)
     assert svcmod.main([]) == svcmod.EXIT_FAILED
 
 
