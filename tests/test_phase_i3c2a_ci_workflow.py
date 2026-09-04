@@ -22,7 +22,7 @@ Workflow / check identity (the source of truth the cases assert against):
                                (v7.0.1) and
                                ``actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97``
                                (v7.0.0) — immutable full-commit SHAs (LOW-3)
-- canonical step set:          5 steps (checkout / bubblewrap / setup-python /
+- canonical step set:          4 steps (checkout / setup-python /
                                pip-install / portable pytest), asserted EXACTLY
                                (no extra, no missing, no reorder) — CASE 18
 - checkout token boundary:     ``persist-credentials: false`` (CASE 19); the
@@ -96,10 +96,6 @@ CANONICAL_STEPS = [
         "name": "Check out repository",
         "uses": CHECKOUT_ACTION,
         "with": {"persist-credentials": "false"},
-    },
-    {
-        "name": "Install sandbox dependency (bubblewrap)",
-        "run": "sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap",
     },
     {
         "name": "Set up Python",

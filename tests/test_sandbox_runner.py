@@ -1,14 +1,24 @@
 """bwrap test-runner tests (SPEC V2B §3).
 
-Deterministic: these tests run real sandboxed pytest runs (no skips/xfails)
-wherever ``bwrap`` is available.  On GitHub CI ``bwrap`` is provisioned via the
-``apt-get install bubblewrap`` step of ``.github/workflows/ci.yml``; on the
-development host it is already installed.  Each test builds a tiny workspace in
-``tmp_path`` and runs it through :func:`run_tests`.
+Deterministic: the execution tests below run REAL sandboxed pytest runs (no
+skips/xfails) wherever the kernel permits unprivileged bwrap sandboxes — on the
+development host (WSL) they run for real.  Classification B
+(OPERATIONAL_HOST_ACCEPTANCE): GitHub-hosted ubuntu-24.04 runners DO permit
+installing bubblewrap, but the runner kernel denies unprivileged user
+namespaces (``bwrap: setting up uid map: Permission denied`` / ``loopback:
+Failed RTM_NEWADDR: Operation not permitted`` — real CI evidence, run
+33897941532), so sandbox EXECUTION cannot be represented faithfully there.
+The nine execution tests are therefore marked ``host_acceptance`` (excluded
+from the portable CI command ``-m \"not host_acceptance\"``; they still run in
+the local full suite).  The three ``build_command`` shape tests below are
+portable (argv inspection only, no execution).  Each execution test builds a
+tiny workspace in ``tmp_path`` and runs it through :func:`run_tests`.
 """
 
 import os
 from pathlib import Path
+
+import pytest
 
 from argent_core import SandboxResult, run_tests
 from argent_core.sandbox_runner import build_command
@@ -28,6 +38,7 @@ def _workspace(tmp_path, files):
 # ------------------------------------------------------------ §3 bwrap runs
 
 
+@pytest.mark.host_acceptance
 def test_bwrap_runs_pytest(tmp_path):
     ws = _workspace(tmp_path, {"test_ok.py": "def test_ok():\n    assert 1 + 1 == 2\n"})
     res = run_tests(str(ws))
@@ -36,6 +47,7 @@ def test_bwrap_runs_pytest(tmp_path):
     assert "passed" in res.stdout_bounded
 
 
+@pytest.mark.host_acceptance
 def test_bwrap_runs_on_empty_fixture_skeleton(tmp_path):
     # An empty tests/ dir: pytest runs and reports "no tests" (exit code 5)
     # rather than failing to launch.  Uses a tmp workspace so the shared
@@ -58,6 +70,7 @@ def test_bwrap_runs_on_empty_fixture_skeleton(tmp_path):
             shutil.rmtree(cache)
 
 
+@pytest.mark.host_acceptance
 def test_sandbox_cannot_overwrite_product_file(tmp_path):
     """FIX 1 (sandbox escape): the workspace is ro-bound, so a QA test that
     tries to write /workspace/product.py must fail and leave the host file
@@ -81,6 +94,7 @@ def test_sandbox_cannot_overwrite_product_file(tmp_path):
 # ---------------------------------------------------------- §3 host invisible
 
 
+@pytest.mark.host_acceptance
 def test_host_paths_invisible(tmp_path):
     ws = _workspace(
         tmp_path,
@@ -104,6 +118,7 @@ def test_host_paths_invisible(tmp_path):
 # ---------------------------------------------------------------- §3 no net
 
 
+@pytest.mark.host_acceptance
 def test_no_network(tmp_path):
     ws = _workspace(
         tmp_path,
@@ -127,6 +142,7 @@ def test_no_network(tmp_path):
 # --------------------------------------------------------------- §3 limits
 
 
+@pytest.mark.host_acceptance
 def test_fork_bomb_hits_process_limit(tmp_path):
     ws = _workspace(
         tmp_path,
@@ -169,6 +185,7 @@ def test_fork_bomb_hits_process_limit(tmp_path):
 # ------------------------------------------------------------- §3 timeout
 
 
+@pytest.mark.host_acceptance
 def test_timeout_reported(tmp_path):
     ws = _workspace(
         tmp_path,
@@ -182,6 +199,7 @@ def test_timeout_reported(tmp_path):
 # ------------------------------------------------------- §3 output bounding
 
 
+@pytest.mark.host_acceptance
 def test_output_bounded(tmp_path):
     ws = _workspace(
         tmp_path,
@@ -195,6 +213,7 @@ def test_output_bounded(tmp_path):
 # ----------------------------------------------------- §3 SandboxResult fields
 
 
+@pytest.mark.host_acceptance
 def test_sandbox_result_fields(tmp_path):
     ws = _workspace(tmp_path, {"test_ok.py": "def test_ok():\n    assert True\n"})
     res = run_tests(str(ws))

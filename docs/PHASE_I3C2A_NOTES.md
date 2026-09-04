@@ -81,9 +81,15 @@ check-run status; anything less would break the checkout itself.
   never derived from PR content) — see §6.
 - **`timeout-minutes: 15`.** The locally proven suite runs in ~48 s; 15 min gives
   ~18× headroom on a slower hosted runner while still bounding a hung run.
-- **bubblewrap is provisioned** (`sudo apt-get install -y --no-install-recommends
-  bubblewrap`) because the execution-sandbox tests run real `bwrap` sandboxes
-  (PORTABLE_WITH_DEPENDENCY, §7).
+- **No bubblewrap provisioning.** The first fixed run (head `5140d15`, run
+  33897941532) proved GitHub-hosted ubuntu-24.04 runners DO install
+  bubblewrap but the runner kernel DENIES unprivileged user namespaces
+  (`bwrap: setting up uid map: Permission denied`, `loopback: Failed
+  RTM_NEWADDR: Operation not permitted`) — real bwrap sandbox EXECUTION is
+  therefore **OPERATIONAL_HOST_ACCEPTANCE (B)**, not portable; those tests are
+  `host_acceptance`-marked (§7). Only the argv-shape sandbox tests are
+  portable. Provisioning a dependency that cannot run would waste CI time and
+  falsely imply coverage.
 - **Portable test command** `python -m pytest tests/ -q -m "not host_acceptance"`
   — the runner executes the full deterministic suite *minus* the
   `host_acceptance`-marked operational tests, which a stock runner cannot
@@ -196,11 +202,13 @@ satisfy the wait.
 
 The GitHub runner executes `python -m pytest tests/ -q -m "not host_acceptance"`
 — the **full deterministic suite minus the `host_acceptance`-marked operational
-tests** (2954 tests). This includes the real `bwrap` execution-sandbox tests
-(`tests/test_sandbox_runner.py` and the Phase-G sandbox-argv tests), which are
-**PORTABLE_WITH_DEPENDENCY**: their invariants (read-only workspace, no network,
-timeout kill, output bound, nproc limit, result fields) are fully appropriate
-for CI, and `bwrap` is safely provisioned via the bubblewrap apt step.
+tests**. The portable set includes the sandbox **argv-shape** tests
+(`build_command` inspection: isolation flags, limits, ro-bind workspace,
+no-cache bytecode flags) and the Phase-G sandbox **argv-composition** tests
+that never execute bwrap (e.g. `test_start_in_scope_wraps_with_bwrap` uses
+`FakePopen`). Real bwrap sandbox EXECUTION is NOT portable: the runner kernel
+denies unprivileged user namespaces (evidence §7.4), so every execution test is
+`host_acceptance`-marked (B) and runs in the local full suite only.
 
 ### 7.2 LOCAL/WSL OPERATIONAL ACCEPTANCE (development-host only)
 
@@ -215,6 +223,8 @@ credentials, a real checkpoint, an installed systemd unit):
 | `i3a` live credential probes | skip without real `~/.config/gh` | skips (no creds) |
 | `g3` real-checkpoint test | skip without checkpoint | skips (no checkpoint) |
 | `g2` deployment-substitution live-unit test | skips without an installed systemd unit (incl. empty `FragmentPath`) | skips (no unit) |
+| `sandbox_runner` real-bwrap execution tests (9) | `host_acceptance` **marker** (kernel-dependent unprivileged userns) | excluded |
+| `g2_sandbox` real-bwrap probes + `start_in_scope` composition (4) | `host_acceptance` **marker** (+ `_HAS_BWRAP` skipif for non-CI hosts) | excluded |
 
 ### 7.3 Real-CI failure classification (A/B/C model)
 
@@ -223,9 +233,9 @@ worked): 13 failed, 2934 passed, 6 skipped. The 13 failures map to 5 root causes
 
 | # | Root cause (test) | Failures | Class | Fix |
 |---|---|---|---|---|
-| 1 | `tests/test_sandbox_runner.py` execution tests (`FileNotFoundError: 'bwrap'`) | 9 | **A** PORTABLE_WITH_DEPENDENCY | provision bubblewrap in the workflow (new step); docstring no longer claims bwrap is machine-local |
+| 1 | `tests/test_sandbox_runner.py` execution tests (run 1: `FileNotFoundError: 'bwrap'`; run 2 on `5140d15`: installs but `bwrap: setting up uid map: Permission denied` / `loopback: Failed RTM_NEWADDR: Operation not permitted`) | 9 | **B** OPERATIONAL_HOST_ACCEPTANCE (revised from A after run-2 evidence: GH-runner kernel denies unprivileged user namespaces) | mark `host_acceptance` (excluded from portable CI); argv-shape tests stay portable; run in the local full suite |
 | 2 | `tests/test_phase_c2_real_scope_smoke.py::test_real_scope_create_verify_cleanup` (`ScopeCreateError`: cgroup move not delegated) | 1 | **B** OPERATIONAL_HOST_ACCEPTANCE | mark `host_acceptance` (keeps `_systemd_scope_available()` skipif) |
-| 3 | `tests/test_phase_g2_sandbox.py::test_start_in_scope_wraps_with_bwrap` (backend preflight needs `bwrap` on PATH) | 1 | **A** (FakePopen, never executes bwrap/systemd) | no code change — provisioning covers it |
+| 3 | `tests/test_phase_g2_sandbox.py` real-bwrap probes + `test_start_in_scope_wraps_with_bwrap` (run 2 on `5140d15`: `uid map: Permission denied` / bwrap preflight) | 4 | **B** OPERATIONAL_HOST_ACCEPTANCE (revised: bwrap execution/probes cannot run on the runner) | mark `host_acceptance` (keep `_HAS_BWRAP` skipifs); no assertion changes |
 | 4 | `tests/test_phase_g2_unit_static.py::test_deployment_substitutions_match_installed_unit_on_this_host` (`IsADirectoryError: '.'` from empty `FragmentPath`) | 1 | **C** ACCIDENTAL_HOST_COUPLING | empty/absent `FragmentPath` → clean return (portability only; local assertion unchanged) |
 | 5 | `tests/test_phase3d_visualizer_snapshot.py::test_secret_patterns_identical_publisher_reader` (`FileNotFoundError` on sibling path) | 1 | **B** OPERATIONAL_HOST_ACCEPTANCE | `pytest.skip` deterministically when sibling path absent (local assertion unchanged) |
 
@@ -233,8 +243,30 @@ worked): 13 failed, 2934 passed, 6 skipped. The 13 failures map to 5 root causes
 operational host acceptance (only provable on the live host), C = accidental
 host coupling (bug in the test's portability, not a host requirement).
 
-The fixes above are the response to that first failed run; a green run on the
-fixed head is completed by Main after the final fix push.
+### 7.4 Second real CI run (head `5140d15`, run 33897941532) — reclassification evidence
+
+After the fix push `5140d15` the workflow provisioned bubblewrap and ran the
+portable suite: **10 failed, 2940 passed, 4 skipped, 1 deselected**. Exact
+provider evidence from the run log:
+
+- `bwrap: setting up uid map: Permission denied` (3 × `test_phase_g2_sandbox.py`
+  real-bwrap probes, 2 × `sandbox_runner` execution tests)
+- `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`
+  (5 × `sandbox_runner` execution tests)
+- 2 × `sandbox_runner` execution tests (`sandbox_cannot_overwrite_product_file`,
+  `sandbox_result_fields`) FALSE-PASSED on the broken sandbox (exit-1/type-only
+  assertions) — masking, which the exclusion also removes.
+
+Conclusion: bubblewrap INSTALLS on ubuntu-24.04 hosted runners, but the runner
+kernel denies unprivileged user namespaces, so real bwrap sandbox execution is
+not faithfully representable there. Per the A/B/C doctrine the nine
+`sandbox_runner` execution tests and the four `g2_sandbox` bwrap/preflight
+composition tests are reclassified **A → B** (OPERATIONAL_HOST_ACCEPTANCE),
+marked `host_acceptance`, and keep running unchanged in the local full suite;
+portable CI keeps the sandbox argv-shape tests. The bubblewrap provisioning
+step was removed (no point provisioning a dependency the kernel refuses). No
+test assertion was weakened for green status — this is classification on real
+platform evidence.
 
 ## 8. Local verification performed (this writer, fix round)
 

@@ -21,10 +21,6 @@ jobs:
           # Do NOT persist the ephemeral read-only token into .git/config:
           # later steps must run token-less (no step receives a token).
           persist-credentials: false
-      # tests/test_sandbox_runner.py + the Phase-G sandbox-argv tests execute
-      # real bwrap sandboxes (PORTABLE_WITH_DEPENDENCY); provision it.
-      - name: Install sandbox dependency (bubblewrap)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:

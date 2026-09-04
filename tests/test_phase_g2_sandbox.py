@@ -91,6 +91,7 @@ def test_sandbox_argv_never_unshares_net_or_pid():
     assert "--unshare-user" not in argv
 
 
+@pytest.mark.host_acceptance
 def test_start_in_scope_wraps_with_bwrap(tmp_path, monkeypatch):
     # The backend's ``start_in_scope`` must actually wrap (no unwrapped branch
     # on the agent-dispatch path).
@@ -182,6 +183,7 @@ print(json.dumps(r))
 """
 
 
+@pytest.mark.host_acceptance
 @pytest.mark.skipif(not _HAS_BWRAP, reason="bwrap unavailable on this host")
 def test_adversarial_probe_cannot_read_or_persist_trusted_dirs(tmp_path):
     home = tmp_path / "home"
@@ -281,6 +283,7 @@ print(json.dumps(r))
 """
 
 
+@pytest.mark.host_acceptance
 @pytest.mark.skipif(not _HAS_BWRAP, reason="bwrap unavailable on this host")
 def test_g3_sandbox_narrows_openclaw_to_per_agent_runtime_dirs():
     # The fixture "home" must live OUTSIDE /tmp: the sandbox masks /tmp with an
@@ -381,6 +384,7 @@ def test_fail_closed_missing_bwrap_starts_no_process(tmp_path, monkeypatch):
 # (d) short-timeout sandboxed spawn -> the whole tree dies (rc 124 == TIMEOUT)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.host_acceptance
 @pytest.mark.skipif(not _HAS_BWRAP, reason="bwrap unavailable on this host")
 def test_short_timeout_sandboxed_spawn_kills_tree(tmp_path):
     home = tmp_path / "home"
