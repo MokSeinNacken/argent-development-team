@@ -13,11 +13,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      # Immutable SHA pins of the current trusted stable GitHub-maintained
+      # releases (verified 2026-09-04): checkout v7.0.1, setup-python v7.0.0.
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do NOT persist the ephemeral read-only token into .git/config:
+          # later steps must run token-less (no step receives a token).
+          persist-credentials: false
+      # tests/test_sandbox_runner.py + the Phase-G sandbox-argv tests execute
+      # real bwrap sandboxes (PORTABLE_WITH_DEPENDENCY); provision it.
+      - name: Install sandbox dependency (bubblewrap)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
       - name: Install test dependency
         run: python -m pip install --quiet --disable-pip-version-check pytest==9.1.1
-      - name: Run full deterministic test suite
-        run: python -m pytest tests/ -q
+      # Portable CI coverage: the local full suite additionally runs
+      # OPERATIONAL_HOST_ACCEPTANCE tests (marker `host_acceptance`, real
+      # systemd/cgroup/live-host state) which a stock runner cannot represent.
+      - name: Run portable deterministic test suite
+        run: python -m pytest tests/ -q -m "not host_acceptance"

@@ -6,19 +6,30 @@ Phase I3-C2-A GitHub Actions CI bootstrap.  It reads and structurally validates
 check for pull requests into ``main`` can NEVER silently drift into a broader,
 write-capable, secret-carrying, or fail-open CI.
 
-Workflow / check identity (the source of truth CASE 13 asserts against):
+Workflow / check identity (the source of truth the cases assert against):
 
 - workflow ``name``:            ``Argent CI``
 - trigger:                     ``on: pull_request`` restricted to ``branches: [main]``
 - top-level ``permissions``:    ``contents: read`` (read-only, nothing else)
 - single job ``id``:           ``test`` (no ``name:`` display-name override)
-- authoritative test command:  ``python -m pytest tests/ -q`` (fail-closed)
+- authoritative test command:  ``python -m pytest tests/ -q -m "not host_acceptance"``
+                               (portable, fail-closed; excludes the
+                               ``host_acceptance``-marked operational tests)
 - ``timeout-minutes``:         ``15``
 - pinned Python:               ``'3.14'``
 - pinned pytest:               ``pytest==9.1.1``
-- trusted actions (exact set): ``actions/checkout@v7.0.1``,
-  ``actions/setup-python@v7.0.0``
-- required check name:         ``test`` (constant ``CHECK_NAME``)
+- trusted actions (exact set): ``actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1``
+                               (v7.0.1) and
+                               ``actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97``
+                               (v7.0.0) — immutable full-commit SHAs (LOW-3)
+- canonical step set:          5 steps (checkout / bubblewrap / setup-python /
+                               pip-install / portable pytest), asserted EXACTLY
+                               (no extra, no missing, no reorder) — CASE 18
+- checkout token boundary:     ``persist-credentials: false`` (CASE 19); the
+                               ephemeral read-only token is used ONLY to clone
+                               and is NOT persisted — no later step or script
+                               receives any token (no env: GITHUB_TOKEN, no
+                               secrets) — HIGH-1
 
 Because the single job id is ``test`` with no display-name override, the GitHub
 check-run name for this workflow is exactly ``test``.  Phase I3-C2-B waits on
@@ -26,10 +37,13 @@ that exact required-check identity, so any change to the workflow name or job id
 must fail these tests loudly and force a coordinated update of the docs.
 
 The parser is a small deterministic line/indent-based structural reader (no
-PyYAML, no network, no secrets); denylists are asserted as strict text checks
-against the whole file or the parsed job/step blocks.
+PyYAML, no network, no secrets).  It is CANONICAL: it parses the job's steps as
+an exact ordered list (names + uses/with/run content), tolerating full-line
+``#`` comments and ``run: |`` block scalars, and it asserts the exact step set
+plus per-step/job/top-level key allowlists (HIGH-2).  Denylists are asserted as
+strict text checks against the whole file or the parsed job/step blocks.
 
-Case -> test function mapping (17 cases):
+Case -> test function mapping (19 cases):
 
 - CASE 1  pull_request trigger restricted to branches:[main]  -> test_case1_pull_request_trigger_restricted_to_main
 - CASE 2  no pull_request_target                             -> test_case2_no_pull_request_target
@@ -42,12 +56,14 @@ Case -> test function mapping (17 cases):
 - CASE 9  no ${{ in any run block (PR title/body/head/labels) -> test_case9_no_run_shell_interpolation_from_pr
 - CASE 10 no branch/ref/event in run (no ${{ in run line)    -> test_case10_no_branch_ref_shell_command
 - CASE 11 timeout bounded (5 <= value <= 30)                 -> test_case11_timeout_bounded
-- CASE 12 only trusted actions (exact set)                   -> test_case12_only_trusted_actions
+- CASE 12 only trusted actions (exact set, SHA-pinned)       -> test_case12_only_trusted_actions
 - CASE 13 required-check identity (name/job/CHECK_NAME)      -> test_case13_required_check_identity
 - CASE 14 workflow path exactly .github/workflows/ci.yml     -> test_case14_workflow_path_exact
 - CASE 15 PR content cannot become command authority         -> test_case15_pr_content_cannot_become_command_authority
 - CASE 16 no schedule/workflow_dispatch/repository_dispatch  -> test_case16_no_other_triggers
 - CASE 17 no env block / no GITHUB_TOKEN / no env injection  -> test_case17_no_env_or_github_token
+- CASE 18 exact canonical step set + structural key allowlists -> test_case18_exact_canonical_step_set
+- CASE 19 checkout persist-credentials: false                -> test_case19_checkout_persist_credentials_false
 """
 
 from __future__ import annotations
@@ -62,12 +78,46 @@ WORKFLOW_FILE = WORKFLOW_DIR / "ci.yml"
 WORKFLOW_NAME = "Argent CI"
 JOB_ID = "test"
 CHECK_NAME = "test"
-TEST_COMMAND = "python -m pytest tests/ -q"
+TEST_COMMAND = 'python -m pytest tests/ -q -m "not host_acceptance"'
 TIMEOUT_MIN = 5
 TIMEOUT_MAX = 30
-CHECKOUT_ACTION = "actions/checkout@v7.0.1"
-SETUP_PYTHON_ACTION = "actions/setup-python@v7.0.0"
+# LOW-3: immutable full-commit SHA pins (resolved 2026-09-04 via the GitHub API).
+# Human-readable release tags (for review) are kept as inline comments in the
+# workflow, NOT as the mutable ref the runner resolves.
+CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"  # v7.0.1
+SETUP_PYTHON_ACTION = "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"  # v7.0.0
 TRUSTED_ACTIONS = (CHECKOUT_ACTION, SETUP_PYTHON_ACTION)
+
+#: Canonical step set (exact ordered content the workflow must equal).  Full-line
+#: ``#`` comments in the steps list are tolerated (they are data, not steps) and
+#: are NOT part of these dicts.
+CANONICAL_STEPS = [
+    {
+        "name": "Check out repository",
+        "uses": CHECKOUT_ACTION,
+        "with": {"persist-credentials": "false"},
+    },
+    {
+        "name": "Install sandbox dependency (bubblewrap)",
+        "run": "sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap",
+    },
+    {
+        "name": "Set up Python",
+        "uses": SETUP_PYTHON_ACTION,
+        "with": {"python-version": "'3.14'"},
+    },
+    {
+        "name": "Install test dependency",
+        "run": "python -m pip install --quiet --disable-pip-version-check pytest==9.1.1",
+    },
+    {
+        "name": "Run portable deterministic test suite",
+        "run": TEST_COMMAND,
+    },
+]
+
+#: Canonical run commands (the COMPLETE set, in order) the workflow executes.
+CANONICAL_RUN_COMMANDS = [s["run"] for s in CANONICAL_STEPS if "run" in s]
 
 
 # ---------------------------------------------------------------------------
@@ -138,51 +188,98 @@ def _test_block() -> list[str]:
     return _sub(jobs_block, _find(jobs_block, 2, JOB_ID))
 
 
-def _job_steps() -> list[str]:
-    """Return one joined string per step of the ``test`` job."""
+def _steps_block() -> list[str]:
     test_block = _test_block()
-    steps_block = _sub(test_block, _find(test_block, 4, "steps"))
-    steps = []
-    current = []
-    for ln in steps_block:
-        if ln.strip() == "":
-            continue
-        if _indent(ln) == 6 and ln.strip().startswith("- "):
-            if current:
-                steps.append("\n".join(current))
-            current = [ln]
+    return _sub(test_block, _find(test_block, 4, "steps"))
+
+
+def _parse_steps() -> list[dict]:
+    """Parse the ``test`` job's steps into an exact ordered list of step dicts.
+
+    Each step dict maps step keys to values among {name, uses, run, with};
+    ``with`` maps to a dict of its entries (string -> string).  Full-line ``#``
+    comments and blank lines are ignored (a comment inside the steps list is NOT
+    a step).  Inline ``#`` comments are stripped from ``uses:`` refs.  A block
+    scalar ``run: |`` is captured as its joined indented body (trailing blank
+    lines trimmed), so a multi-line script body can never hide commands from the
+    validator.
+    """
+    steps: list[dict] = []
+    cur: dict | None = None
+    cur_with: dict | None = None
+    run_body: list[str] | None = None
+
+    def close_step() -> None:
+        nonlocal cur, cur_with, run_body
+        if run_body is not None:
+            while run_body and run_body[-1] == "":
+                run_body.pop()
+            if cur is not None:
+                cur["run"] = "\n".join(run_body)
+            run_body = None
+        if cur is not None:
+            steps.append(cur)
+        cur = None
+        cur_with = None
+
+    def set_entry(text: str) -> None:
+        nonlocal cur_with, run_body
+        key, _, val = text.partition(":")
+        key = key.strip()
+        val = val.strip()
+        if key == "with":
+            cur_with = {}
+            cur["with"] = cur_with
+        elif key == "uses":
+            # strip inline comment (# v7.0.1) so the immutable SHA is exact
+            cur["uses"] = val.split("#", 1)[0].strip()
+        elif key == "run" and val == "|":
+            run_body = []
+        elif key == "run":
+            cur["run"] = val
         else:
-            current.append(ln)
-    if current:
-        steps.append("\n".join(current))
+            cur[key] = val
+
+    for ln in _steps_block():
+        stripped = ln.strip()
+        indent = _indent(ln)
+        if stripped == "":
+            if run_body is not None:
+                run_body.append("")
+            continue
+        if stripped.startswith("#"):
+            # Full-line comment: not part of any step or with-entry.
+            continue
+        if indent == 6 and stripped.startswith("- "):
+            close_step()
+            cur = {}
+            set_entry(stripped[2:].strip())
+            continue
+        if run_body is not None:
+            run_body.append(stripped)
+            continue
+        if cur is not None and indent >= 10 and cur_with is not None:
+            k, _, v = stripped.partition(":")
+            cur_with[k.strip()] = v.strip()
+            continue
+        if cur is not None and indent >= 8:
+            set_entry(stripped)
+            continue
+    close_step()
     return steps
 
 
 def _uses_refs() -> list[str]:
-    refs = []
-    for step in _job_steps():
-        for line in step.splitlines():
-            s = line.strip()
-            if s.startswith("- "):
-                s = s[2:].strip()
-            if s.startswith("uses:"):
-                refs.append(s[len("uses:"):].strip())
-    return refs
+    return [s["uses"] for s in _parse_steps() if "uses" in s]
 
 
 def _run_commands() -> list[str]:
-    cmds = []
-    for step in _job_steps():
-        for line in step.splitlines():
-            s = line.strip()
-            if s.startswith("run:"):
-                cmds.append(s[len("run:"):].strip())
-    return cmds
+    return [s["run"] for s in _parse_steps() if "run" in s]
 
 
-def _test_step() -> str:
-    for step in _job_steps():
-        if "python -m pytest" in step:
+def _test_step() -> dict:
+    for step in _parse_steps():
+        if "run" in step and "python -m pytest" in step["run"]:
             return step
     raise AssertionError("authoritative pytest step not found in workflow")
 
@@ -193,6 +290,43 @@ def _timeout_minutes():
     if idx is None:
         return None
     return int(test_block[idx].strip().split(":", 1)[1].strip())
+
+
+def _comment_free_text() -> str:
+    """Return the workflow text with ``#`` inline comments removed.
+
+    Used by the capability/token denylist checks (CASE 5/6) so that explanatory
+    comments (which are data, not workflow behaviour) cannot trip a literal
+    ``release``/``token`` word check.  Only safe for THIS controlled file (no
+    ``#`` inside a quoted value); a ``#`` inside a double-quoted string is not a
+    YAML comment anyway.  The check remains strict: the denylist tokens are
+    still rejected anywhere in the executable (non-comment) content.
+    """
+    return "\n".join(ln.split("#", 1)[0] for ln in _text().splitlines())
+
+
+def _top_level_keys() -> list[str]:
+    lines = _read_lines()
+    return [
+        ln.strip().split(":", 1)[0].strip()
+        for ln in lines
+        if _indent(ln) == 0 and ":" in ln and not ln.strip().startswith("-")
+    ]
+
+
+def _job_keys() -> list[str]:
+    return [
+        ln.strip().split(":", 1)[0].strip()
+        for ln in _test_block()
+        if _indent(ln) == 4 and ":" in ln and not ln.strip().startswith("-")
+    ]
+
+
+def _step_keys() -> set[str]:
+    keys: set[str] = set()
+    for step in _parse_steps():
+        keys.update(step.keys())
+    return keys
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +395,9 @@ def test_case4_permissions_read_only_contents_only():
 # ---------------------------------------------------------------------------
 
 def test_case5_no_deploy_release_publish():
-    t = _text().lower()
+    # Checked against comment-free content: a capability can only come from a
+    # key/value/command, never from an explanatory comment.
+    t = _comment_free_text().lower()
     for token in ("deploy", "release", "publish", "gh release",
                   "actions/deploy", "upload-artifact", "download-artifact"):
         assert token not in t, f"{token!r} present"
@@ -272,7 +408,7 @@ def test_case5_no_deploy_release_publish():
 # ---------------------------------------------------------------------------
 
 def test_case6_no_external_write_token_or_credentials():
-    t = _text().lower()
+    t = _comment_free_text().lower()
     assert "github_token" not in t
     assert "token" not in t
 
@@ -287,10 +423,10 @@ def test_case7_test_command_fail_closed():
     assert pytest_cmds == [TEST_COMMAND]
     step = _test_step()
     # No shell-ignore mechanisms may mask the authoritative test step.
-    assert "|| true" not in step
-    assert "set +e" not in step
+    assert "|| true" not in step["run"]
+    assert "set +e" not in step["run"]
     assert "continue-on-error" not in step
-    assert "if:" not in step
+    assert "if" not in step
     assert not TEST_COMMAND.lstrip().startswith("-")
 
 
@@ -335,16 +471,11 @@ _BRANCH_REF_TOKENS = (
 
 def test_case10_no_branch_ref_shell_command():
     text = _text()
-    # Strongest guarantee: no run: line contains any expression at all.
+    # Strongest guarantee: no run: command contains any expression at all.
     for cmd in _run_commands():
         assert "${{" not in cmd
     for token in _BRANCH_REF_TOKENS:
         assert token not in text
-    # No run line may contain an expression marker either.
-    for step in _job_steps():
-        for line in step.splitlines():
-            if line.strip().startswith("run:"):
-                assert "${{" not in line
 
 
 # ---------------------------------------------------------------------------
@@ -358,13 +489,18 @@ def test_case11_timeout_bounded():
 
 
 # ---------------------------------------------------------------------------
-# CASE 12 — only trusted actions (exact set)
+# CASE 12 — only trusted actions (exact set, SHA-pinned)
 # ---------------------------------------------------------------------------
 
 def test_case12_only_trusted_actions():
     refs = _uses_refs()
     assert sorted(refs) == sorted(TRUSTED_ACTIONS)
     assert len(refs) == len(set(refs)) == 2
+    # LOW-3: every trusted ref is an immutable full-commit SHA, never a mutable
+    # tag/branch (a mutable ref would let a retagged release change behaviour).
+    for ref in refs:
+        sha = ref.rsplit("@", 1)[1]
+        assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha), ref
 
 
 # ---------------------------------------------------------------------------
@@ -439,3 +575,34 @@ def test_case17_no_env_or_github_token():
         assert not s.startswith("env:"), f"env block present: {line!r}"
     assert "GITHUB_TOKEN" not in text
     assert "environment" not in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# CASE 18 — exact canonical step set + structural key allowlists
+# ---------------------------------------------------------------------------
+
+def test_case18_exact_canonical_step_set():
+    steps = _parse_steps()
+    # Exact ordered list: no extra, no missing, no reorder (names + content,
+    # incl. with: entries and complete run: commands).
+    assert steps == CANONICAL_STEPS
+    # Complete run: command set equals exactly the canonical commands.
+    assert _run_commands() == CANONICAL_RUN_COMMANDS
+    # Structural key allowlists (no hidden capability keys anywhere).
+    assert _top_level_keys() == ["name", "on", "permissions", "jobs"]
+    assert set(_job_keys()) == {"runs-on", "timeout-minutes", "steps"}
+    assert _step_keys() <= {"name", "uses", "with", "run"}
+
+
+# ---------------------------------------------------------------------------
+# CASE 19 — checkout persist-credentials: false
+# ---------------------------------------------------------------------------
+
+def test_case19_checkout_persist_credentials_false():
+    steps = _parse_steps()
+    checkout = steps[0]
+    assert checkout["name"] == "Check out repository"
+    assert checkout["uses"] == CHECKOUT_ACTION
+    # HIGH-1: the ephemeral read-only token must NOT be persisted into
+    # .git/config; later steps run token-less (no step receives a token).
+    assert checkout["with"] == {"persist-credentials": "false"}

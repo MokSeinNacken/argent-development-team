@@ -295,7 +295,15 @@ def test_deployment_substitutions_match_installed_unit_on_this_host():
         return  # no systemd -> skip cleanly
     if not out.startswith("FragmentPath="):
         return
-    fragment = Path(out.split("=", 1)[1])
+    fragment_value = out.split("=", 1)[1].strip()
+    # A unit that is not loaded/installed prints an EMPTY FragmentPath value;
+    # Path("") would resolve to '.' (a directory) and read_text('.') would
+    # raise IsADirectoryError.  Guard the empty/absent cases before any
+    # exists()/read_text() so this host-coupled check stays purely portable
+    # (same clean skip as the other absent-systemd paths above).
+    if not fragment_value:
+        return  # empty FragmentPath -> unit not installed -> skip cleanly
+    fragment = Path(fragment_value)
     if not fragment.exists():
         return  # installed unit absent -> skip cleanly
     installed_text = fragment.read_text(encoding="utf-8")

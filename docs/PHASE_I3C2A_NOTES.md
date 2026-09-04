@@ -2,12 +2,12 @@
 
 **Branch:** `phase-i3c2a-ci-bootstrap` (Base `29de775ad12088cba13cf2285a6514b12f9d770d` = Phase I3-C1 GREEN).
 **Datum:** 2026-09-04.
-**Scope:** ADDITIVE only — one workflow file, one test module, two docs. **No
-commit, no push, no GitHub/broker/systemd/service/state-dir operation, no LLM
-agents.** The PR that will carry this workflow is created **later** by the
-supervisor through the trusted external-action broker; this phase only installs
-the minimal, safe CI definition and the deterministic security tests that keep
-it trustworthy.
+**Scope:** ADDITIVE only — one workflow file, one test module, one `conftest.py`
+hook, a handful of portability guards, two docs. **No commit, no push, no
+GitHub/broker/systemd/service/state-dir operation, no LLM agents.** The PR that
+will carry this workflow is created **later** by the supervisor through the
+trusted external-action broker; this phase only installs the minimal, safe CI
+definition and the deterministic security tests that keep it trustworthy.
 
 ---
 
@@ -17,19 +17,35 @@ Phase I3-C2-A installs the **minimal, safe GitHub Actions CI workflow** that
 will produce a trustworthy GitHub check for pull requests into `main` of
 `MokSeinNacken/argent-development-team`. The workflow is read-only, carries no
 secrets, has no deployment/release/publish capability, and runs the repo's
-deterministic test suite with a fail-closed job. Phase I3-C2-B will later wait
-on this CI's check runs with an exact required-check identity, so that identity
-is fixed and documented here (§6).
+portable deterministic test suite with a fail-closed job. Phase I3-C2-B will
+later wait on this CI's check runs with an exact required-check identity, so
+that identity is fixed and documented here (§6).
 
 **Boundaries (CI only):**
 
 - No deployment / release / publish / artifact capability.
-- No secrets, no credentials, no `GITHUB_TOKEN` usage.
+- No secrets, no credentials, no `GITHUB_TOKEN` usage by any step.
 - Read-only `permissions: contents: read`.
 - Ends at the Owner Gate — this phase produces
   `CI_BOOTSTRAP_PR_READY_FOR_OWNER_MERGE`; the PR is created later by the
   supervisor via the broker (this writer never touches GitHub).
 - I3-C2-B must **NOT** start automatically; it waits for owner merge.
+
+### 1.1 Honest token boundary (HIGH-1, corrected)
+
+The original docs claimed "no action receives a token". That was imprecise. The
+**exact** boundary is:
+
+- `actions/checkout` (step 1) receives the ephemeral, **read-only,
+  contents-scoped** `GITHUB_TOKEN` **only** to clone the repository.
+- That token is **NOT persisted** into `.git/config` because the checkout step
+  sets `persist-credentials: false` (asserted by CASE 19).
+- **No later step and no script receives any token**: there is no
+  `env: GITHUB_TOKEN`, no `secrets`, no `with: token:` anywhere, and no action
+  beyond checkout is in the token path. Asserted by CASE 6 / 17 / 19.
+
+This is the least privilege that still lets a PR check clone and report its
+check-run status; anything less would break the checkout itself.
 
 ## 2. Design decisions + reasons
 
@@ -44,18 +60,18 @@ is fixed and documented here (§6).
   No `pull-requests: write`, `checks: write`, `statuses: write` etc. — the
   check-run status is reported implicitly by the workflow run itself, not via an
   explicit write permission.
-- **No secrets.** The repo's deterministic suite needs none (evidence §3): every
-  live-environment test skips cleanly on a stock runner via existing `skipif`
-  guards; there is no network, no external service, no credentials in any test.
-  An empty `secrets` universe is therefore both safe and sufficient.
+- **No secrets.** The repo's portable suite needs none (evidence §3): every
+  live-environment test skips cleanly on a stock runner via the
+  `host_acceptance` marker / `skipif` / skip-if-absent guards; there is no
+  network, no external service, no credentials in any test. An empty `secrets`
+  universe is therefore both safe and sufficient.
 - **No `pull_request_target`.** `pull_request_target` runs with the *base*
   repository's elevated context and default write permissions — an untrusted PR
   could exfiltrate tokens or mutate the base. `pull_request` runs in the
   read-only, fork-safe context; the whole point of this bootstrap is to keep
   untrusted PR code at the lowest possible authority.
-- **No third-party actions.** Only GitHub-maintained `actions/checkout` and
-  `actions/setup-python` (§4). No secrets are passed to any action; no action
-  receives a token.
+- **Only two GitHub-maintained actions, pinned to immutable commit SHAs** (§4).
+  No third-party actions; no action beyond checkout is in the token path.
 - **No expressions (`${{ }}`) anywhere.** This removes the entire class of
   script-injection / PR-content-as-command-authority attacks at the source:
   nothing derived from the PR title/body/head/labels/ref can ever reach a shell.
@@ -63,8 +79,15 @@ is fixed and documented here (§6).
   deterministic job; each adds surface area without adding check value.
 - **No job display-name override.** Job id `test` is the check name (stable,
   never derived from PR content) — see §6.
-- **`timeout-minutes: 15`.** The locally proven suite runs in ~51 s; 15 min gives
+- **`timeout-minutes: 15`.** The locally proven suite runs in ~48 s; 15 min gives
   ~18× headroom on a slower hosted runner while still bounding a hung run.
+- **bubblewrap is provisioned** (`sudo apt-get install -y --no-install-recommends
+  bubblewrap`) because the execution-sandbox tests run real `bwrap` sandboxes
+  (PORTABLE_WITH_DEPENDENCY, §7).
+- **Portable test command** `python -m pytest tests/ -q -m "not host_acceptance"`
+  — the runner executes the full deterministic suite *minus* the
+  `host_acceptance`-marked operational tests, which a stock runner cannot
+  faithfully represent (§7).
 
 ## 3. Repository test requirements (evidence)
 
@@ -72,32 +95,47 @@ is fixed and documented here (§6).
   (nutzerlokal installiert). No `pyproject.toml` / `setup.py` / requirements
   files; `tests/conftest.py` adds the repo root to `sys.path`, so **no package
   install step is needed or wanted**.
-- Authoritative full deterministic suite (proven by Phase I3-C1 / I3-C2-A local
-  runs): `python -m pytest tests/ -q` from the repo root → **2936 passed** in
-  **~51 s** locally (commit `29de775ad…`).
-- All live-environment tests (`bwrap`/`systemd-run`/real-checkpoint/real-gh)
-  **skip cleanly** on a stock GitHub runner via existing `skipif` guards; no
-  secrets, no external services, no real network anywhere in the suite.
+- Portable deterministic suite: `python -m pytest tests/ -q -m "not host_acceptance"`
+  from the repo root. Locally the **full** suite is **2955 passed** in **~48 s**
+  (this fix round); the portable subset (minus 1 `host_acceptance` test) is
+  **2954 collected**.
+- All live-environment tests (real systemd scope, sibling-checkout consistency,
+  live credential probes, real checkpoint, installed-unit substitution) **skip
+  cleanly** on a stock GitHub runner via the `host_acceptance` marker /
+  `skipif` / skip-if-absent guards; no secrets, no external services, no real
+  network anywhere in the suite.
 - **pytest pinned to `==9.1.1`** — the locally proven version (deterministic
   check conclusions). Installing anything else would change check semantics.
 - The only install step is `python -m pip install --quiet
   --disable-pip-version-check pytest==9.1.1` (user-local, no system mutation).
 
-## 4. Third-party action safety
+## 4. Third-party action safety (supply chain)
 
-- `actions/checkout@v7.0.1` and `actions/setup-python@v7.0.0` are
-  GitHub-maintained, current stable releases (verified 2026-09-04 via the GitHub
-  releases API).
+- **Immutable full-commit SHA pins** (resolved 2026-09-04 via the GitHub API;
+  the human-readable release tag is kept as an inline comment for review, never
+  as the mutable ref the runner resolves):
+  - `actions/checkout` → `3d3c42e5aac5ba805825da76410c181273ba90b1` (# v7.0.1)
+  - `actions/setup-python` → `5fda3b95a4ea91299a34e894583c3862153e4b97` (# v7.0.0)
 - These are the **only** actions (`uses:` set is exactly those two, asserted by
-  the test suite as module constants).
-- No secrets are passed to any action; no action receives any token; no action
-  has a `with:` input beyond the pinned Python version.
+  the test suite as module constants, and each SHA is verified to be a 40-hex
+  immutable commit — CASE 12).
+- No secrets are passed to any action; only checkout is in the token path and
+  that token is not persisted (§1.1); the only `with:` inputs are
+  `persist-credentials: false` (checkout) and `python-version: '3.14'`
+  (setup-python).
+- **pytest pin:** `pytest==9.1.1` (deterministic version).
+- **Accepted residual (documented):** the pip index is **not** hash-locked
+  (no `--require-hashes`, no pinned wheel hash). This is a deliberate, accepted
+  residual of this bootstrap: the single installed dependency is a
+  version-pinned, widely-used PyPI package, and full hash-locking is deferred to
+  a later hardening pass. Nothing else is installed.
 
-## 5. Security validation (17 cases → test module)
+## 5. Security validation (19 cases → test module)
 
 The workflow is validated by `tests/test_phase_i3c2a_ci_workflow.py` (stdlib
 `pathlib` only — no PyYAML, deterministic line/indent structural reader + strict
-denylist text assertions). Case → test mapping:
+denylist text assertions, **canonical** exact-step-set parsing). Case → test
+mapping:
 
 | Case | Meaning | Test function |
 |---|---|---|
@@ -112,12 +150,21 @@ denylist text assertions). Case → test mapping:
 | 9 | no `${{` in any run block (PR title/body/head/labels) | `test_case9_no_run_shell_interpolation_from_pr` |
 | 10 | no branch/ref/event input → shell command | `test_case10_no_branch_ref_shell_command` |
 | 11 | timeout bounded (5 ≤ value ≤ 30) | `test_case11_timeout_bounded` |
-| 12 | only trusted actions (exact set) | `test_case12_only_trusted_actions` |
+| 12 | only trusted actions (exact set, SHA-pinned) | `test_case12_only_trusted_actions` |
 | 13 | required-check identity (name/job/CHECK_NAME) | `test_case13_required_check_identity` |
 | 14 | workflow path exactly `.github/workflows/ci.yml` | `test_case14_workflow_path_exact` |
 | 15 | PR content cannot become command authority | `test_case15_pr_content_cannot_become_command_authority` |
 | 16 | no schedule/workflow_dispatch/repository_dispatch | `test_case16_no_other_triggers` |
 | 17 | no env block / GITHUB_TOKEN / env injection | `test_case17_no_env_or_github_token` |
+| 18 | exact canonical step set + structural key allowlists | `test_case18_exact_canonical_step_set` |
+| 19 | checkout `persist-credentials: false` | `test_case19_checkout_persist_credentials_false` |
+
+The parser is now **canonical** (HIGH-2): it parses the job's steps as an exact
+ordered list (names + uses/with/run content), tolerates full-line `#` comments
+and `run: |` block scalars, and asserts the exact step set plus per-step/job/
+top-level key allowlists (`{name, uses, with, run}` / `{runs-on,
+timeout-minutes, steps}` / `{name, on, permissions, jobs}`). Inline `#`
+comments are stripped when reading `uses:` refs.
 
 ## 6. Check identity for I3-C2-B (documented, deterministic)
 
@@ -129,19 +176,81 @@ denylist text assertions). Case → test mapping:
 Any change to the workflow name or job id will fail CASE 13 loudly and force a
 coordinated update of the test constants + docs — this is deliberate.
 
-## 7. Local verification performed (this writer)
+### 6.1 Check provenance binding (LOW-4)
+
+The required-check identity that I3-C2-B waits on is **not** the check name
+alone. A same-named check emitted by a *different* app must never satisfy the
+wait. The required-check identity for I3-C2-B therefore comprises **all three**:
+
+1. **check name** `test`;
+2. **GitHub Actions app identity** (app slug `github-actions`);
+3. **workflow file path** `.github/workflows/ci.yml`.
+
+I3-C2-B must bind all three (name + app slug + workflow path) when polling the
+check-run status; a check named `test` from any other app or workflow must not
+satisfy the wait.
+
+## 7. CI coverage model
+
+### 7.1 PORTABLE CI COVERAGE (what the runner runs)
+
+The GitHub runner executes `python -m pytest tests/ -q -m "not host_acceptance"`
+— the **full deterministic suite minus the `host_acceptance`-marked operational
+tests** (2954 tests). This includes the real `bwrap` execution-sandbox tests
+(`tests/test_sandbox_runner.py` and the Phase-G sandbox-argv tests), which are
+**PORTABLE_WITH_DEPENDENCY**: their invariants (read-only workspace, no network,
+timeout kill, output bound, nproc limit, result fields) are fully appropriate
+for CI, and `bwrap` is safely provisioned via the bubblewrap apt step.
+
+### 7.2 LOCAL/WSL OPERATIONAL ACCEPTANCE (development-host only)
+
+These prove **live-host** state a stock GitHub runner cannot faithfully
+represent (real systemd user-scope + cgroup delegation, a sibling checkout, real
+credentials, a real checkpoint, an installed systemd unit):
+
+| Test | Mechanism | On stock runner |
+|---|---|---|
+| `c2` real-scope smoke (`test_real_scope_create_verify_cleanup`) | `host_acceptance` **marker** (excluded by `-m "not host_acceptance"`) | excluded |
+| `3d-visualizer` sibling-checkout consistency (`test_secret_patterns_identical_publisher_reader`) | skip-if-absent guard (sibling repo path) | skips (path absent) |
+| `i3a` live credential probes | skip without real `~/.config/gh` | skips (no creds) |
+| `g3` real-checkpoint test | skip without checkpoint | skips (no checkpoint) |
+| `g2` deployment-substitution live-unit test | skips without an installed systemd unit (incl. empty `FragmentPath`) | skips (no unit) |
+
+### 7.3 Real-CI failure classification (A/B/C model)
+
+The first real GitHub CI run on `4c0ad046` **correctly FAILED** (fail-closed
+worked): 13 failed, 2934 passed, 6 skipped. The 13 failures map to 5 root causes:
+
+| # | Root cause (test) | Failures | Class | Fix |
+|---|---|---|---|---|
+| 1 | `tests/test_sandbox_runner.py` execution tests (`FileNotFoundError: 'bwrap'`) | 9 | **A** PORTABLE_WITH_DEPENDENCY | provision bubblewrap in the workflow (new step); docstring no longer claims bwrap is machine-local |
+| 2 | `tests/test_phase_c2_real_scope_smoke.py::test_real_scope_create_verify_cleanup` (`ScopeCreateError`: cgroup move not delegated) | 1 | **B** OPERATIONAL_HOST_ACCEPTANCE | mark `host_acceptance` (keeps `_systemd_scope_available()` skipif) |
+| 3 | `tests/test_phase_g2_sandbox.py::test_start_in_scope_wraps_with_bwrap` (backend preflight needs `bwrap` on PATH) | 1 | **A** (FakePopen, never executes bwrap/systemd) | no code change — provisioning covers it |
+| 4 | `tests/test_phase_g2_unit_static.py::test_deployment_substitutions_match_installed_unit_on_this_host` (`IsADirectoryError: '.'` from empty `FragmentPath`) | 1 | **C** ACCIDENTAL_HOST_COUPLING | empty/absent `FragmentPath` → clean return (portability only; local assertion unchanged) |
+| 5 | `tests/test_phase3d_visualizer_snapshot.py::test_secret_patterns_identical_publisher_reader` (`FileNotFoundError` on sibling path) | 1 | **B** OPERATIONAL_HOST_ACCEPTANCE | `pytest.skip` deterministically when sibling path absent (local assertion unchanged) |
+
+**Classification semantics:** A = portable (should run in CI), B =
+operational host acceptance (only provable on the live host), C = accidental
+host coupling (bug in the test's portability, not a host requirement).
+
+The fixes above are the response to that first failed run; a green run on the
+fixed head is completed by Main after the final fix push.
+
+## 8. Local verification performed (this writer, fix round)
 
 - YAML syntax parse (local PyYAML only for validation — **never** a repo
-  dependency): `yaml.safe_load` → top-level keys `['True', 'jobs', 'name',
-  'permissions']` (the `on` key is reported as `True` under YAML 1.1's
-  boolean-key quirk — fine for a syntax check; the repo tests are text-based and
+  dependency): `yaml.safe_load` → top-level keys `['name', True, 'permissions',
+  'jobs']` (the `on` key is reported as `True` under YAML 1.1's boolean-key
+  quirk — fine for a syntax check; the repo tests are text-based and
   unaffected).
-- New security tests: `python3 -m pytest tests/test_phase_i3c2a_ci_workflow.py
-  -q` → **17 passed**.
-- Full suite (deployment env exports applied, see §8): **2953 passed** (2936
-  baseline + 17 new).
+- Security tests: `python3 -m pytest tests/test_phase_i3c2a_ci_workflow.py -q`
+  → **19 passed**.
+- Full suite (deployment env exports applied, see §9): **2955 passed** in
+  **~48 s**.
+- Portable collect: `python3 -m pytest tests/ -q -m "not host_acceptance"
+  --collect-only` → **2954 collected, 1 deselected**.
 
-## 8. Deployment-tracking note
+## 9. Deployment-tracking note
 
 `g2-systemd/install-check.sh` + `tests/test_phase_g2_unit_static.py` default
 `ARGENT_WORKTREE`/`ARGENT_DOC` to the live deployment. The live deployed unit
@@ -159,19 +268,29 @@ that is a pre-existing stale default and is **not** modified by this phase. The
 tests/scripts are env-parameterizable by design; on GitHub runners the live-unit
 test skips cleanly because systemd is absent.)
 
-## 9. Explicit non-goals / limitations
+## 10. Explicit non-goals / limitations
 
-- **Broad classic PAT remains** — not rotated this phase; the fine-grained PAT /
-  GitHub App replacement remains a pre-I4 hardening item.
+- **Provider-token residual (LOW-5, documented precisely).** A broad classic PAT
+  remains on account `MokSeinNacken` with scopes `gist`, `read:org`, `repo`,
+  `workflow`. `main` has **no branch protection**. Mitigations are broker policy
+  fences: the `argent/` namespace allowlist, task-scoped usage, and `SENSITIVE →
+  OWNER_GATE_REQUIRED`. This token is **NOT rotated** in this phase. A
+  fine-grained PAT or a GitHub App remains a **required hardening item before
+  productive Phase-I / I4 closure**.
 - **No branch protection on `main`** — the required-check policy stays explicit
   and local (never inferred from a non-existent ruleset).
+- **pip index is not hash-locked** (§4) — accepted residual, documented.
 - **This phase does NOT accept any CI lifecycle** (no wait/wake acceptance) —
   that is I3-C2-B, after owner merge.
 - No commit/push/PR is produced by this phase; the supervisor creates the PR via
   the broker later.
 
-## 10. Status
+## 11. Status
 
-**PENDING.** Files written and verified locally; GREEN is marked only by Main
-after the live push/PR flow, broker audit, credential re-probe, secret scan,
-Sol review, and full regression. See `docs/PHASE_I3C2A_ACCEPTANCE.md`.
+**PENDING — fix round applied.** The first real CI run on `4c0ad046` correctly
+FAILED (fail-closed), surfacing 13 environmental failures (5 root causes); the
+fixes in this round (provisioning, `host_acceptance` marker, portability guards,
+canonical parser, SHA pins, honest token boundary) are the response. GREEN is
+marked only by Main after the final fix push, green CI on the fixed head,
+broker audit, credential re-probe, secret scan, Sol review, and full regression.
+See `docs/PHASE_I3C2A_ACCEPTANCE.md`.

@@ -559,9 +559,18 @@ def test_secret_patterns_identical_publisher_reader() -> None:
     import re as _re
 
     pub = Path(vs.__file__).read_text(encoding="utf-8")
-    reader = Path(
+    reader_path = Path(
         "/home/pc/projects/system-visualizer-3d/backend/app/services/argent_snapshot.py"
-    ).read_text(encoding="utf-8")
+    )
+    # OPERATIONAL_HOST_ACCEPTANCE: cross-checkout consistency check against a
+    # sibling repo that exists only on the development host.  Skip
+    # deterministically when the sibling checkout is absent (same pattern as
+    # the real-file guards in tests/test_phase_g3_checkpoint.py and
+    # tests/test_phase_i3a_credentials.py); the local assertion is unchanged
+    # when the file is present.
+    if not reader_path.exists():
+        pytest.skip("sibling system-visualizer-3d checkout absent on this host")
+    reader = reader_path.read_text(encoding="utf-8")
 
     def extract_pattern(src: str, var: str) -> str:
         m = _re.search(rf"{var}\s*=\s*re\.compile\(\n(.*?)\n\s*\)", src, _re.S)

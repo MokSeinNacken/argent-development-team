@@ -1,7 +1,9 @@
 """bwrap test-runner tests (SPEC V2B §3).
 
-Deterministic: bwrap is present on this machine, so these tests run real
-sandboxed pytest runs (no skips/xfails).  Each test builds a tiny workspace in
+Deterministic: these tests run real sandboxed pytest runs (no skips/xfails)
+wherever ``bwrap`` is available.  On GitHub CI ``bwrap`` is provisioned via the
+``apt-get install bubblewrap`` step of ``.github/workflows/ci.yml``; on the
+development host it is already installed.  Each test builds a tiny workspace in
 ``tmp_path`` and runs it through :func:`run_tests`.
 """
 
