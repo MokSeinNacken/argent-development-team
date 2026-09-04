@@ -12,6 +12,25 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from argent_core import Core, OWNER_SOURCE, Role, role_source  # noqa: E402
 
+
+def pytest_configure(config):
+    """Register the ``host_acceptance`` marker.
+
+    ``host_acceptance`` marks tests that prove OPERATIONAL_HOST_ACCEPTANCE on a
+    real host (live systemd user-scope + cgroup delegation, a sibling-checkout
+    consistency check, live credential probes, a real checkpoint, or an
+    installed systemd unit).  A stock GitHub runner cannot faithfully represent
+    such live-host state, so the portable CI command runs
+    ``-m "not host_acceptance"`` to exclude them; they still run in the local
+    full suite on the development host.
+    """
+    config.addinivalue_line(
+        "markers",
+        "host_acceptance: proves live-host (systemd/cgroup/checkout/credential) "
+        "state that a stock CI runner cannot represent; excluded from portable CI.",
+    )
+
+
 LEAD = role_source(Role.LEAD)
 ANALYST = role_source(Role.ANALYST)
 IMPLEMENTER = role_source(Role.IMPLEMENTER)

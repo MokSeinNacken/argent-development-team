@@ -150,7 +150,8 @@ def test_schema_version_is_15():
     # action_locks FK on supervisor_jobs).  I2 (Phase I2): 20 -> 21 (additive
     # integration_candidates merge-queue table).  I3-A (Phase I3-A): 21 -> 22
     # (additive external_action_requests + external_action_audit tables).
-    assert SCHEMA_VERSION == "22"
+    # I3-C1 (Phase I3-C1): 22 -> 23 (additive ci_policy/ci_evidence columns).
+    assert SCHEMA_VERSION == "23"
 
 
 def test_fresh_db_has_v6_tables_and_version(db_path, core):

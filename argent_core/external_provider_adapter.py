@@ -41,6 +41,17 @@ class ProviderUnavailable(ProviderError):
     """The provider is unreachable / down (a provider outage, not a code bug)."""
 
 
+class ProviderNetworkError(ProviderUnavailable):
+    """A transport/network failure reaching the provider (I3-B additive).
+
+    A distinct subclass of :class:`ProviderUnavailable` so the adapter and its
+    tests can tell a local transport failure (subprocess spawn failure, DNS,
+    timeout, connection reset) apart from a provider-reported 5xx outage, while
+    the broker's existing ``OUTCOME_UNAVAILABLE`` mapping (retryable outage)
+    still applies unchanged — a network failure never invents a new outcome.
+    """
+
+
 class ProviderRateLimited(ProviderError):
     """The provider rejected the operation with a rate-limit (429 / quota)."""
 

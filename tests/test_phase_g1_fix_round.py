@@ -58,6 +58,7 @@ from mock_supervisor_runtime import (
     FakeClock,
     FakeRunLauncher,
     FakeRunStatusProvider,
+    make_deterministic_scheduler,
     make_run_observation,
 )
 
@@ -534,7 +535,7 @@ def test_run_loop_drives_multistep_job_to_done(tmp_path):
     job = sup.store.create_job(task.id, idempotency_key="job-1")
     jid = job.supervisor_job_id
 
-    sched = Scheduler(sup, owner_instance_id="instance-A", lease_ttl_seconds=600)
+    sched = make_deterministic_scheduler(sup, owner_instance_id="instance-A", lease_ttl_seconds=600)
     ewm = ExternalWaitManager(core._store, adapters={}, clock=clock)
     inst = SupervisorInstance(
         core._store,
@@ -569,7 +570,7 @@ def test_loop_periodic_recovery_takes_over_expired_lease(db_path):
     sup = Supervisor(core2, FakeRunStatusProvider(), FakeRunLauncher(),
                      clock=clock)
     sup._process_identity_provider = fake_identity_provider()
-    sched = Scheduler(sup, owner_instance_id="B", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(sup, owner_instance_id="B", lease_ttl_seconds=60)
 
     # Restart BEFORE lease expiry: reconcile leaves the (still-valid) foreign lease.
     summary = sched.reconcile_after_restart()

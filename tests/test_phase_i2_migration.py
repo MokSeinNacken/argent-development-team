@@ -42,7 +42,7 @@ def test_fresh_db_lands_on_v21(tmp_path):
     core = Core(str(tmp_path / "fresh.db"))
     try:
         assert _schema_version(core) == SCHEMA_VERSION
-        assert SCHEMA_VERSION == "22"
+        assert SCHEMA_VERSION == "23"
         assert "integration_candidates" in _tables(core)
     finally:
         core.close()

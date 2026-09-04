@@ -51,11 +51,17 @@ def _systemd_scope_available() -> bool:
         return False
 
 
+@pytest.mark.host_acceptance
 @pytest.mark.skipif(
     not _systemd_scope_available(),
     reason="systemd-run --user --scope not available (no root workaround)",
 )
 def test_real_scope_create_verify_cleanup():
+    # OPERATIONAL_HOST_ACCEPTANCE: proves REAL systemd user-scope + cgroup
+    # delegation on a live host.  A stock GitHub runner has a systemd user
+    # session but does NOT delegate cgroup process-move, so this test is
+    # excluded from portable CI via the `host_acceptance` marker (the
+    # _systemd_scope_available() skipif above is unchanged).
     # The raw C2 scope backend is exercised WITHOUT the agent-dispatch sandbox
     # (the bwrap wrap is G2 F1; this test proves the scope mechanism itself).
     backend = SystemdRunScopeBackend(sandbox_wrap=False)

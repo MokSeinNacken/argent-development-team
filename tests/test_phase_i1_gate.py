@@ -39,7 +39,7 @@ from argent_core.scheduler import (
 )
 from argent_core.supervisor import Supervisor
 from c1_helpers import make_snapshot
-from mock_supervisor_runtime import FakeClock, FakeRunLauncher, FakeRunStatusProvider
+from mock_supervisor_runtime import FakeClock, FakeRunLauncher, FakeRunStatusProvider, make_deterministic_scheduler
 
 OWNER = OWNER_SOURCE
 
@@ -100,7 +100,7 @@ def test_case4_scheduler_serializes_same_worktree_writers(db_path):
     claim_meta(env, j2, repo_identity="repo-A",
                canonical_worktree_path="/wt/A", branch_identity="f2",
                mutation_path_roots=["src/b"], requeue=True)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     r2 = sched.run_pass(j2)
     assert r2.outcome == OUTCOME_CONCURRENCY_SERIALIZED
     assert r2.detail == ConcurrencyReasonCode.WORKTREE_CONFLICT.value
@@ -119,7 +119,7 @@ def test_case3_scheduler_allows_distinct_worktrees(db_path):
     claim_meta(env, j2, repo_identity="repo-B",
                canonical_worktree_path="/wt/B", branch_identity="f1",
                mutation_path_roots=["src/b"], requeue=True)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     # j2 structurally eligible (distinct repo/worktree); the gate does NOT
     # serialize it (the resource governor would then cap writers at 1).
     r2 = sched.run_pass(j2)
@@ -206,7 +206,7 @@ def test_case12_dependency_prevents_premature_claim(db_path):
     ja = add_job(env, "a", rc="LIGHT")
     jb = add_job(env, "b", rc="LIGHT")
     claim_meta(env, jb, depends_on=ja, requeue=True)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     # B must not be executed while A is not DONE: the concurrency gate DEFERs
     # it (DEPENDENCY_NOT_MET) and requeues it QUEUED (no spawn).
     r = sched.run_pass(jb)
@@ -226,7 +226,7 @@ def test_case13_completed_dependency_wakes_dependent_exactly_once(db_path):
     env.core._store._update_supervisor_job(
         ja, status="TERMINAL", terminal="DONE", next_action="NONE",
     )
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     r = sched.run_pass(jb)
     assert r.outcome != "no_work"
     assert row(env, jb)["primary_state"] == "RUNNING"
@@ -241,7 +241,7 @@ def test_missing_dependency_blocks_conservatively(db_path):
     env = make_env(db_path)
     jb = add_job(env, "b", rc="LIGHT")
     claim_meta(env, jb, depends_on="supervisor:does-not-exist", requeue=True)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     # Explicit claim -> concurrency gate BLOCKs on a missing prerequisite.
     r = sched.run_pass(jb)
     assert r.outcome == OUTCOME_CONCURRENCY_BLOCKED
@@ -254,7 +254,7 @@ def test_missing_dependency_blocked_at_claim_next_job(db_path):
     env = make_env(db_path)
     jb = add_job(env, "b", rc="LIGHT")
     claim_meta(env, jb, depends_on="supervisor:does-not-exist", requeue=True)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     # The claim loop BLOCKs the job (terminal) and returns no claimable work.
     assert sched.run_pass().outcome == "no_work"
     assert row(env, jb)["terminal"] == "BLOCKED"
@@ -406,7 +406,7 @@ def test_case24_blocked_heavy_does_not_starve_light(db_path):
     j_light = add_job(env, "light", rc="LIGHT")
     # Heavy blocked by a missing dependency (conservative BLOCK).
     claim_meta(env, j_heavy, depends_on="supervisor:missing", requeue=True)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     r = sched.run_pass()  # claims the LIGHT job (heavy is blocked, not claimable)
     assert r.job_id == j_light
     assert row(env, j_light)["primary_state"] == "RUNNING"
@@ -417,7 +417,7 @@ def test_case24b_fifo_order_preserved(db_path):
     env = make_env(db_path)
     j1 = add_job(env, "first", rc="LIGHT")
     j2 = add_job(env, "second", rc="LIGHT")
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     # claim_next_job returns the earliest rowid (FIFO) among equal priority.
     r = sched.run_pass()
     assert r.job_id == j1
@@ -430,7 +430,7 @@ def test_case25_retry_backoff_consumes_no_active_slot(db_path):
     future = (env.clock() + timedelta(seconds=1000)).astimezone().isoformat()
     env.sup.store.enqueue_job(j, queue_reason="RETRY_BACKOFF",
                               next_eligible_at=future)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     assert sched.run_pass(j).outcome == "no_work"  # not eligible
     # Not RUNNING -> not in the active set.
     assert env.sup.store.list_active_job_facts() == []
@@ -447,7 +447,7 @@ def test_case26_waiting_external_releases_capacity(db_path):
     )
     # WAITING_EXTERNAL is not RUNNING -> excluded from active set.
     assert env.sup.store.list_active_job_facts() == []
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     r = sched.run_pass(j2)
     assert r.outcome != "no_work"
     assert row(env, j2)["primary_state"] == "RUNNING"
@@ -461,7 +461,7 @@ def test_case27_failing_job_does_not_fail_unrelated(db_path):
     env.core._store._update_supervisor_job(
         j_fail, status="TERMINAL", terminal="FAILED", next_action="NONE",
     )
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = make_deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     r = sched.run_pass(j_ok)
     assert r.outcome != "no_work"
     assert row(env, j_ok)["primary_state"] == "RUNNING"

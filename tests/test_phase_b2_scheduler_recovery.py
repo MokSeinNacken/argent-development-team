@@ -32,6 +32,60 @@ OWNER = OWNER_SOURCE
 LEAD = role_source(Role.LEAD)
 
 
+class _AllowGovernor:
+    """Deterministic always-ALLOW resource governor for scheduler unit tests.
+
+    The default (real) :class:`ResourceGovernor` reads the LIVE host snapshot,
+    which makes new-claim preflights load-sensitive: under machine memory
+    pressure a claim can be DEFERred, which intermittently broke the
+    dual-scheduler disjoint-ownership tests in full-suite runs (a PRE-EXISTING
+    load-sensitive race — reproduced at the I3-B base 2b804a13 at ~40% of full
+    suite runs, independent of the I3-C1 change set; the production
+    single-supervisor path is unaffected).  These tests prove scheduling/
+    fencing semantics, not host admission, so they inject an always-ALLOW
+    governor plus a no-op snapshot provider.
+    """
+
+    def __init__(self):
+        from argent_core.resource_governor import AdmissionDecision
+        from argent_core.resource_policy import ResourceClass, ResourcePolicy
+
+        self.policy = ResourcePolicy()
+        self.decision = AdmissionDecision(
+            resource_class=ResourceClass.LIGHT.value,
+            policy_version="1",
+            snapshot_ref="snap-test",
+            decision="ALLOW",
+            reason_code="OK",
+            next_eligible_at=None,
+            effective_limits={},
+            timestamp="2026-09-01T00:00:00+00:00",
+        )
+        self.calls = []
+
+    def decide(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.decision
+
+
+class _NoopSnapshotProvider:
+    """Snapshot provider that never touches the real host."""
+
+    def capture(self, *args, **kwargs):
+        return {}
+
+
+def _deterministic_scheduler(supervisor, *, owner_instance_id, lease_ttl_seconds):
+    """Scheduler with canned ALLOW admission (no real-host dependency)."""
+    return Scheduler(
+        supervisor,
+        owner_instance_id=owner_instance_id,
+        lease_ttl_seconds=lease_ttl_seconds,
+        resource_governor=_AllowGovernor(),
+        snapshot_provider=_NoopSnapshotProvider(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -81,7 +135,7 @@ def add_job_for_task(env):
 def test_pass_terminates_and_claims_queued_job(db_path):
     env = make_env(db_path)
     jid = add_queued_job(env)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = _deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     r = sched.run_pass(jid)
     # The pass returns (bounded) and exactly one safe step advanced the job.
     assert r.outcome in (OUTCOME_RENEWED, "stepped", "released")
@@ -96,7 +150,7 @@ def test_pass_terminates_and_claims_queued_job(db_path):
 def test_pass_picks_next_claimable_job_without_job_id(db_path):
     env = make_env(db_path)
     jid = add_queued_job(env)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = _deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     r = sched.run_pass()  # no job_id -> claim_next_job
     assert r.job_id == jid
     assert job_row(env.core, jid)["owner_instance_id"] == "A"
@@ -107,7 +161,7 @@ def test_pass_ignores_terminal_jobs(db_path):
     env = make_env(db_path)
     jid = add_queued_job(env)
     set_terminal(env.core, jid, "DONE")
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = _deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     assert sched.run_pass(jid).outcome == OUTCOME_NO_WORK
     assert sched.run_pass().outcome == OUTCOME_NO_WORK
     assert job_row(env.core, jid)["terminal"] == "DONE"
@@ -121,7 +175,7 @@ def test_pass_respects_next_eligible_at(db_path):
     future = _format_dt(env.clock() + timedelta(seconds=100))
     env.core._store.enqueue_job(jid, queue_reason="RETRY_BACKOFF",
                                 next_eligible_at=future)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = _deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     assert sched.run_pass(jid).outcome == OUTCOME_NO_WORK
     env.clock.advance(101)
     r = sched.run_pass(jid)
@@ -132,7 +186,7 @@ def test_pass_respects_next_eligible_at(db_path):
 
 def test_pass_no_work_when_queue_empty(db_path):
     env = make_env(db_path)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = _deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     assert sched.run_pass().outcome == OUTCOME_NO_WORK
     assert sched.run_pass("supervisor:missing").outcome == OUTCOME_NO_WORK
     env.core.close()
@@ -150,8 +204,8 @@ def test_dual_scheduler_exactly_one_wins(db_path):
     core2 = Core(db_path, clock=clock)
     prov2 = FakeRunStatusProvider()
     sup2 = Supervisor(core2, prov2, FakeRunLauncher(), clock=clock)
-    sched_a = Scheduler(env.sup, owner_instance_id="instance-A", lease_ttl_seconds=60)
-    sched_b = Scheduler(sup2, owner_instance_id="instance-B", lease_ttl_seconds=60)
+    sched_a = _deterministic_scheduler(env.sup, owner_instance_id="instance-A", lease_ttl_seconds=60)
+    sched_b = _deterministic_scheduler(sup2, owner_instance_id="instance-B", lease_ttl_seconds=60)
     try:
         ra = sched_a.run_pass(jid)
         assert ra.outcome != OUTCOME_NO_WORK
@@ -173,8 +227,10 @@ def test_dual_scheduler_disjoint_jobs_both_work(db_path):
 
     core2 = Core(db_path, clock=clock)
     sup2 = Supervisor(core2, FakeRunStatusProvider(), FakeRunLauncher(), clock=clock)
-    sched_a = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
-    sched_b = Scheduler(sup2, owner_instance_id="B", lease_ttl_seconds=60)
+    sched_a = _deterministic_scheduler(
+        env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched_b = _deterministic_scheduler(
+        sup2, owner_instance_id="B", lease_ttl_seconds=60)
     try:
         ra = sched_a.run_pass(jid1)
         rb = sched_b.run_pass(jid2)
@@ -193,7 +249,7 @@ def test_dual_scheduler_disjoint_jobs_both_work(db_path):
 def test_renewal_extends_lease_for_active_holder(db_path):
     env = make_env(db_path)
     jid = add_queued_job(env)
-    sched = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
+    sched = _deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=60)
     r1 = sched.run_pass(jid)
     assert r1.outcome == OUTCOME_RENEWED  # claimed + stepped + still RUNNING
     row = job_row(env.core, jid)
@@ -257,7 +313,7 @@ def test_takeover_a_then_b_then_stale_a_fenced(db_path):
     clock = FakeClock()
     env = make_env(db_path, clock=clock)
     jid = add_queued_job(env)
-    sched_a = Scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=30)
+    sched_a = _deterministic_scheduler(env.sup, owner_instance_id="A", lease_ttl_seconds=30)
     assert sched_a.run_pass(jid).outcome != OUTCOME_NO_WORK
     assert job_row(env.core, jid)["owner_instance_id"] == "A"
 
@@ -304,7 +360,7 @@ def test_restart_preserves_facts_and_reconciles(db_path):
 
     core2 = Core(db_path, clock=clock)
     sup2 = Supervisor(core2, FakeRunStatusProvider(), FakeRunLauncher(), clock=clock)
-    sched2 = Scheduler(sup2, owner_instance_id="A", lease_ttl_seconds=60)
+    sched2 = _deterministic_scheduler(sup2, owner_instance_id="A", lease_ttl_seconds=60)
     try:
         # Facts identical after reopen (no in-memory cache authority).
         for j in (jid_running, jid_queued, jid_done):
@@ -339,7 +395,7 @@ def test_restart_ambiguous_null_expiry_quarantined(db_path):
         jid, primary_state="RUNNING", status="ACTIVE",
         owner_instance_id="A", lease_epoch=1,
     )
-    sched = Scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
+    sched = _deterministic_scheduler(env.sup, owner_instance_id="B", lease_ttl_seconds=60)
     summary = sched.reconcile_after_restart()
     assert summary.quarantined_lost == 1
     row = job_row(env.core, jid)
@@ -488,7 +544,7 @@ def test_ambiguous_writer_no_second_writer_no_blind_respawn(db_path):
     # RUNNING with a valid foreign lease and no progress evidence -> NOT taken
     # over (belongs to the holder); no second writer, no blind respawn.
     env.sup.store.claim_job(jid, owner_instance_id="writer-A", ttl_seconds=3600)
-    sched_b = Scheduler(env.sup, owner_instance_id="writer-B", lease_ttl_seconds=60)
+    sched_b = _deterministic_scheduler(env.sup, owner_instance_id="writer-B", lease_ttl_seconds=60)
     assert sched_b.run_pass(jid).outcome == OUTCOME_NO_WORK
     row = job_row(env.core, jid)
     assert row["owner_instance_id"] == "writer-A"  # unchanged
@@ -505,7 +561,7 @@ def test_ambiguous_writer_quarantine_lost_no_claim(db_path):
         jid, primary_state="RUNNING", status="ACTIVE",
         owner_instance_id="writer-A", lease_epoch=1,
     )  # NULL lease_expires_at -> ambiguous
-    sched_b = Scheduler(env.sup, owner_instance_id="writer-B", lease_ttl_seconds=60)
+    sched_b = _deterministic_scheduler(env.sup, owner_instance_id="writer-B", lease_ttl_seconds=60)
     summary = sched_b.reconcile_after_restart()
     assert summary.quarantined_lost == 1
     assert job_row(env.core, jid)["primary_state"] == "LOST"

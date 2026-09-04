@@ -48,6 +48,7 @@ from .background_runtime import (
 )
 from .core import Core
 from .external_wait import ExternalWaitManager
+from . import job_state
 from .scheduler import Scheduler
 from .supervisor import (
     OpenClawRunLauncher,
@@ -327,6 +328,7 @@ def build_service(
     supervisor=None,
     scheduler=None,
     external_wait_manager=None,
+    ci_wait_manager=None,
     instance=None,
     sleep_fn: Optional[Callable[[float], None]] = None,
     max_passes: Optional[int] = None,
@@ -358,7 +360,21 @@ def build_service(
     )
     external_wait_manager = external_wait_manager or ExternalWaitManager(
         core._store, adapters={}, clock=clock,
+        kinds=frozenset({
+            job_state.WaitKind.UPSTREAM.value,
+            job_state.WaitKind.RATE_LIMIT.value,
+            job_state.WaitKind.NETWORK.value,
+            job_state.WaitKind.TIMER.value,
+        }),
     )
+    # I3-C1: a dedicated CI wait manager owns ``kind='ci'`` waits exclusively
+    # (the CI wait core reuses the same external_waits table + WAITING_EXTERNAL
+    # state machine; no second scheduler).  Default has no adapters = no live
+    # CI provider (fails closed); Main wires the GitHubCiAdapter for the live
+    # read-only probe.
+    if ci_wait_manager is None:
+        from .ci_external_wait import CiWaitManager
+        ci_wait_manager = CiWaitManager(core._store, adapters={}, clock=clock)
     instance = instance or SupervisorInstance(
         core._store,
         identity_provider=identity_provider,
@@ -370,6 +386,7 @@ def build_service(
     runtime = SupervisorRuntime(
         scheduler=scheduler,
         external_wait_manager=external_wait_manager,
+        ci_wait_manager=ci_wait_manager,
         instance=instance,
         store=core._store,
         clock=clock,
